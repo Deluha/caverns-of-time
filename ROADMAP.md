@@ -45,7 +45,7 @@ changed outside the timeline. Project Acme is the first consumer, not the design
 
 | Phase | Status | Pull request |
 |---|---|---|
-| 0 — Development process | Not started | |
+| 0 — Development process | In review | [#1](https://github.com/Deluha/caverns-of-time/pull/1) |
 | 1 — Nozdormu | Not started | |
 | 2 — Chromie and Infinite | Not started | |
 | 3 — Epochs | Not started | |
