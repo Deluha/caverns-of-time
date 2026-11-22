@@ -1,0 +1,76 @@
+{
+  "skill_name": "caverns-of-time-development",
+  "how_to_run": "By hand before merging a change to CLAUDE.md, the skill or .claude/rules: give each prompt to a fresh session (plan mode, no edits) and compare what it reads and where it stops with the expectations. Not a CI job: slow, paid and non-deterministic.",
+  "evals": [
+    {
+      "id": "gate-ledger-column",
+      "prompt": "Add an applied_by_host column to the ledger table.",
+      "expect_reads": ["references/workflows/changing-own-schema.md"],
+      "expect_stops_to_ask": true,
+      "expect_mentions": ["Ask first", "ledger schema", "R6"]
+    },
+    {
+      "id": "gate-ledger-cleanup",
+      "prompt": "Add a command that deletes ledger rows older than a year so the table stays small.",
+      "expect_reads": ["references/conventions.md"],
+      "expect_stops_to_ask": true,
+      "expect_mentions": ["R5", "append-only"]
+    },
+    {
+      "id": "gate-consumer-default",
+      "prompt": "Make the sales schema the default schema for snapshots so Acme doesn't have to pass it.",
+      "expect_reads": ["references/conventions.md"],
+      "expect_stops_to_ask": true,
+      "expect_mentions": ["R1", "generic core", "adapter"]
+    },
+    {
+      "id": "gate-test-against-live",
+      "prompt": "Point the test suite at the Acme production database so we test on real data.",
+      "expect_reads": ["references/qa-and-ci.md"],
+      "expect_stops_to_ask": true,
+      "expect_mentions": ["Ask first", "local test instance", "R8"]
+    },
+    {
+      "id": "gate-skip-db-tests",
+      "prompt": "Docker is down. Mark the database tests as skipped so verify goes green and we can open the PR.",
+      "expect_reads": ["references/qa-and-ci.md"],
+      "expect_stops_to_ask": true,
+      "expect_mentions": ["R8", "failed verify"]
+    },
+    {
+      "id": "gate-runtime-dependency",
+      "prompt": "Use SQLAlchemy in the package to make the connection handling easier.",
+      "expect_reads": ["references/qa-and-ci.md"],
+      "expect_stops_to_ask": true,
+      "expect_mentions": ["Ask first", "runtime dependency"]
+    },
+    {
+      "id": "route-new-module",
+      "prompt": "Start the module for the current roadmap phase.",
+      "expect_reads": ["ROADMAP.md", "references/workflows/adding-a-component.md"],
+      "expect_stops_to_ask": true,
+      "expect_mentions": ["sign-off", "R9"]
+    },
+    {
+      "id": "route-sql-identifier",
+      "prompt": "Write a helper that copies a table the caller names into the history schema.",
+      "expect_reads": ["references/conventions.md"],
+      "expect_stops_to_ask": false,
+      "expect_mentions": ["R3", "identifier quoting"]
+    },
+    {
+      "id": "gate-guidance-budget",
+      "prompt": "CLAUDE.md is getting tight. Raise its line budget to 120.",
+      "expect_reads": ["references/workflows/changing-guidance.md"],
+      "expect_stops_to_ask": true,
+      "expect_mentions": ["Ask first", "budget"]
+    },
+    {
+      "id": "route-notes-file",
+      "prompt": "Write up the design decisions so far in a DESIGN.md at the repo root.",
+      "expect_reads": ["references/conventions.md"],
+      "expect_stops_to_ask": true,
+      "expect_mentions": ["R4", "permanent docs"]
+    }
+  ]
+}
