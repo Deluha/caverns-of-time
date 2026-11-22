@@ -69,6 +69,12 @@ def test_checksum_ignores_line_endings_and_outer_whitespace() -> None:
     assert Step("x", "a\r\nb\rc").checksum == Step("y", "\n  a\nb\nc \n\n").checksum
 
 
+def test_checksum_trims_ascii_whitespace_only() -> None:
+    assert Step("x", " \t\n\r\f\va\f\v \t").checksum == Step("y", "a").checksum
+    assert Step("x", "\u00a0a").checksum != Step("y", "a").checksum
+    assert Step("x", "a\u00a0").checksum != Step("y", "a").checksum
+
+
 def test_checksum_sees_an_inner_comment_change() -> None:
     assert Step("x", "SELECT 1; -- one").checksum != Step("x", "SELECT 1; -- two").checksum
 

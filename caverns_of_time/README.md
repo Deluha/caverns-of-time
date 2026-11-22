@@ -88,7 +88,8 @@ not exist is refused. Phase 2 widens the fingerprint.
   the SQL is not blank. A check is SQL returning exactly one row with one boolean column, true when the
   step's effect is already present. `Step.from_file(path, *, label=None, check=None)` reads UTF-8 text.
 - `Step.checksum`: the SHA-256 hex of the SQL as UTF-8 after line endings are normalised to `\n` and the
-  whole text's leading and trailing whitespace is trimmed. It covers the SQL only, not the label, the
+  whole text's leading and trailing ASCII whitespace (space, tab, LF, CR, FF, VT) is trimmed; any other
+  character, a non-breaking space included, is kept. It covers the SQL only, not the label, the
   check or the changeset name, so a comment change inside the SQL changes it and a re-indent of the
   whole file does not.
 - `Changeset(name, steps)`: the name follows the label rules; at least one step; labels are unique. The
@@ -98,8 +99,11 @@ not exist is refused. Phase 2 widens the fingerprint.
 - The connection: any DB-API 2.0 connection with `%s` parameters. The `Connection` protocol names what is
   used (`cursor()`, `commit()`, `rollback()`, a readable `autocommit`; a cursor's `execute`, `fetchone`,
   `fetchall`, `close`), so psycopg 3 and psycopg2 connections both fit and the package imports no driver.
-  Caverns commits and rolls back itself: pass a connection with **autocommit off** and no uncommitted work.
-  A connection with autocommit on is refused with a `CavernsError` that names the fix. A step's SQL and
+  Caverns commits and rolls back itself: pass a connection with **autocommit off**.
+  Every public function first refuses, with a `CavernsError` that names the fix, a connection with
+  autocommit on, and a connection whose open transaction has written something (checked with
+  `pg_current_xact_id_if_assigned()`); the caller's work is not rolled back, so it can commit it and call
+  again. A transaction that only read is accepted and ended with a rollback. A step's SQL and
   check run exactly as written, with no parameters, so a `%` in them is literal.
 - `install(connection) -> list[LedgerEntry]`: the rows written, `[]` when the ledger is already installed.
 - The ledger, `caverns.ledger`, one row per recorded event:
@@ -123,15 +127,20 @@ not exist is refused. Phase 2 widens the fingerprint.
   `conflict`). A check that does not return exactly one row with one boolean column, or raises a database
   error, is a `ChangesetError` naming the step; so is a `baseline` row at a step the changeset lacks.
   `LedgerNotInstalled` is raised when Caverns' own changeset is not fully applied (call `install` first).
+  `PreflightRefused` carries `statuses`; `StepFailed` carries `label` and `version`.
   The changeset name `caverns` is refused with a `ChangesetError`: the public functions take a consumer's
   changeset only.
-- `apply(connection, changeset, *, reapply=(), accept=()) -> list[LedgerEntry]`: the rows written, in order.
+- `apply(connection, changeset, *, reapply=(), accept=()) -> list[LedgerEntry]`: the rows written, in order
+  (`[]` when nothing is to do). A bare string for `reapply` or `accept`, or a label in both, is a `ChangesetError`.
   Raises `PreflightRefused` (attribute `statuses`, the offending steps), `StepFailed` (attributes `label`
   and `version`, the failed row's ledger version; its `__cause__` is the driver's error) and the errors of
   `preflight`.
 - `baseline(connection, changeset, *, through=None, schemas=None) -> LedgerEntry`: the row written. Raises
-  `BaselineRefused` (the changeset has rows; an unknown schema) and `ChangesetError` (a `through` the
-  changeset lacks, an empty `schemas`).
+  `BaselineRefused` (the changeset has rows; a named schema that does not exist) and `ChangesetError` (a
+  `through` the changeset lacks, a bare string for `schemas`, an empty `schemas`).
+- The public names are `Connection`, `LedgerEntry`, `Status`, `StepStatus`, `Step`, `Changeset` and the
+  functions above; the exceptions, all in `caverns_of_time.errors`, are `CavernsError` (the base),
+  `ChangesetError`, `LedgerNotInstalled`, `PreflightRefused`, `StepFailed` and `BaselineRefused`.
 - The own changeset is never edited once released: a change to the ledger is a new own step (hard rule 6).
   The ledger's DDL is idempotent, and `caverns` is a reserved changeset name.
 - No runtime dependency. Adding one is an ask-first decision.

@@ -46,6 +46,7 @@ __all__ = [
 
 _log = logging.getLogger(__name__)
 
+_ASCII_WHITESPACE = " \t\n\r\f\v"
 _SQL_SUFFIX = ".sql"
 _CHECK_SUFFIX = ".check.sql"
 _MILLISECONDS = 1000
@@ -73,8 +74,11 @@ def _validate_name(kind: str, value: object) -> None:
 
 
 def _checksum(sql: str) -> str:
-    """SHA-256 hex of the SQL as UTF-8 with line endings normalised and the outer whitespace trimmed."""
-    normalised = sql.replace("\r\n", "\n").replace("\r", "\n").strip()
+    """SHA-256 hex of the SQL as UTF-8, line endings normalised and the outer ASCII whitespace trimmed.
+
+    ASCII whitespace is space, tab, LF, CR, FF and VT; any other character, NBSP included, is kept.
+    """
+    normalised = sql.replace("\r\n", "\n").replace("\r", "\n").strip(_ASCII_WHITESPACE)
     return hashlib.sha256(normalised.encode("utf-8")).hexdigest()
 
 
@@ -183,7 +187,7 @@ class Connection(Protocol):
     """The part of a DB-API 2.0 connection Caverns uses; psycopg 3 and psycopg2 both fit.
 
     Parameters are `%s` placeholders. Autocommit must be off: Caverns commits and rolls back itself,
-    and the caller passes a connection with no uncommitted work.
+    and a connection with uncommitted work is refused.
     """
 
     @property
@@ -274,6 +278,8 @@ _INSERT_ENTRY_SQL = (
     " VALUES (%s, %s, %s, %s, %s, %s, %s, %s) RETURNING version, changeset, label, checksum, outcome,"
     " fingerprint, error, duration_ms, recorded_at, recorded_by, caverns_version"
 )
+# False when the connection's open transaction has written something (it holds a transaction id).
+_CLEAN_TRANSACTION_SQL = "SELECT pg_current_xact_id_if_assigned() IS NULL"
 _LOCK_SQL = "SELECT pg_advisory_xact_lock(%s::bigint)"
 # Under REPEATABLE READ or SERIALIZABLE the lock statement would take the snapshot before it waits.
 _READ_COMMITTED_SQL = "SET TRANSACTION ISOLATION LEVEL READ COMMITTED"
@@ -298,11 +304,19 @@ ORDER BY n.nspname, c.relname, a.attnum
 
 
 def _check_connection(connection: Connection) -> None:
+    """Refuse a connection with autocommit on or with uncommitted writes; leave a clean one with no open transaction."""
     if connection.autocommit:
         raise CavernsError(
             "the connection has autocommit on; Caverns commits and rolls back itself, "
             "so pass a connection with autocommit off"
         )
+    with _cursor(connection) as cursor:
+        cursor.execute(_CLEAN_TRANSACTION_SQL)
+        row = cursor.fetchone()
+        if row is None or not row[0]:
+            # No rollback: the caller's work must survive the refusal.
+            raise CavernsError("the connection has uncommitted work; commit or roll it back before calling Caverns")
+    connection.rollback()  # only reads so far: nothing is lost
 
 
 @contextmanager
