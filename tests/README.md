@@ -13,7 +13,7 @@ database.
 | `conftest.py` | The `db_dsn`, `db_conn` and `ledger_conn` fixtures, the local-only guard, the `db` marker, the required-run check | — |
 | `test_database.py` | The instance itself: major version 18, rollback of uncommitted work, the image tag and connection string agreeing across CI, the dev container and `dev_tools/database.py`; the fixtures' guards | yes |
 | `test_nozdormu_changeset.py` | Nozdormu's pure parts: step and changeset validation, the checksum, the file and directory loaders, the status decision on synthetic ledger rows, the SQL constants naming one ledger table | no |
-| `test_nozdormu_ledger.py` | Nozdormu against PostgreSQL, once per driver (psycopg 3, psycopg2): installation, the ledger's constraints and its append-only triggers, preflight's four statuses and refusals | yes |
+| `test_nozdormu_ledger.py` | Nozdormu against PostgreSQL, once per driver (psycopg 3, psycopg2): installation, the ledger's constraints and its append-only triggers, preflight's four statuses and refusals, apply (skip, refusal, `reapply`, `accept`, failure, a concurrent runner) | yes |
 | `test_check_conventions.py` | Convention rules C1–C9 on synthetic input, then the real repository | no |
 | `test_check_docs_sync.py` | The docs-sync classifier, token rules, git parsing | no |
 | `test_check_guidance_integrity.py` | Each guidance check on a miniature tree, then the real repository | no |
