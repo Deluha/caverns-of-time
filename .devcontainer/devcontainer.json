@@ -1,0 +1,20 @@
+// Caverns of Time dev container (GitHub Codespaces and VS Code Dev Containers).
+// Two services (docker-compose.yml): the Python workspace and a PostgreSQL 18 test
+// instance sharing its network, so the tests reach the database on 127.0.0.1.
+// The project installs into the image's Python with the dev extra, and the git
+// hooks are wired on create.
+{
+  "name": "Caverns of Time",
+  "dockerComposeFile": "docker-compose.yml",
+  "service": "app",
+  "workspaceFolder": "/workspace",
+  "postCreateCommand": "pip install -e '.[dev]' && pre-commit install",
+  "customizations": {
+    "vscode": {
+      "extensions": ["ms-python.python", "charliermarsh.ruff"],
+      "settings": {
+        "python.defaultInterpreterPath": "/usr/local/bin/python"
+      }
+    }
+  }
+}

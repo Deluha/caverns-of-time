@@ -1,0 +1,47 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "model": "opus",
+  "permissions": {
+    "defaultMode": "acceptEdits",
+    "allow": [
+      "Bash(python dev_tools/verify.py:*)",
+      "Bash(python dev_tools/check_conventions.py:*)",
+      "Bash(python dev_tools/check_guidance_integrity.py:*)",
+      "Bash(python dev_tools/check_docs_sync.py:*)",
+      "Bash(python dev_tools/database.py:*)",
+      "Bash(pytest:*)",
+      "Bash(python -m pytest:*)",
+      "Bash(ruff check:*)",
+      "Bash(python -m mypy:*)",
+      "Bash(git diff:*)",
+      "Bash(git log:*)",
+      "Bash(git status:*)"
+    ],
+    "ask": [
+      "Edit(CLAUDE.md)",
+      "Edit(.claude/settings.json)",
+      "Edit(.claude/agents/**)",
+      "Edit(.claude/hooks/**)",
+      "Edit(.github/workflows/**)",
+      "Edit(.pre-commit-config.yaml)",
+      "Edit(.gitleaks.toml)"
+    ],
+    "deny": [
+      "Agent(Explore)",
+      "Read(./**/.env)",
+      "Read(./**/.env.*)",
+      "Read(./**/*.env)",
+      "Read(./**/*.pem)",
+      "Read(./**/*.pfx)",
+      "Read(./**/*.key)"
+    ]
+  },
+  "hooks": {
+    "SessionStart": [
+      { "hooks": [ { "type": "command", "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/session-start.sh" } ] }
+    ],
+    "PostToolUse": [
+      { "matcher": "Edit|Write", "hooks": [ { "type": "command", "command": "python3 \"$CLAUDE_PROJECT_DIR\"/.claude/hooks/post_edit_check.py" } ] }
+    ]
+  }
+}
