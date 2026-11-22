@@ -774,7 +774,10 @@ def test_the_fingerprint_is_stable_and_follows_the_tables(ledger_conn: Any) -> N
     with_column = _fingerprint(ledger_conn, "three", schemas=["nozdormu_test"])
     assert with_column != first
     _execute(ledger_conn, "CREATE TABLE nozdormu_test.bare ()")  # a table without columns still counts
-    assert _fingerprint(ledger_conn, "four", schemas=["nozdormu_test"]) != with_column
+    with_bare = _fingerprint(ledger_conn, "four", schemas=["nozdormu_test"])
+    assert with_bare != with_column
+    _execute(ledger_conn, INDEX.sql)  # the widened fingerprint of Infinite sees an index too
+    assert _fingerprint(ledger_conn, "five", schemas=["nozdormu_test"]) != with_bare
 
 
 def test_the_fingerprint_does_not_depend_on_the_search_path(ledger_conn: Any) -> None:

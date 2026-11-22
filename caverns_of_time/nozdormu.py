@@ -10,18 +10,17 @@ from __future__ import annotations
 
 import enum
 import hashlib
-import json
 import logging
 import os
 import time
-from collections.abc import Callable, Collection, Iterator, Sequence
-from contextlib import contextmanager
+from collections.abc import Callable, Collection, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Protocol
 
 from caverns_of_time import __version__
+from caverns_of_time._connection import Connection, Cursor, check_connection, names, read_only, run_check, transaction
+from caverns_of_time._fingerprint import capture, named_schemas, resolve_schemas
 from caverns_of_time.errors import (
     BaselineRefused,
     CavernsError,
@@ -172,35 +171,6 @@ class Changeset:
         return cls(name, steps)
 
 
-class _Cursor(Protocol):
-    """The part of a DB-API 2.0 cursor Caverns uses; psycopg 3 and psycopg2 both fit."""
-
-    def execute(self, query: str, params: Sequence[Any] | None = ..., /) -> object: ...
-
-    def fetchone(self) -> Sequence[Any] | None: ...
-
-    def fetchall(self) -> Sequence[Sequence[Any]]: ...
-
-    def close(self) -> object: ...
-
-
-class Connection(Protocol):
-    """The part of a DB-API 2.0 connection Caverns uses; psycopg 3 and psycopg2 both fit.
-
-    Parameters are `%s` placeholders. Autocommit must be off: Caverns commits and rolls back itself,
-    and a connection with uncommitted work is refused.
-    """
-
-    @property
-    def autocommit(self) -> bool: ...
-
-    def cursor(self) -> _Cursor: ...
-
-    def commit(self) -> object: ...
-
-    def rollback(self) -> object: ...
-
-
 @dataclass(frozen=True)
 class LedgerEntry:
     """One row of `caverns.ledger`, the columns in table order."""
@@ -284,87 +254,7 @@ _INSERT_ENTRY_SQL = (
     " VALUES (%s, %s, %s, %s, %s, %s, %s, %s) RETURNING version, changeset, label, checksum, outcome,"
     " fingerprint, error, duration_ms, recorded_at, recorded_by, caverns_version"
 )
-# False when the connection's open transaction has written something (it holds a transaction id).
-_CLEAN_TRANSACTION_SQL = "SELECT pg_current_xact_id_if_assigned() IS NULL"
 _LOCK_SQL = "SELECT pg_advisory_xact_lock(%s::bigint)"
-_PIN_SEARCH_PATH_SQL = "SELECT set_config('search_path', 'pg_catalog', true)"
-# Under REPEATABLE READ or SERIALIZABLE the lock statement would take the snapshot before it waits.
-_READ_COMMITTED_SQL = "SET TRANSACTION ISOLATION LEVEL READ COMMITTED"
-_READ_ONLY_SQL = "SET TRANSACTION READ ONLY"
-# The schemas a baseline fingerprints when the caller names none: every one but the system's and Caverns' own.
-_DEFAULT_SCHEMAS_SQL = (
-    "SELECT nspname::text FROM pg_namespace"
-    " WHERE left(nspname, 3) <> 'pg_' AND nspname NOT IN ('information_schema', 'caverns') ORDER BY nspname"
-)
-_EXISTING_SCHEMAS_SQL = "SELECT nspname::text FROM pg_namespace WHERE nspname = ANY(%s::text[])"
-# A LEFT JOIN keeps a table without columns in the result.
-_TABLE_COLUMNS_SQL = """
-SELECT n.nspname::text, c.relname::text, c.relkind::text, a.attname::text,
-       format_type(a.atttypid, a.atttypmod), a.attnotnull, pg_get_expr(d.adbin, d.adrelid)
-FROM pg_class c
-JOIN pg_namespace n ON n.oid = c.relnamespace
-LEFT JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped
-LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum
-WHERE c.relkind IN ('r', 'p') AND n.nspname = ANY(%s::text[])
-ORDER BY n.nspname, c.relname, a.attnum
-"""
-
-
-def _check_connection(connection: Connection) -> None:
-    """Refuse a connection with autocommit on or with uncommitted writes; leave a clean one with no open transaction."""
-    if connection.autocommit:
-        raise CavernsError(
-            "the connection has autocommit on; Caverns commits and rolls back itself, "
-            "so pass a connection with autocommit off"
-        )
-    try:
-        with _cursor(connection) as cursor:
-            cursor.execute(_CLEAN_TRANSACTION_SQL)
-            row = cursor.fetchone()
-    except Exception as error:
-        # No rollback here either: the caller decides what becomes of its failed transaction.
-        raise CavernsError(
-            "the connection cannot run a statement: its transaction has failed or the connection is lost; "
-            "roll it back or reconnect before calling Caverns"
-        ) from error
-    if row is None or not row[0]:
-        # No rollback: the caller's work must survive the refusal.
-        raise CavernsError("the connection has uncommitted work; commit or roll it back before calling Caverns")
-    connection.rollback()  # only reads so far: nothing is lost
-
-
-@contextmanager
-def _cursor(connection: Connection) -> Iterator[_Cursor]:
-    cursor = connection.cursor()
-    try:
-        yield cursor
-    finally:
-        cursor.close()
-
-
-@contextmanager
-def _transaction(connection: Connection) -> Iterator[_Cursor]:
-    """One transaction: committed when the block ends, rolled back when it raises."""
-    try:
-        with _cursor(connection) as cursor:
-            # The ledger is re-read after the lock: that read needs a snapshot taken after the wait.
-            cursor.execute(_READ_COMMITTED_SQL)
-            yield cursor
-    except BaseException:
-        connection.rollback()
-        raise
-    connection.commit()
-
-
-@contextmanager
-def _read_only(connection: Connection) -> Iterator[_Cursor]:
-    """A read-only transaction that is always rolled back."""
-    try:
-        with _cursor(connection) as cursor:
-            cursor.execute(_READ_ONLY_SQL)
-            yield cursor
-    finally:
-        connection.rollback()
 
 
 def _reject_reserved(changeset: Changeset) -> None:
@@ -372,18 +262,18 @@ def _reject_reserved(changeset: Changeset) -> None:
         raise ChangesetError(f"the changeset name {changeset.name!r} is reserved for Caverns' own changeset")
 
 
-def _lock(cursor: _Cursor) -> None:
+def _lock(cursor: Cursor) -> None:
     """Take the ledger's advisory lock until the transaction ends."""
     cursor.execute(_LOCK_SQL, (_ADVISORY_LOCK_KEY,))
 
 
-def _ledger_exists(cursor: _Cursor) -> bool:
+def _ledger_exists(cursor: Cursor) -> bool:
     cursor.execute(_LEDGER_EXISTS_SQL)
     row = cursor.fetchone()
     return row is not None and bool(row[0])
 
 
-def _read_entries(cursor: _Cursor, changeset: str) -> list[LedgerEntry]:
+def _read_entries(cursor: Cursor, changeset: str) -> list[LedgerEntry]:
     """The changeset's ledger rows, oldest first; none while the ledger does not exist yet."""
     if not _ledger_exists(cursor):
         return []
@@ -396,7 +286,7 @@ def _elapsed_ms(started: float) -> int:
 
 
 def _insert(
-    cursor: _Cursor,
+    cursor: Cursor,
     changeset: str,
     step: Step,
     outcome: str,
@@ -463,40 +353,12 @@ def _decide(
     return statuses
 
 
-def _has_more_results(cursor: _Cursor) -> bool:
-    """Whether the statement the cursor ran produced a further result set (a second statement)."""
-    nextset = getattr(cursor, "nextset", None)
-    if not callable(nextset):
-        return False
-    try:
-        return bool(nextset())
-    except Exception:
-        # NOTE: psycopg2 raises NotSupportedError here: such a driver cannot report further result sets,
-        # so the one-statement rule is documented rather than detected there.
-        return False
-
-
-def _run_check(cursor: _Cursor, label: str, check: str) -> bool:
-    """Run a step's check; it must be one statement returning one row with one boolean column."""
-    try:
-        cursor.execute(check)
-        rows = cursor.fetchall()
-        more = _has_more_results(cursor)
-    except Exception as error:
-        raise ChangesetError(f"the check of step {label!r} failed: {error}") from error
-    if more:
-        raise ChangesetError(f"the check of step {label!r} must be one statement")
-    if len(rows) == 1 and len(rows[0]) == 1 and isinstance(rows[0][0], bool):
-        return rows[0][0]
-    raise ChangesetError(f"the check of step {label!r} must return one row with one boolean column")
-
-
-def _statuses(cursor: _Cursor, changeset: Changeset) -> list[StepStatus]:
+def _statuses(cursor: Cursor, changeset: Changeset) -> list[StepStatus]:
     entries = _read_entries(cursor, changeset.name)
-    return _decide(changeset, entries, lambda label, check: _run_check(cursor, label, check))
+    return _decide(changeset, entries, lambda label, check: run_check(cursor, label, check))
 
 
-def _require_installed(cursor: _Cursor) -> None:
+def _require_installed(cursor: Cursor) -> None:
     own = _statuses(cursor, _OWN_CHANGESET)
     if any(status.status is not Status.APPLIED for status in own):
         raise LedgerNotInstalled("the ledger is not installed (Caverns' own changeset is not applied): call install()")
@@ -508,9 +370,9 @@ def preflight(connection: Connection, changeset: Changeset) -> list[StepStatus]:
     Raises `LedgerNotInstalled` before `install()` and `ChangesetError` for a reserved name, a broken
     check or a baseline at a step the changeset lacks.
     """
-    _check_connection(connection)
+    check_connection(connection)
     _reject_reserved(changeset)
-    with _read_only(connection) as cursor:
+    with read_only(connection) as cursor:
         _require_installed(cursor)
         return _statuses(cursor, changeset)
 
@@ -521,25 +383,16 @@ def history(connection: Connection, *, changeset: str | None = None, limit: int 
     Raises `LedgerNotInstalled` before `install()` and `ChangesetError` for an invalid *changeset* or a
     *limit* that is not a positive integer.
     """
-    _check_connection(connection)
+    check_connection(connection)
     if changeset is not None:
         _validate_name("changeset name", changeset)
     if limit is not None and (isinstance(limit, bool) or not isinstance(limit, int) or limit < 1):
         raise ChangesetError(f"limit must be a positive integer, not {limit!r}")
-    with _read_only(connection) as cursor:
+    with read_only(connection) as cursor:
         if not _ledger_exists(cursor):
             raise LedgerNotInstalled("the ledger is not installed (caverns.ledger does not exist): call install()")
         cursor.execute(_HISTORY_SQL, (changeset, changeset, limit))
         return [LedgerEntry(*values) for values in cursor.fetchall()]
-
-
-def _names(argument: str, values: Collection[str]) -> frozenset[str]:
-    """*values* as a set; a bare string is refused because it would be read as its characters."""
-    if values is None:
-        raise ChangesetError(f"{argument} must be a collection of names, not None")
-    if isinstance(values, str):
-        raise ChangesetError(f"{argument} must be a collection of names, not the string {values!r}")
-    return frozenset(values)
 
 
 def _acknowledged(status: StepStatus, reapply: frozenset[str], accept: frozenset[str]) -> bool:
@@ -591,7 +444,7 @@ def _record_failure(
     rolled back either way.
     """
     try:
-        with _transaction(connection) as cursor:
+        with transaction(connection) as cursor:
             _lock(cursor)
             if not _ledger_exists(cursor):
                 raise CavernsError("the ledger does not exist")
@@ -604,7 +457,7 @@ def _record_failure(
     return StepFailed(step.label, entry.version)
 
 
-def _execute_step(connection: Connection, changeset: Changeset, cursor: _Cursor, step: Step) -> int:
+def _execute_step(connection: Connection, changeset: Changeset, cursor: Cursor, step: Step) -> int:
     """Run the step's SQL as written; its duration in milliseconds.
 
     A failure rolls the transaction back, records a `failed` row and raises `StepFailed`; when that row
@@ -626,7 +479,7 @@ def _write_step(connection: Connection, changeset: Changeset, status: StepStatus
     one means the work is done) must not be acted on.
     """
     step = status.step
-    with _transaction(connection) as cursor:
+    with transaction(connection) as cursor:
         _lock(cursor)
         current = _recheck(changeset, status, _read_entries(cursor, changeset.name))
         if current.status is Status.APPLIED:
@@ -658,8 +511,8 @@ def _apply_statuses(
 
 def install(connection: Connection) -> list[LedgerEntry]:
     """Create the ledger by applying Caverns' own changeset; the rows written ([] when installed)."""
-    _check_connection(connection)
-    with _read_only(connection) as cursor:
+    check_connection(connection)
+    with read_only(connection) as cursor:
         statuses = _statuses(cursor, _OWN_CHANGESET)
     # An effect without its row (a schema-only restore) is recorded as accepted: re-running would only repeat it.
     unknown = frozenset(s.step.label for s in statuses if s.status is Status.UNKNOWN)
@@ -683,7 +536,7 @@ def apply(
     running). A step that fails is rolled back, recorded as `failed` and raised as `StepFailed`;
     later steps do not run. Returns the rows written, in order.
     """
-    reapply_names, accept_names = _names("reapply", reapply), _names("accept", accept)
+    reapply_names, accept_names = names("reapply", reapply), names("accept", accept)
     statuses = preflight(connection, changeset)
     return _apply_statuses(connection, changeset, statuses, reapply_names, accept_names)
 
@@ -698,35 +551,6 @@ def _baseline_step(changeset: Changeset, through: str | None) -> Step:
     raise ChangesetError(f"changeset {changeset.name!r} has no step {through!r} to baseline through")
 
 
-def _resolve_schemas(cursor: _Cursor, schemas: list[str] | None) -> list[str]:
-    """The schemas to fingerprint: the given ones, which must exist, else every non-system one."""
-    if schemas is None:
-        cursor.execute(_DEFAULT_SCHEMAS_SQL)
-        return [row[0] for row in cursor.fetchall()]
-    cursor.execute(_EXISTING_SCHEMAS_SQL, (schemas,))
-    missing = sorted(set(schemas) - {row[0] for row in cursor.fetchall()})
-    if missing:
-        raise BaselineRefused(f"the schema {missing[0]!r} does not exist")
-    return schemas
-
-
-def _read_document(cursor: _Cursor, schemas: list[str]) -> dict[str, Any]:
-    """The tables and columns of *schemas* as a canonical document, read from the system catalogs."""
-    cursor.execute(_TABLE_COLUMNS_SQL, (schemas,))
-    tables: dict[tuple[str, str], dict[str, Any]] = {}
-    for schema, name, kind, column, column_type, not_null, default in cursor.fetchall():
-        table = tables.setdefault((schema, name), {"schema": schema, "name": name, "kind": kind, "columns": []})
-        if column is not None:
-            table["columns"].append({"name": column, "type": column_type, "not_null": not_null, "default": default})
-    return {"tables": [tables[key] for key in sorted(tables)]}
-
-
-def _hash_document(document: dict[str, Any]) -> str:
-    """SHA-256 hex of the document's canonical JSON."""
-    canonical = json.dumps(document, sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
-
-
 def baseline(
     connection: Connection,
     changeset: Changeset,
@@ -737,24 +561,21 @@ def baseline(
     """Record an existing database as the starting point of *changeset*; nothing is executed.
 
     One `baseline` row for the step *through* (default the last) carries that step's checksum and a
-    fingerprint of the tables and columns in *schemas* (default: every schema but `pg_*`,
+    fingerprint (`infinite.fingerprint`'s hash) of *schemas* (default: every schema but `pg_*`,
     `information_schema` and `caverns`). Afterwards every step up to *through* is `applied`. Refused
     (`BaselineRefused`) when the changeset already has ledger rows or a named schema does not exist.
     """
-    _check_connection(connection)
+    check_connection(connection)
     _reject_reserved(changeset)
     step = _baseline_step(changeset, through)
-    names = None if schemas is None else sorted(_names("schemas", schemas))
-    if names is not None and not names:
-        raise ChangesetError("schemas is empty; name at least one schema or leave it out")
-    with _read_only(connection) as cursor:
+    named = named_schemas(schemas)
+    with read_only(connection) as cursor:
         _require_installed(cursor)
-    with _transaction(connection) as cursor:
+    with transaction(connection) as cursor:
         _lock(cursor)
-        cursor.execute(_PIN_SEARCH_PATH_SQL)  # format_type and pg_get_expr print names relative to search_path
         if _read_entries(cursor, changeset.name):
             raise BaselineRefused(f"changeset {changeset.name!r} already has ledger rows")
-        fingerprint = _hash_document(_read_document(cursor, _resolve_schemas(cursor, names)))
-        entry = _insert(cursor, changeset.name, step, _OUTCOME_BASELINE, fingerprint=fingerprint)
+        fingerprint = capture(cursor, resolve_schemas(cursor, named, BaselineRefused))
+        entry = _insert(cursor, changeset.name, step, _OUTCOME_BASELINE, fingerprint=fingerprint.hash)
     _log.info("baseline of changeset %s at step %s: ledger version %d", entry.changeset, entry.label, entry.version)
     return entry

@@ -3,8 +3,8 @@
 ## Purpose & scope
 
 The importable package. It is generic: nothing here names a consumer or assumes a consumer's schema
-(hard rule 1). It holds the version, the shared exceptions, the console helpers and, so far, two
-components: Nozdormu, the migration ledger, and Chromie, the command line.
+(hard rule 1). It holds the version, the shared exceptions, the console helpers and, so far, three
+components: Nozdormu, the migration ledger, Chromie, the command line, and Infinite, the schema fingerprint.
 
 ## Files & entry points
 
@@ -12,9 +12,12 @@ components: Nozdormu, the migration ledger, and Chromie, the command line.
 |---|---|
 | `__init__.py` | `__version__`, read from the installed distribution's metadata |
 | `errors.py` | The exception types, all in one module |
+| `_connection.py` | Shared private plumbing, not a component: the `Connection` and `Cursor` protocols, the connection guard, the transaction helpers, the one-statement check runner and the collection-of-names guard |
+| `_fingerprint.py` | Shared private fingerprint machinery, not a component: `Fingerprint`, the catalog queries, the document and its hash, the default and missing schemas |
 | `console.py` | The console helpers: status lines with their icons, tables and JSON; the only module that prints |
 | `chromie.py` | Chromie: the `chromie` command's parsing, connection configuration and dispatch (command flow only) |
 | `nozdormu.py` | Nozdormu: the `Step` and `Changeset` model, the checksum, the loaders, the connection contract, the ledger, `install`, `preflight`, `history`, `apply` and `baseline` |
+| `infinite.py` | Infinite: `fingerprint` and the `Fingerprint` it returns |
 
 ## How it works
 
@@ -87,11 +90,28 @@ that already holds a changeset's effects. It writes one `baseline` row (label: t
 default the last; that step's checksum; a fingerprint) and executes nothing; from then on every step up to
 and including `through` is `applied`, the later ones follow the normal rules. It runs in one transaction
 under the advisory lock and is refused (`BaselineRefused`) when the changeset already has any ledger row.
-The fingerprint is the SHA-256 of a canonical JSON document of the tables (kinds `r` and `p`) and their
-columns (name, type, not-null, default) in the given schemas, read from the system catalogs with `search_path`
-pinned to `pg_catalog` (type and default expressions print relative to it); without
-`schemas` it covers every schema except `pg_*`, `information_schema` and `caverns`. A named schema that does
-not exist is refused. Phase 2 widens the fingerprint.
+The fingerprint is the hash of Infinite's fingerprint (below) of the given schemas; without `schemas` it
+covers every schema except `pg_*`, `information_schema` and `caverns`. A named schema that does not exist is refused.
+
+**Infinite, the fingerprint.** `infinite.fingerprint(connection, *, schemas=None)` reads the shape of a
+database's schemas from the system catalogs, in one read-only transaction that writes nothing and is always
+rolled back, with `search_path` pinned to `pg_catalog` so that type, default and definition texts print the same
+whatever the session's path. The document is keyed by schema, then by kind, then by object name; every schema
+named appears with all six kinds, empty when it holds none, so an empty or dropped schema is visible:
+
+| Kind | Key | Value |
+|---|---|---|
+| `table` | `<table>` | `{"kind": "r" \| "p" \| "f"}`: ordinary, partitioned or foreign |
+| `column` | `<table>.<column>` | `{"type", "not_null", "default", "generated", "identity", "collation"}`: `format_type`; a boolean; the default expression or null; the generation expression or null; `"always"`, `"by default"` or null; the collation name when it differs from the type's default, else null. Columns of tables only |
+| `index` | `<index>` | `pg_get_indexdef` |
+| `constraint` | `<table>.<constraint>` | `pg_get_constraintdef`; table constraints of the kinds check, foreign key, primary key, unique and exclusion (a `NOT NULL` is the column's `not_null`) |
+| `view` | `<view>` | `{"kind": "v" \| "m", "definition": pg_get_viewdef}`: view or materialized view; a view's shape is its definition |
+| `function` | `<name>(<identity arguments>)` | `pg_get_functiondef`; functions and procedures |
+
+An object that belongs to an extension is left out (an extension's table takes its indexes and constraints with
+it). Not covered: triggers, sequences, types, grants, ownership, comments and extensions themselves. The hash is the
+SHA-256 of the document's canonical JSON (sorted keys, no whitespace). Without `schemas` the fingerprint covers
+every schema except `pg_*`, `information_schema` and `caverns`; the result's `schemas` are sorted and unique.
 
 **Chromie, the command line.** `chromie` is installed with the `cli` extra
 (`pip install 'caverns-of-time[cli]'`), which brings its driver, psycopg 3; the library itself imports
@@ -193,7 +213,12 @@ LABEL     STATUS   VERSION
 - `baseline(connection, changeset, *, through=None, schemas=None) -> LedgerEntry`: the row written. Raises
   `BaselineRefused` (the changeset has rows; a named schema that does not exist) and `ChangesetError` (a
   `through` the changeset lacks, a bare string for `schemas`, an empty `schemas`).
-- The public names are `Connection`, `LedgerEntry`, `Status`, `StepStatus`, `Step`, `Changeset` and the
+- `infinite.fingerprint(connection, *, schemas=None) -> Fingerprint`: `Fingerprint(schemas, document, hash)`, a
+  frozen dataclass of the sorted, unique schema names (a tuple), the document and its SHA-256 hex. It runs in one
+  read-only transaction and writes nothing. Raises `ChangesetError` for a bare string, a name that is not a string
+  or an empty collection for `schemas`, and for a named schema that does not exist; the connection is checked as
+  for every public function.
+- The public names are `Connection`, `LedgerEntry`, `Status`, `StepStatus`, `Step`, `Changeset`, `Fingerprint` and the
   functions above; the exceptions, all in `caverns_of_time.errors`, are `CavernsError` (the base),
   `ChangesetError`, `LedgerNotInstalled`, `PreflightRefused`, `StepFailed` and `BaselineRefused`.
 - The own changeset is never edited once released: a change to the ledger is a new own step (hard rule 6).
