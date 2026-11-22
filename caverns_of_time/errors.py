@@ -11,3 +11,7 @@ class CavernsError(Exception):
 
 class ChangesetError(CavernsError):
     """An invalid step, changeset or directory, a reserved name, an unknown label or a broken check."""
+
+
+class LedgerNotInstalled(CavernsError):
+    """The ledger is not installed: Caverns' own changeset is not fully applied."""
