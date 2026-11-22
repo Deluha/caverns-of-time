@@ -4,7 +4,7 @@
 
 The importable package. It is generic: nothing here names a consumer or assumes a consumer's schema
 (hard rule 1). It holds the version, the shared exceptions and, so far, one component: Nozdormu, the
-migration ledger (in progress; this file describes what is built).
+migration ledger.
 
 ## Files & entry points
 
@@ -16,7 +16,8 @@ migration ledger (in progress; this file describes what is built).
 
 ## How it works
 
-Each component arrives as one module in its roadmap phase (`ROADMAP.md`).
+Each component arrives as one module in its roadmap phase (`ROADMAP.md`); Nozdormu is the first.
+The flow is install, then preflight, then apply; baseline adopts a database that already has the effects.
 
 **Nozdormu, the model.** A `Step` is a label, SQL and an optional check; a `Changeset` is a name and an
 ordered list of steps. Both are frozen and validated when built. A changeset comes from a Python list or
@@ -53,16 +54,6 @@ then recorded as a `failed` row in a transaction of its own, and `StepFailed` is
 error; later steps do not run, and the step is `pending` again. The rows written are returned and logged.
 `install` takes the same path for Caverns' own changeset.
 
-**Nozdormu, baseline.** `baseline(connection, changeset, *, through=None, schemas=None)` adopts a database
-that already holds a changeset's effects. It writes one `baseline` row (label: the `through` step, by
-default the last; that step's checksum; a fingerprint) and executes nothing; from then on every step up to
-and including `through` is `applied`, the later ones follow the normal rules. It runs in one transaction
-under the advisory lock and is refused (`BaselineRefused`) when the changeset already has any ledger row.
-The fingerprint is the SHA-256 of a canonical JSON document of the tables (kinds `r` and `p`) and their
-columns (name, type, not-null, default) in the given schemas, read from the system catalogs; without
-`schemas` it covers every schema except `pg_*`, `information_schema` and `caverns`. A named schema that does
-not exist is refused. Phase 2 widens the fingerprint.
-
 A `conflict` or `unknown` step refuses the whole run before anything is executed or written
 (`PreflightRefused`, listing the steps) unless the caller acknowledges it:
 
@@ -75,6 +66,16 @@ Naming a step in any other status is a `PreflightRefused`; naming a label the ch
 label in both, is a `ChangesetError`. Preferred practice: add a new step rather than edit one that has
 been applied. Statements that cannot run inside a transaction (`CREATE INDEX CONCURRENTLY`) are
 unsupported in v0.1: such a step fails and is recorded as a failed step.
+
+**Nozdormu, baseline.** `baseline(connection, changeset, *, through=None, schemas=None)` adopts a database
+that already holds a changeset's effects. It writes one `baseline` row (label: the `through` step, by
+default the last; that step's checksum; a fingerprint) and executes nothing; from then on every step up to
+and including `through` is `applied`, the later ones follow the normal rules. It runs in one transaction
+under the advisory lock and is refused (`BaselineRefused`) when the changeset already has any ledger row.
+The fingerprint is the SHA-256 of a canonical JSON document of the tables (kinds `r` and `p`) and their
+columns (name, type, not-null, default) in the given schemas, read from the system catalogs; without
+`schemas` it covers every schema except `pg_*`, `information_schema` and `caverns`. A named schema that does
+not exist is refused. Phase 2 widens the fingerprint.
 
 ## Interfaces & contracts
 
