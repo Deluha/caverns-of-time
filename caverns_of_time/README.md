@@ -38,12 +38,18 @@ read-only transaction that is always rolled back. It decides the ledger first, t
 
 | Status | When |
 |---|---|
-| `applied` | the latest row of the step that is not `failed` has the step's current checksum; or the changeset has a `baseline` row and the step is at or before the baseline's step |
+| `applied` | the latest non-failed row matches, or the step is before the baseline's step, or is the baseline's step with an unchanged checksum |
 | `conflict` | the latest row of the step that is not `failed` has another checksum (the SQL was edited) |
 | `pending` | no such row, and the step has no check or its check is false |
 | `unknown` | no such row, but the check is true: the effect is present and nothing recorded it |
 
 A `failed` row never decides a status. A step's check runs only when the ledger is silent about the step.
+A check is exactly one SELECT statement: psycopg 3 refuses a second result set (`ChangesetError`), psycopg2
+cannot report one, so there the rule is documented rather than detected.
+
+A step inserted before the baseline's step counts as applied and never runs: add new steps after it. A
+`baseline` row whose step the changeset no longer has makes preflight and apply refuse (`ChangesetError`);
+because the ledger is append-only, the way out is a new changeset name. Keep the baseline's step in the changeset.
 
 **Nozdormu, apply.** `apply(connection, changeset, *, reapply=(), accept=())` runs preflight, then walks the
 steps in changeset order: `applied` is skipped, `pending` runs. Each write transaction starts at READ
@@ -58,7 +64,8 @@ step's own error. That happens when the failed step was Caverns' own `ledger` st
 that cannot create the schema), so there is no ledger to record into, or when the `failed` row cannot be
 written (a read-only session). A connection lost during a step raises the driver's error and records
 nothing. The rows written are returned and logged.
-`install` takes the same path for Caverns' own changeset.
+`install` takes the same path for Caverns' own changeset; when the ledger table exists without its row (a
+schema-only restore) it records its own step as `accepted` without running it, and logs a warning.
 
 A `conflict` or `unknown` step refuses the whole run before anything is executed or written
 (`PreflightRefused`, listing the steps) unless the caller acknowledges it:
@@ -79,7 +86,8 @@ default the last; that step's checksum; a fingerprint) and executes nothing; fro
 and including `through` is `applied`, the later ones follow the normal rules. It runs in one transaction
 under the advisory lock and is refused (`BaselineRefused`) when the changeset already has any ledger row.
 The fingerprint is the SHA-256 of a canonical JSON document of the tables (kinds `r` and `p`) and their
-columns (name, type, not-null, default) in the given schemas, read from the system catalogs; without
+columns (name, type, not-null, default) in the given schemas, read from the system catalogs with `search_path`
+pinned to `pg_catalog` (type and default expressions print relative to it); without
 `schemas` it covers every schema except `pg_*`, `information_schema` and `caverns`. A named schema that does
 not exist is refused. Phase 2 widens the fingerprint.
 
@@ -106,12 +114,14 @@ not exist is refused. Phase 2 widens the fingerprint.
   Every public function first refuses, with a `CavernsError` that names the fix, a connection with
   autocommit on, and a connection whose open transaction has written something (checked with
   `pg_current_xact_id_if_assigned()`); the caller's work is not rolled back, so it can commit it and call
-  again. A connection whose transaction has already failed is refused the same way, and also left
-  untouched: roll it back, then call again. A transaction that only read is accepted and ended with a
+  again. A connection whose transaction has already failed, or that is lost, is refused the same way
+  (a `CavernsError` from the driver's error), and also left untouched: roll it back or reconnect, then call again. A transaction that only read is accepted and ended with a
   rollback, which also ends anything transaction-scoped the caller set in it (`SET LOCAL`, an uncommitted
-  `SET`, transaction-level locks). A step's SQL and check run exactly as written, with no parameters, so a
+  `SET`, transaction-level locks). A psycopg 3 connection inside `with conn.transaction():` is unsupported,
+  because Caverns must commit and roll back itself. A step's SQL and check run exactly as written, with no parameters, so a
   `%` in them is literal.
-- `install(connection) -> list[LedgerEntry]`: the rows written, `[]` when the ledger is already installed.
+- `install(connection) -> list[LedgerEntry]`: the rows written, `[]` when the ledger is already installed;
+  one `accepted` row when the table exists without its row.
 - The ledger, `caverns.ledger`, one row per recorded event:
 
   | Column | Holds |

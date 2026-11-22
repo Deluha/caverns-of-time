@@ -69,7 +69,7 @@ def _validate_name(kind: str, value: object) -> None:
         raise ChangesetError(f"{kind} is empty")
     if value != value.strip():
         raise ChangesetError(f"{kind} {value!r} has surrounding whitespace")
-    if "\n" in value or "\r" in value:
+    if len(value.splitlines()) != 1:
         raise ChangesetError(f"{kind} {value!r} spans more than one line")
 
 
@@ -281,6 +281,7 @@ _INSERT_ENTRY_SQL = (
 # False when the connection's open transaction has written something (it holds a transaction id).
 _CLEAN_TRANSACTION_SQL = "SELECT pg_current_xact_id_if_assigned() IS NULL"
 _LOCK_SQL = "SELECT pg_advisory_xact_lock(%s::bigint)"
+_PIN_SEARCH_PATH_SQL = "SELECT set_config('search_path', 'pg_catalog', true)"
 # Under REPEATABLE READ or SERIALIZABLE the lock statement would take the snapshot before it waits.
 _READ_COMMITTED_SQL = "SET TRANSACTION ISOLATION LEVEL READ COMMITTED"
 _READ_ONLY_SQL = "SET TRANSACTION READ ONLY"
@@ -310,19 +311,19 @@ def _check_connection(connection: Connection) -> None:
             "the connection has autocommit on; Caverns commits and rolls back itself, "
             "so pass a connection with autocommit off"
         )
-    with _cursor(connection) as cursor:
-        try:
+    try:
+        with _cursor(connection) as cursor:
             cursor.execute(_CLEAN_TRANSACTION_SQL)
             row = cursor.fetchone()
-        except Exception as error:
-            # No rollback here either: the caller decides what becomes of its failed transaction.
-            raise CavernsError(
-                "the connection cannot run a statement: its transaction has failed or the connection is lost; "
-                "roll it back or reconnect before calling Caverns"
-            ) from error
-        if row is None or not row[0]:
-            # No rollback: the caller's work must survive the refusal.
-            raise CavernsError("the connection has uncommitted work; commit or roll it back before calling Caverns")
+    except Exception as error:
+        # No rollback here either: the caller decides what becomes of its failed transaction.
+        raise CavernsError(
+            "the connection cannot run a statement: its transaction has failed or the connection is lost; "
+            "roll it back or reconnect before calling Caverns"
+        ) from error
+    if row is None or not row[0]:
+        # No rollback: the caller's work must survive the refusal.
+        raise CavernsError("the connection has uncommitted work; commit or roll it back before calling Caverns")
     connection.rollback()  # only reads so far: nothing is lost
 
 
@@ -456,13 +457,29 @@ def _decide(
     return statuses
 
 
+def _has_more_results(cursor: _Cursor) -> bool:
+    """Whether the statement the cursor ran produced a further result set (a second statement)."""
+    nextset = getattr(cursor, "nextset", None)
+    if not callable(nextset):
+        return False
+    try:
+        return bool(nextset())
+    except Exception:
+        # NOTE: psycopg2 raises NotSupportedError here: such a driver cannot report further result sets,
+        # so the one-statement rule is documented rather than detected there.
+        return False
+
+
 def _run_check(cursor: _Cursor, label: str, check: str) -> bool:
-    """Run a step's check; it must return exactly one row with one boolean column."""
+    """Run a step's check; it must be one statement returning one row with one boolean column."""
     try:
         cursor.execute(check)
         rows = cursor.fetchall()
+        more = _has_more_results(cursor)
     except Exception as error:
         raise ChangesetError(f"the check of step {label!r} failed: {error}") from error
+    if more:
+        raise ChangesetError(f"the check of step {label!r} must be one statement")
     if len(rows) == 1 and len(rows[0]) == 1 and isinstance(rows[0][0], bool):
         return rows[0][0]
     raise ChangesetError(f"the check of step {label!r} must return one row with one boolean column")
@@ -494,6 +511,8 @@ def preflight(connection: Connection, changeset: Changeset) -> list[StepStatus]:
 
 def _names(argument: str, values: Collection[str]) -> frozenset[str]:
     """*values* as a set; a bare string is refused because it would be read as its characters."""
+    if values is None:
+        raise ChangesetError(f"{argument} must be a collection of names, not None")
     if isinstance(values, str):
         raise ChangesetError(f"{argument} must be a collection of names, not the string {values!r}")
     return frozenset(values)
@@ -618,7 +637,11 @@ def install(connection: Connection) -> list[LedgerEntry]:
     _check_connection(connection)
     with _read_only(connection) as cursor:
         statuses = _statuses(cursor, _OWN_CHANGESET)
-    return _apply_statuses(connection, _OWN_CHANGESET, statuses, frozenset(), frozenset())
+    # An effect without its row (a schema-only restore) is recorded as accepted: re-running would only repeat it.
+    unknown = frozenset(s.step.label for s in statuses if s.status is Status.UNKNOWN)
+    for label in sorted(unknown):
+        _log.warning("own step %s is present without a ledger row: recording it as accepted", label)
+    return _apply_statuses(connection, _OWN_CHANGESET, statuses, frozenset(), unknown)
 
 
 def apply(
@@ -704,6 +727,7 @@ def baseline(
         _require_installed(cursor)
     with _transaction(connection) as cursor:
         _lock(cursor)
+        cursor.execute(_PIN_SEARCH_PATH_SQL)  # format_type and pg_get_expr print names relative to search_path
         if _read_entries(cursor, changeset.name):
             raise BaselineRefused(f"changeset {changeset.name!r} already has ledger rows")
         fingerprint = _hash_document(_read_document(cursor, _resolve_schemas(cursor, names)))

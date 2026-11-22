@@ -20,7 +20,7 @@ SQL = "CREATE TABLE t (id int);"
 # --- Step validation ---------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("label", ["", " x", "x ", "a\nb", "a\rb", "\t"])
+@pytest.mark.parametrize("label", ["", " x", "x ", "a\nb", "a\rb", "a\u2028b", "a\x85b", "\t"])
 def test_step_rejects_a_bad_label(label: str) -> None:
     with pytest.raises(ChangesetError, match="step label"):
         Step(label, SQL)
@@ -123,7 +123,7 @@ def test_changeset_keeps_its_steps_as_a_tuple() -> None:
     assert changeset.steps == (Step("a", SQL), Step("b", SQL))
 
 
-@pytest.mark.parametrize("name", ["", " app", "a\nb"])
+@pytest.mark.parametrize("name", ["", " app", "a\nb", "a\u2029b"])
 def test_changeset_rejects_a_bad_name(name: str) -> None:
     with pytest.raises(ChangesetError, match="changeset name"):
         Changeset(name, [Step("a", SQL)])
@@ -305,6 +305,12 @@ def test_a_baseline_at_a_step_the_changeset_lacks_is_an_error() -> None:
     ghost = Step("ghost", "SELECT 1")
     with pytest.raises(ChangesetError, match="'ghost'"):
         _decide([_entry(1, ghost, "baseline")])
+
+
+@pytest.mark.parametrize("values", [None, "table"])
+def test_a_collection_of_names_is_not_none_or_a_string(values: object) -> None:
+    with pytest.raises(ChangesetError, match="must be a collection of names"):
+        nozdormu._names("accept", values)  # type: ignore[arg-type]
 
 
 def test_the_fingerprint_hash_ignores_key_order_and_sees_content() -> None:
