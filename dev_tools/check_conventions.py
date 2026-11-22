@@ -37,6 +37,8 @@ PERMANENT_DOCS = {
 TEST_FILE_RE = re.compile(r"(^|/)(test_[^/]*|[^/]*_test)\.py$")
 # C6: the only test-side files that may open a database connection or name a DSN.
 CONNECTION_OWNERS = {TESTS + "conftest.py"}
+# C9: names that skip or excuse a test.
+SKIP_NAMES = {"skip", "skipif", "xfail", "importorskip", "SkipTest"}
 # C7: command-line parsing lives in the Chromie entry module only.
 CLI_MODULES = {"argparse", "click", "typer"}
 CLI_ENTRY = PACKAGE + "chromie.py"
@@ -85,12 +87,28 @@ def check_no_print(sources: Iterable[Source]) -> list[str]:
     return out
 
 
+def _is_text(node: ast.expr) -> bool:
+    return isinstance(node, ast.JoinedStr) or (isinstance(node, ast.Constant) and isinstance(node.value, str))
+
+
 def _is_formatted_string(node: ast.expr) -> bool:
+    """A statement built by formatting plain text: an f-string, `"…" % x`, `"…" + x`, `"…".format(x)`.
+
+    The driver's own composition (`sql.SQL("…").format(sql.Identifier(t))`, `sql.SQL(…) + sql.Identifier(t)`)
+    has no plain-text operand and is not reported.
+    """
     if isinstance(node, ast.JoinedStr):
         return True
-    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Mod | ast.Add):
-        return True
-    return isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "format"
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Mod):
+        return _is_text(node.left)
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        return any(_is_text(side) or _is_formatted_string(side) for side in (node.left, node.right))
+    return (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "format"
+        and _is_text(node.func.value)
+    )
 
 
 def check_safe_sql(sources: Iterable[Source]) -> list[str]:
@@ -138,6 +156,13 @@ def check_module_docstrings(sources: Iterable[Source]) -> list[str]:
     return out
 
 
+def _called_name(node: ast.Call) -> str | None:
+    """The bare or attribute name a call invokes: `connect` for both `connect()` and `x.connect()`."""
+    if isinstance(node.func, ast.Name):
+        return node.func.id
+    return node.func.attr if isinstance(node.func, ast.Attribute) else None
+
+
 def check_test_connections(sources: Iterable[Source]) -> list[str]:
     """C6 (R8): tests reach the database through the conftest fixtures only."""
     out = []
@@ -148,8 +173,10 @@ def check_test_connections(sources: Iterable[Source]) -> list[str]:
         if tree is None:
             continue
         for node in ast.walk(tree):
-            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "connect":
+            if isinstance(node, ast.Call) and _called_name(node) == "connect":
                 out.append(f"{path}:{node.lineno}: C6 connect() in a test — take the conftest fixture (R8)")
+            if isinstance(node, ast.ImportFrom) and any(alias.name == "connect" for alias in node.names):
+                out.append(f"{path}:{node.lineno}: C6 `connect` imported in a test — take the conftest fixture (R8)")
             if isinstance(node, ast.Constant) and isinstance(node.value, str) and "postgresql://" in node.value:
                 out.append(f"{path}:{node.lineno}: C6 connection string in a test — take the conftest fixture (R8)")
     return out
@@ -189,11 +216,17 @@ def check_test_skips(sources: Iterable[Source]) -> list[str]:
         tree = _parse(path, source)
         if tree is None:
             continue
+        found: list[tuple[int, str]] = []
         for node in ast.walk(tree):
-            if isinstance(node, ast.Attribute) and node.attr in {"skip", "skipif", "xfail", "importorskip"}:
-                out.append(
-                    f"{path}:{node.lineno}: C9 `{node.attr}` in a test — a skipped test fails the done gate (R8)"
-                )
+            if isinstance(node, ast.Attribute):
+                found.append((node.lineno, node.attr))
+            elif isinstance(node, ast.Name):
+                found.append((node.lineno, node.id))
+            elif isinstance(node, ast.ImportFrom):
+                found += [(node.lineno, alias.name) for alias in node.names]
+        for lineno, name in sorted(found):
+            if name in SKIP_NAMES:
+                out.append(f"{path}:{lineno}: C9 `{name}` in a test — a skipped test fails the done gate (R8)")
     return out
 
 

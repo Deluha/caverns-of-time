@@ -27,7 +27,13 @@ def test_c3_formatted_sql() -> None:
         "    cur.execute('SELECT * FROM ' + t)\n"
         "    cur.executemany('SELECT {}'.format(t), [])\n"
     )
-    good = "def f(cur, q, t):\n    cur.execute(q)\n    cur.execute('SELECT %s', (t,))\n"
+    good = (
+        "def f(cur, q, t, sql):\n"
+        "    cur.execute(q)\n"
+        "    cur.execute('SELECT %s', (t,))\n"
+        "    cur.execute(sql.SQL('DROP TABLE {}').format(sql.Identifier(t)))\n"
+        "    cur.execute(sql.SQL('DROP TABLE ') + sql.Identifier(t))\n"
+    )
     assert [line.split(":")[1] for line in cc.check_safe_sql([(PKG + "a.py", bad)])] == ["2", "3", "4", "5"]
     assert cc.check_safe_sql([(PKG + "a.py", good), ("tests/t.py", bad)]) == []
 
@@ -54,6 +60,8 @@ def test_c6_test_connections() -> None:
     out = cc.check_test_connections([("tests/test_a.py", bad), ("tests/conftest.py", bad), (PKG + "a.py", bad)])
     assert [line.split(":")[1] for line in out] == ["2", "3"]
     assert all(line.startswith("tests/test_a.py") for line in out)
+    bare = "from psycopg import connect\nc = connect(dsn)\n"
+    assert [line.split(":")[1] for line in cc.check_test_connections([("tests/test_b.py", bare)])] == ["1", "2"]
 
 
 def test_c7_cli_entry() -> None:
@@ -77,6 +85,8 @@ def test_c9_test_skips() -> None:
     bad = "import pytest\n@pytest.mark.skipif(True, reason='x')\ndef test_a():\n    pytest.skip('x')\n"
     out = cc.check_test_skips([("tests/test_a.py", bad), ("tests/conftest.py", bad)])
     assert [line.split(":")[1] for line in out] == ["2", "4"]
+    bare = "import unittest\nfrom pytest import skip\ndef test_a():\n    skip('x')\n    raise unittest.SkipTest\n"
+    assert [line.split(":")[1] for line in cc.check_test_skips([("tests/test_b.py", bare)])] == ["2", "4", "5"]
 
 
 def test_syntax_errors_are_left_to_ruff() -> None:

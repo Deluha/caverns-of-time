@@ -18,8 +18,9 @@ library only, so each script runs on a bare Python. Not part of the distribution
 ## How it works
 
 - `verify.py` runs conventions, guidance integrity, `ruff check .`, `mypy`, `pytest -q` and docs-sync in
-  that order, never stopping at the first failure. For the pytest step it exports `CAVERNS_REQUIRE_DB=1`
-  and, when `CAVERNS_TEST_DSN` is unset, the local default from `database.py`.
+  that order, never stopping at the first failure. For the pytest step it exports `CAVERNS_REQUIRE_DB=1`,
+  drops a caller's `PYTEST_ADDOPTS` and, when `CAVERNS_TEST_DSN` is unset, uses the local default from
+  `database.py`.
 - The checkers are pure functions over explicit inputs; each `main()` wires the real repository. What
   each one parses: `.claude/skills/caverns-of-time-development/references/checkers.md`.
 - `database.py` holds the image tag, port and throwaway password of the test instance in one place.

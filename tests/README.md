@@ -11,7 +11,7 @@ database.
 | File | Covers | Database |
 |---|---|---|
 | `conftest.py` | The `db_dsn` and `db_conn` fixtures, the local-host guard, the `db` marker | — |
-| `test_database.py` | The instance itself: major version 18, per-test rollback, the image tag and connection string agreeing across CI, the dev container and `dev_tools/database.py`; the fixtures' guards | yes |
+| `test_database.py` | The instance itself: major version 18, rollback of uncommitted work, the image tag and connection string agreeing across CI, the dev container and `dev_tools/database.py`; the fixtures' guards | yes |
 | `test_check_conventions.py` | Convention rules C1–C9 on synthetic input, then the real repository | no |
 | `test_check_docs_sync.py` | The docs-sync classifier, token rules, git parsing | no |
 | `test_check_guidance_integrity.py` | Each guidance check on a miniature tree, then the real repository | no |
@@ -20,11 +20,15 @@ database.
 
 ## How it works
 
-- `db_conn` yields a connection to the test instance and rolls its work back when the test ends, so
-  tests never see each other's objects.
+- `db_conn` yields a connection to the test instance and rolls its uncommitted work back when the test
+  ends. Work a test commits is not undone: a test of committing code creates and drops its own schema
+  until a later phase adds a fixture for that.
 - Every test that takes `db_dsn` or `db_conn` is marked `db` automatically.
-- The connection string comes from `CAVERNS_TEST_DSN`. Its host must be `localhost`, `127.0.0.1` or
-  `::1`; anything else fails the test.
+- The connection string comes from `CAVERNS_TEST_DSN`. Every `host` and `hostaddr` entry, as libpq reads
+  them, must be `localhost`, `127.0.0.1` or `::1`; a host list, a `host=` parameter, a service entry or
+  a missing host fails the test.
+- With `CAVERNS_REQUIRE_DB=1` a run in which no database test passed fails as a whole, so deselecting
+  the database tests cannot produce a green run.
 
 | How pytest is run | `CAVERNS_TEST_DSN` unset | Instance unreachable |
 |---|---|---|
@@ -44,7 +48,7 @@ database.
 ## Extending
 
 Write a database test by taking `db_conn`. Create what the test needs inside the test; the rollback
-removes it. Add the file to the table above.
+removes whatever was not committed. Add the file to the table above.
 
 ## See also
 

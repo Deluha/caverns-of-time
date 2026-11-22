@@ -24,7 +24,7 @@ This repository holds no credential and its workflows use no secret.
   (`dev_tools/database.py`, the CI service container, the dev container). Its password is written in the
   repository on purpose: the instance holds no data and listens on localhost only.
 - **Consumer databases** — no test, workflow or development session connects to a consumer's database.
-  The test fixtures refuse a connection string whose host is not the local machine
+  The test fixtures refuse a connection string that can reach another machine
   (`tests/conftest.py`). A consumer supplies its own connection at run time; Caverns never stores one.
 - **Enforcement** — convention rule C8 (`dev_tools/check_conventions.py`) fails pre-commit and CI if a
   secret file or build artifact is tracked.

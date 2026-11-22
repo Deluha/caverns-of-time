@@ -29,12 +29,13 @@ repos:
     hooks:
       # The mechanically-checkable conventions (rules C1-C9: skill
       # references/checkers.md#checker-project-conventions). Whole-repo check
-      # (lists the files itself), so it runs whenever a .py or .md is part of the commit.
+      # (lists the files itself); it runs on every commit because C4 and C8 judge
+      # files of any type (a tracked key file, a stray markdown or SQL file).
       - id: project-conventions
         name: project conventions (check_conventions.py rules C1-C9)
         entry: python dev_tools/check_conventions.py
         language: system
-        files: \.(py|md)$
+        always_run: true
         pass_filenames: false
 
       # Ruff: pycodestyle, pyflakes, bugbear, import order, pyupgrade (config in

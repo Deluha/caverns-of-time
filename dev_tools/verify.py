@@ -57,6 +57,7 @@ def step_environment(environ: dict[str, str]) -> dict[str, str]:
     env = dict(environ)
     env.setdefault(DSN_VARIABLE, DEFAULT_DSN)
     env[REQUIRE_DB_VARIABLE] = "1"
+    env.pop("PYTEST_ADDOPTS", None)  # a caller's `-m "not db"` must not reach the pytest step
     return env
 
 

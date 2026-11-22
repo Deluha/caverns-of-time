@@ -29,3 +29,7 @@ def test_variable_names_match_the_fixtures() -> None:
     from tests import conftest
 
     assert (verify.DSN_VARIABLE, verify.REQUIRE_DB_VARIABLE) == (conftest.DSN_VARIABLE, conftest.REQUIRE_DB_VARIABLE)
+
+
+def test_environment_drops_pytest_options_from_the_caller() -> None:
+    assert "PYTEST_ADDOPTS" not in verify.step_environment({"PYTEST_ADDOPTS": '-m "not db"'})

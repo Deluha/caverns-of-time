@@ -18,5 +18,5 @@ repository:
   conventions, guidance-integrity and docs-sync checkers, and their tests.
 - A PostgreSQL 18 test instance for every environment: Docker locally and in cloud sessions, a service
   container in CI, a compose service in the dev container. The verify command and CI require it.
-- Pre-commit hooks, gitleaks, and three CI workflows ending in one `CI gate` check; mypy is strict and
-  gating.
+- Pre-commit hooks, gitleaks, and three CI workflows (pre-commit, docs sync, tests), each with one check
+  to require on `main`; mypy is strict and gating.
