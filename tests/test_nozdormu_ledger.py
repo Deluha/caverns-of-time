@@ -20,7 +20,7 @@ from caverns_of_time.errors import (
     PreflightRefused,
     StepFailed,
 )
-from caverns_of_time.nozdormu import Changeset, Status, Step, apply, baseline, install, preflight
+from caverns_of_time.nozdormu import Changeset, Status, Step, apply, baseline, history, install, preflight
 
 DRIVER_ERRORS = (psycopg.Error, psycopg2.Error)
 SCHEMA = Step("schema", "CREATE SCHEMA nozdormu_test", check="SELECT to_regnamespace('nozdormu_test') IS NOT NULL")
@@ -809,3 +809,72 @@ def test_the_default_schemas_are_every_one_but_the_system_ones_and_caverns(ledge
     default = _fingerprint(ledger_conn, "one")
     assert default == _fingerprint(ledger_conn, "two", schemas=[row[0] for row in names])
     assert default != _fingerprint(ledger_conn, "three", schemas=[row[0] for row in names] + ["caverns"])
+
+
+# --- history -------------------------------------------------------------------------------
+
+
+def _history_ledger(conn: Any) -> None:
+    """The ledger with its own row (version 1), then app's three steps (2 to 4) and one other changeset's row."""
+    install(conn)
+    apply(conn, APP)
+    _execute(
+        conn,
+        "INSERT INTO caverns.ledger (changeset, label, checksum, outcome, caverns_version)"
+        " VALUES ('other', 'x', %s, 'applied', 'test')",
+        (SCHEMA.checksum,),
+    )
+
+
+def test_history_is_the_whole_ledger_newest_first(ledger_conn: Any) -> None:
+    _history_ledger(ledger_conn)
+    entries = history(ledger_conn)
+    assert [e.version for e in entries] == [5, 4, 3, 2, 1]
+    assert [(e.changeset, e.label) for e in entries] == [
+        ("other", "x"), ("app", "index"), ("app", "table"), ("app", "schema"), ("caverns", "ledger"),
+    ]  # fmt: skip
+    _assert_idle(ledger_conn)
+
+
+def test_history_of_one_changeset(ledger_conn: Any) -> None:
+    _history_ledger(ledger_conn)
+    assert [e.label for e in history(ledger_conn, changeset="app")] == ["index", "table", "schema"]
+    assert [e.label for e in history(ledger_conn, changeset="caverns")] == ["ledger"]
+    assert history(ledger_conn, changeset="nobody") == []
+
+
+def test_history_limit_keeps_the_newest_rows(ledger_conn: Any) -> None:
+    _history_ledger(ledger_conn)
+    assert [e.version for e in history(ledger_conn, limit=2)] == [5, 4]
+    assert [e.version for e in history(ledger_conn, changeset="app", limit=1)] == [4]
+    assert len(history(ledger_conn, limit=100)) == 5
+
+
+def test_history_refuses_a_ledger_that_is_not_installed(ledger_conn: Any) -> None:
+    with pytest.raises(LedgerNotInstalled, match="call install"):
+        history(ledger_conn)
+    _assert_idle(ledger_conn)
+
+
+@pytest.mark.parametrize("limit", [0, -1, True, "3", 1.5])
+def test_history_refuses_a_limit_that_is_not_a_positive_integer(ledger_conn: Any, limit: Any) -> None:
+    install(ledger_conn)
+    with pytest.raises(ChangesetError, match="limit must be a positive integer"):
+        history(ledger_conn, limit=limit)
+    _assert_idle(ledger_conn)
+
+
+@pytest.mark.parametrize("name", ["", " app", "a\nb", 3])
+def test_history_refuses_an_invalid_changeset_name(ledger_conn: Any, name: Any) -> None:
+    install(ledger_conn)
+    with pytest.raises(ChangesetError, match="changeset name"):
+        history(ledger_conn, changeset=name)
+    _assert_idle(ledger_conn)
+
+
+def test_history_writes_nothing(ledger_conn: Any) -> None:
+    _history_ledger(ledger_conn)
+    before = _query(ledger_conn, LEDGER_ROWS)
+    history(ledger_conn, changeset="app", limit=2)
+    assert _query(ledger_conn, LEDGER_ROWS) == before
+    _assert_idle(ledger_conn)

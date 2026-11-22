@@ -14,7 +14,7 @@ components: Nozdormu, the migration ledger, and Chromie, the command line.
 | `errors.py` | The exception types, all in one module |
 | `console.py` | The console helpers: status lines with their icons, tables and JSON; the only module that prints |
 | `chromie.py` | Chromie: the `chromie` command's parsing, connection configuration and dispatch (command flow only) |
-| `nozdormu.py` | Nozdormu: the `Step` and `Changeset` model, the checksum, the loaders, the connection contract, the ledger, `install`, `preflight`, `apply` and `baseline` |
+| `nozdormu.py` | Nozdormu: the `Step` and `Changeset` model, the checksum, the loaders, the connection contract, the ledger, `install`, `preflight`, `history`, `apply` and `baseline` |
 
 ## How it works
 
@@ -101,6 +101,29 @@ other fallback, so a stray libpq environment never chooses the database. Every c
 0 success, 1 a finding the command exists to report, 2 a usage or environment error (bad arguments, no
 connection string, a refused connection, a Caverns error).
 
+`chromie log [--changeset NAME] [--limit N]` shows the ledger, newest first, as a table (`--limit` defaults to
+20, `0` shows every row; `--format json` is a list of objects with every ledger column, `recorded_at` as ISO 8601
+with its offset, `[]` when there are none). An empty result is an information line, exit 0:
+
+```text
+VERSION  CHANGESET  LABEL     OUTCOME  RECORDED_AT (UTC)    BY
+      2  app        1_schema  applied  2026-11-22 17:06:45  postgres
+      1  caverns    ledger    applied  2026-11-22 17:06:45  postgres
+```
+
+`chromie status DIRECTORY [--changeset NAME]` loads the directory as a changeset (named after the directory unless
+`--changeset` says otherwise) and prints each step's status with the version of the ledger row that decided it
+(`-` when none). Exit 0 when every step is `applied`, 1 when any is not (an error line lists them), 2 on a
+usage error such as a missing directory or a ledger that is not installed. `--format json` prints
+`{"changeset": ..., "steps": [{"label", "status", "version"}]}` with the same exit codes:
+
+```text
+LABEL     STATUS   VERSION
+1_schema  applied  2
+2_table   pending  -
+❌ 1 of 2 steps of changeset app not applied: 2_table (pending).
+```
+
 ## Interfaces & contracts
 
 - `caverns_of_time.__version__`: the version from `pyproject.toml`; `0+unknown` in a checkout that was
@@ -156,6 +179,11 @@ connection string, a refused connection, a Caverns error).
   `PreflightRefused` carries `statuses`; `StepFailed` carries `label` and `version`.
   The changeset name `caverns` is refused with a `ChangesetError`: the public functions take a consumer's
   changeset only.
+- `history(connection, *, changeset=None, limit=None) -> list[LedgerEntry]`: the ledger rows, newest first
+  (by version); only *changeset*'s when given (Caverns' own `caverns` included: reading is allowed), at most
+  *limit* rows (`None`: all). It runs in one read-only transaction and writes nothing. Raises
+  `LedgerNotInstalled` when the ledger table does not exist, and `ChangesetError` for an invalid changeset name or a
+  *limit* that is not an integer of 1 or more (a `bool` is not one).
 - `apply(connection, changeset, *, reapply=(), accept=()) -> list[LedgerEntry]`: the rows written, in order
   (`[]` when nothing is to do). A bare string for `reapply` or `accept`, or a label in both, is a `ChangesetError`.
   Raises `PreflightRefused` (attribute `statuses`, the offending steps), `StepFailed` (attributes `label`

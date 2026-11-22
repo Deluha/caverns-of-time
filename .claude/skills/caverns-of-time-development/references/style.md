@@ -45,6 +45,8 @@ Comments explain **why**, not **what**.
 |---|---|
 | `--dsn` | connection string (else the environment) |
 | `--schema` | a schema name |
+| `--changeset` | a changeset name |
+| `--limit` | the most rows to show (0: all) |
 | `--dry-run` | report what would change, write nothing |
 | `--yes` | skip the confirmation (required unattended) |
 | `--format` | output format |
