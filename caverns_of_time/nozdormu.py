@@ -13,7 +13,7 @@ import hashlib
 import logging
 import os
 import time
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Collection, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, fields
 from datetime import datetime
@@ -21,9 +21,9 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from caverns_of_time import __version__
-from caverns_of_time.errors import CavernsError, ChangesetError, LedgerNotInstalled
+from caverns_of_time.errors import CavernsError, ChangesetError, LedgerNotInstalled, PreflightRefused, StepFailed
 
-__all__ = ["Changeset", "Connection", "LedgerEntry", "Status", "Step", "StepStatus", "install", "preflight"]
+__all__ = ["Changeset", "Connection", "LedgerEntry", "Status", "Step", "StepStatus", "apply", "install", "preflight"]
 
 _log = logging.getLogger(__name__)
 
@@ -35,6 +35,7 @@ _MILLISECONDS = 1000
 _OWN_CHANGESET_NAME = "caverns"
 _OUTCOME_APPLIED = "applied"
 _OUTCOME_FAILED = "failed"
+_OUTCOME_ACCEPTED = "accepted"
 _OUTCOME_BASELINE = "baseline"
 # One key for every ledger write: Caverns' writers take turns, whatever the changeset.
 _ADVISORY_LOCK_KEY = 0x43617665726E73  # "Caverns"
@@ -417,16 +418,136 @@ def preflight(connection: Connection, changeset: Changeset) -> list[StepStatus]:
         return _statuses(cursor, changeset)
 
 
+def _names(argument: str, values: Collection[str]) -> frozenset[str]:
+    """*values* as a set; a bare string is refused because it would be read as its characters."""
+    if isinstance(values, str):
+        raise ChangesetError(f"{argument} must be a collection of names, not the string {values!r}")
+    return frozenset(values)
+
+
+def _acknowledged(status: StepStatus, reapply: frozenset[str], accept: frozenset[str]) -> bool:
+    """Whether the run may go on past this step as the caller asked."""
+    label, current = status.step.label, status.status
+    if label in reapply:
+        return current is Status.CONFLICT
+    if label in accept:
+        return current in (Status.CONFLICT, Status.UNKNOWN)
+    return current not in (Status.CONFLICT, Status.UNKNOWN)
+
+
+def _plan(
+    changeset: Changeset, statuses: Sequence[StepStatus], reapply: frozenset[str], accept: frozenset[str]
+) -> list[tuple[StepStatus, str]]:
+    """The steps a run writes, in order, each with the outcome to record; refuses before any is written."""
+    missing = sorted((reapply | accept) - {step.label for step in changeset.steps})
+    if missing:
+        raise ChangesetError(f"changeset {changeset.name!r} has no step {missing[0]!r} to reapply or accept")
+    both = sorted(reapply & accept)
+    if both:
+        raise ChangesetError(f"step {both[0]!r} is in both reapply and accept")
+    refused = [status for status in statuses if not _acknowledged(status, reapply, accept)]
+    if refused:
+        raise PreflightRefused(refused)
+    plan = []
+    for status in statuses:
+        if status.step.label in accept:
+            plan.append((status, _OUTCOME_ACCEPTED))
+        elif status.step.label in reapply or status.status is Status.PENDING:
+            plan.append((status, _OUTCOME_APPLIED))
+    return plan
+
+
+def _recheck(changeset: Changeset, status: StepStatus, entries: Sequence[LedgerEntry]) -> StepStatus:
+    """The step's status as the ledger says it now; where the ledger is silent the earlier status stands."""
+    index = changeset.steps.index(status.step)
+    decision = _ledger_decision(changeset, entries, index)
+    return status if decision is None else StepStatus(status.step, *decision)
+
+
+def _record_failure(
+    connection: Connection, changeset: Changeset, step: Step, error: Exception, duration_ms: int
+) -> StepFailed:
+    """Record a failed step in a transaction of its own; the error to raise."""
+    with _transaction(connection) as cursor:
+        _lock(cursor)
+        entry = _insert(cursor, changeset.name, step, _OUTCOME_FAILED, error=str(error), duration_ms=duration_ms)
+    _log.warning("step %s of changeset %s failed: ledger version %d", step.label, changeset.name, entry.version)
+    return StepFailed(step.label, entry.version)
+
+
+def _execute_step(connection: Connection, changeset: Changeset, cursor: _Cursor, step: Step) -> int:
+    """Run the step's SQL as written; its duration in milliseconds.
+
+    A failure rolls the transaction back, records a `failed` row and raises `StepFailed`.
+    """
+    started = time.monotonic()
+    try:
+        cursor.execute(step.sql)
+    except Exception as error:
+        connection.rollback()
+        raise _record_failure(connection, changeset, step, error, _elapsed_ms(started)) from error
+    return _elapsed_ms(started)
+
+
+def _write_step(connection: Connection, changeset: Changeset, status: StepStatus, outcome: str) -> LedgerEntry | None:
+    """Run or accept one step in one transaction; None when another runner applied it first.
+
+    The ledger is read again under the lock: a status that changed since preflight (an `applied`
+    one means the work is done) must not be acted on.
+    """
+    step = status.step
+    with _transaction(connection) as cursor:
+        _lock(cursor)
+        current = _recheck(changeset, status, _read_entries(cursor, changeset.name))
+        if current.status is Status.APPLIED:
+            return None
+        if current.status is not status.status:
+            raise PreflightRefused([current])
+        duration = _execute_step(connection, changeset, cursor, step) if outcome == _OUTCOME_APPLIED else None
+        return _insert(cursor, changeset.name, step, outcome, duration_ms=duration)
+
+
+def _apply_statuses(
+    connection: Connection,
+    changeset: Changeset,
+    statuses: Sequence[StepStatus],
+    reapply: frozenset[str],
+    accept: frozenset[str],
+) -> list[LedgerEntry]:
+    """Walk the planned steps in order, each in its own transaction; the rows written."""
+    written = []
+    for status, outcome in _plan(changeset, statuses, reapply, accept):
+        entry = _write_step(connection, changeset, status, outcome)
+        if entry is not None:
+            _log.info(
+                "%s step %s of changeset %s: ledger version %d", outcome, entry.label, entry.changeset, entry.version
+            )
+            written.append(entry)
+    return written
+
+
 def install(connection: Connection) -> list[LedgerEntry]:
     """Create the ledger by applying Caverns' own changeset; the rows written ([] when installed)."""
     _check_connection(connection)
-    step = _OWN_CHANGESET.steps[0]
-    with _transaction(connection) as cursor:
-        _lock(cursor)
-        if _read_entries(cursor, _OWN_CHANGESET_NAME):
-            return []
-        started = time.monotonic()
-        cursor.execute(step.sql)
-        entry = _insert(cursor, _OWN_CHANGESET_NAME, step, _OUTCOME_APPLIED, duration_ms=_elapsed_ms(started))
-    _log.info("installed the ledger: version %d", entry.version)
-    return [entry]
+    with _read_only(connection) as cursor:
+        statuses = _statuses(cursor, _OWN_CHANGESET)
+    return _apply_statuses(connection, _OWN_CHANGESET, statuses, frozenset(), frozenset())
+
+
+def apply(
+    connection: Connection,
+    changeset: Changeset,
+    *,
+    reapply: Collection[str] = (),
+    accept: Collection[str] = (),
+) -> list[LedgerEntry]:
+    """Apply the steps of *changeset* that are pending, one transaction and one ledger row each.
+
+    A step already applied is skipped. A `conflict` or `unknown` step refuses the whole run
+    (`PreflightRefused`, nothing written) unless named in *reapply* (conflict only: run the edited
+    SQL, record a new `applied` row) or *accept* (conflict or unknown: record `accepted` without
+    running). A step that fails is rolled back, recorded as `failed` and raised as `StepFailed`;
+    later steps do not run. Returns the rows written, in order.
+    """
+    statuses = preflight(connection, changeset)
+    return _apply_statuses(connection, changeset, statuses, _names("reapply", reapply), _names("accept", accept))

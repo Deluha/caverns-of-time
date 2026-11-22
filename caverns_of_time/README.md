@@ -12,7 +12,7 @@ migration ledger (in progress; this file describes what is built).
 |---|---|
 | `__init__.py` | `__version__`, read from the installed distribution's metadata |
 | `errors.py` | The exception types, all in one module |
-| `nozdormu.py` | Nozdormu: the `Step` and `Changeset` model, the checksum, the loaders, the connection contract, the ledger, `install` and `preflight` |
+| `nozdormu.py` | Nozdormu: the `Step` and `Changeset` model, the checksum, the loaders, the connection contract, the ledger, `install`, `preflight` and `apply` |
 
 ## How it works
 
@@ -43,6 +43,28 @@ read-only transaction that is always rolled back. It decides the ledger first, t
 | `unknown` | no such row, but the check is true: the effect is present and nothing recorded it |
 
 A `failed` row never decides a status. A step's check runs only when the ledger is silent about the step.
+
+**Nozdormu, apply.** `apply(connection, changeset, *, reapply=(), accept=())` runs preflight, then walks the
+steps in changeset order: `applied` is skipped, `pending` runs. Each step is its own transaction: take
+the ledger's advisory lock, read the ledger again (a step another runner applied meanwhile is skipped; one
+whose status changed otherwise refuses the run), execute the step's SQL as written, insert the ledger row
+and commit, so the step's effect and its row stand or fall together. A step that raises is rolled back,
+then recorded as a `failed` row in a transaction of its own, and `StepFailed` is raised from the database
+error; later steps do not run, and the step is `pending` again. The rows written are returned and logged.
+`install` takes the same path for Caverns' own changeset.
+
+A `conflict` or `unknown` step refuses the whole run before anything is executed or written
+(`PreflightRefused`, listing the steps) unless the caller acknowledges it:
+
+| Argument | Allowed for | Effect |
+|---|---|---|
+| `reapply` | `conflict` | run the edited SQL, record a new `applied` row; the old row stays |
+| `accept` | `conflict`, `unknown` | record an `accepted` row with the current checksum, run nothing |
+
+Naming a step in any other status is a `PreflightRefused`; naming a label the changeset lacks, or one
+label in both, is a `ChangesetError`. Preferred practice: add a new step rather than edit one that has
+been applied. Statements that cannot run inside a transaction (`CREATE INDEX CONCURRENTLY`) are
+unsupported in v0.1: such a step fails and is recorded as a failed step.
 
 ## Interfaces & contracts
 
@@ -88,6 +110,10 @@ A `failed` row never decides a status. A step's check runs only when the ledger 
   `LedgerNotInstalled` is raised when Caverns' own changeset is not fully applied (call `install` first).
   The changeset name `caverns` is refused with a `ChangesetError`: the public functions take a consumer's
   changeset only.
+- `apply(connection, changeset, *, reapply=(), accept=()) -> list[LedgerEntry]`: the rows written, in order.
+  Raises `PreflightRefused` (attribute `statuses`, the offending steps), `StepFailed` (attributes `label`
+  and `version`, the failed row's ledger version; its `__cause__` is the driver's error) and the errors of
+  `preflight`.
 - The own changeset is never edited once released: a change to the ledger is a new own step (hard rule 6).
   The ledger's DDL is idempotent, and `caverns` is a reserved changeset name.
 - No runtime dependency. Adding one is an ask-first decision.
