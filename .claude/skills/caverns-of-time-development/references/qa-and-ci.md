@@ -104,5 +104,6 @@ No workflow holds a secret, and none connects to anything but its own service co
 
 `pyproject.toml` is the only place dependencies are declared. Runtime dependencies are ask-first and
 arrive in the same PR as their first import. The `dev` extra carries the tooling (pytest, ruff, mypy,
-pre-commit, actionlint) and the test suite's PostgreSQL drivers (psycopg 3 and psycopg2). Pin minimally; pin exactly only where
-a new release must arrive as a reviewed bump (actionlint, the gitleaks version in the workflow).
+pre-commit, actionlint) and the test suite's PostgreSQL drivers (psycopg 3 and psycopg2). Pin minimally;
+pin exactly only where a new release must arrive as a reviewed bump (actionlint, the gitleaks version in
+the workflow).

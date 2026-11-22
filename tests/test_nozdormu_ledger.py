@@ -279,6 +279,20 @@ def test_a_connection_with_uncommitted_work_is_refused_and_keeps_its_work(ledger
     assert _query(ledger_conn, LEDGER_ROWS) == [(1, "caverns", "ledger", "applied")]
 
 
+def test_a_connection_with_a_failed_transaction_is_refused_untouched(ledger_conn: Any) -> None:
+    install(ledger_conn)
+    try:
+        with ledger_conn.cursor() as cursor:
+            cursor.execute("SELECT 1/0")
+    except Exception:  # the driver's own error; the transaction is now aborted
+        pass
+    with pytest.raises(CavernsError, match="transaction has failed") as refused:
+        preflight(ledger_conn, APP)
+    assert refused.value.__cause__ is not None
+    ledger_conn.rollback()
+    assert len(preflight(ledger_conn, APP)) == len(APP.steps)
+
+
 def test_preflight_accepts_a_connection_with_an_open_read_only_transaction(ledger_conn: Any) -> None:
     install(ledger_conn)
     with ledger_conn.cursor() as cursor:
@@ -442,6 +456,8 @@ def test_apply_refuses_a_bad_acknowledgement(ledger_conn: Any, kwargs: dict[str,
     assert _query(ledger_conn, APP_ROWS) == [("schema", "applied"), ("table", "applied")]
 
 
+READ_ONLY_SESSION_SQL = "SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY"
+READ_WRITE_SESSION_SQL = "SET SESSION CHARACTERISTICS AS TRANSACTION READ WRITE"
 BAD = Step(
     "bad",
     "CREATE TABLE nozdormu_test.bad (id int); SELECT 1 / 0",
@@ -473,7 +489,7 @@ def test_a_failed_step_can_be_fixed_and_applied(ledger_conn: Any) -> None:
     assert [(e.label, e.outcome) for e in apply(ledger_conn, fixed)] == [("bad", "applied"), ("later", "applied")]
 
 
-def test_a_failing_own_step_raises_the_driver_error_and_records_nothing(
+def test_a_failing_own_step_raises_a_caverns_error_and_records_nothing(
     ledger_conn: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     failing = Changeset("caverns", [Step("ledger", "SELECT 1/0", check=nozdormu._LEDGER_EXISTS_SQL)])
@@ -483,6 +499,21 @@ def test_a_failing_own_step_raises_the_driver_error_and_records_nothing(
     assert not isinstance(refused.value, StepFailed)
     assert isinstance(refused.value.__cause__, DRIVER_ERRORS) and "division by zero" in str(refused.value.__cause__)
     assert not _exists(ledger_conn, "caverns.ledger")  # the connection is usable and nothing was written
+
+
+def test_a_failure_that_cannot_be_recorded_raises_a_caverns_error(ledger_conn: Any) -> None:
+    install(ledger_conn)
+    _execute(ledger_conn, "CREATE SCHEMA nozdormu_test")
+    _execute(ledger_conn, READ_ONLY_SESSION_SQL)
+    try:
+        with pytest.raises(CavernsError, match="could not be recorded") as refused:
+            apply(ledger_conn, Changeset("app", [Step("ro", "CREATE TABLE nozdormu_test.ro_t ()")]))
+    finally:
+        _execute(ledger_conn, READ_WRITE_SESSION_SQL)
+    assert not isinstance(refused.value, StepFailed)
+    assert isinstance(refused.value.__cause__, DRIVER_ERRORS)
+    assert _query(ledger_conn, APP_ROWS) == []
+    assert not _exists(ledger_conn, "nozdormu_test.ro_t")
 
 
 def test_apply_skips_a_step_another_runner_applied_after_preflight(ledger_conn: Any) -> None:
@@ -508,7 +539,12 @@ RACE_STEP = Step("race", "CREATE TABLE nozdormu_test.race_t ()")
 RACE = Changeset("race", [RACE_STEP])
 RACE_ROWS = "SELECT label, outcome FROM caverns.ledger WHERE changeset = 'race' ORDER BY version"
 REPEATABLE_READ_SQL = "SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL REPEATABLE READ"
-WAITING_LOCKS_SQL = "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND NOT granted"
+# pg_locks shows a bigint advisory key as its high (classid) and low (objid) 32 bits.
+LOCK_KEY_HIGH = nozdormu._ADVISORY_LOCK_KEY >> 32
+LOCK_KEY_LOW = nozdormu._ADVISORY_LOCK_KEY & 0xFFFFFFFF
+WAITING_LOCKS_SQL = (
+    "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND NOT granted AND classid = %s AND objid = %s"
+)
 WAIT_SECONDS = 10.0
 POLL_SECONDS = 0.02
 
@@ -517,7 +553,7 @@ def _wait_for_a_waiting_lock(conn: Any) -> None:
     deadline = time.monotonic() + WAIT_SECONDS
     with conn.cursor() as cursor:
         while time.monotonic() < deadline:
-            cursor.execute(WAITING_LOCKS_SQL)
+            cursor.execute(WAITING_LOCKS_SQL, (LOCK_KEY_HIGH, LOCK_KEY_LOW))
             if cursor.fetchone()[0] == 1:
                 return
             time.sleep(POLL_SECONDS)
@@ -538,7 +574,7 @@ def test_a_runner_waits_for_the_lock_and_reads_the_ledger_after_it(ledger_conn: 
         except BaseException as error:  # reported by the assertions below
             result["error"] = error
 
-    runner = threading.Thread(target=run)
+    runner = threading.Thread(target=run, daemon=True)
     runner.start()
     try:
         _wait_for_a_waiting_lock(second_conn)

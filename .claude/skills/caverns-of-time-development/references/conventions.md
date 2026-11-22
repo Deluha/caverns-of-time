@@ -52,7 +52,8 @@ A ledger row records something that happened; it is never updated and never dele
 failure, a re-apply and a retention action are new rows. No code path issues `UPDATE`, `DELETE` or
 `TRUNCATE` against a ledger table, and no migration of Caverns' own schema rewrites existing rows.
 
-Enforced: review, plus the ledger's triggers, tested by `test_the_ledger_is_append_only` in `tests/test_nozdormu_ledger.py` (UPDATE, DELETE and TRUNCATE are rejected).
+Enforced: review, plus the ledger's triggers, tested by `test_the_ledger_is_append_only` in
+`tests/test_nozdormu_ledger.py` (UPDATE, DELETE and TRUNCATE are rejected).
 
 ## R6 own changes go through the ledger
 
