@@ -13,11 +13,11 @@ components: Nozdormu, the migration ledger, Chromie, the command line, and Infin
 | `__init__.py` | `__version__`, read from the installed distribution's metadata |
 | `errors.py` | The exception types, all in one module |
 | `_connection.py` | Shared private plumbing, not a component: the `Connection` and `Cursor` protocols, the connection guard, the transaction helpers, the one-statement check runner and the collection-of-names guard |
-| `_fingerprint.py` | Shared private fingerprint machinery, not a component: `Fingerprint`, the catalog queries, the document and its hash, the default and missing schemas |
+| `_fingerprint.py` | Shared private fingerprint machinery, not a component: `Fingerprint`, the catalog queries, the document and its hash, the default, watched and missing schemas, `Difference` and `compare`, and the storage of fingerprints in `caverns.fingerprint` (`record`, `latest`) |
 | `console.py` | The console helpers: status lines with their icons, tables and JSON; the only module that prints |
 | `chromie.py` | Chromie: the `chromie` command's parsing, connection configuration and dispatch (command flow only) |
 | `nozdormu.py` | Nozdormu: the `Step` and `Changeset` model, the checksum, the loaders, the connection contract, the ledger, `install`, `preflight`, `history`, `apply` and `baseline` |
-| `infinite.py` | Infinite: `fingerprint` and the `Fingerprint` it returns |
+| `infinite.py` | Infinite: `fingerprint` and the `Fingerprint` it returns, `drift` and the `Drift` and `Difference` it returns |
 
 ## How it works
 
@@ -32,10 +32,13 @@ sub-directories, is a step in file-name order, labelled with the file name minus
 readable from one file (`Step.from_file`).
 
 **Nozdormu, the ledger.** Every recorded change is a row of `caverns.ledger`. Caverns creates it itself:
-`install(connection)` applies Caverns' own changeset (named `caverns`, one step `ledger`) and records that
-step as the ledger's first row, in the same transaction as the DDL. Installing again writes nothing and
-returns `[]`. Until the ledger exists, reading it behaves as an empty ledger; that is how the own
-changeset bootstraps.
+`install(connection)` applies Caverns' own changeset (named `caverns`, two steps: `ledger`, then `fingerprint`,
+the table of recorded fingerprints) and records each step as a ledger row, in the same transaction as its DDL.
+Installing again writes nothing and returns `[]`. Until the ledger exists, reading it behaves as an empty
+ledger; that is how the own changeset bootstraps. A database installed before the `fingerprint` step existed
+has only the `ledger` row: call `install()` again after upgrading, which applies `fingerprint` as a pending
+step; until then `preflight`, `apply`, `baseline` and `drift` raise `LedgerNotInstalled` (`history` needs only
+the ledger table and keeps working). `install` records no fingerprint.
 
 **Nozdormu, preflight.** `preflight(connection, changeset)` reports one `StepStatus` (step, status and the
 ledger row that decided it, if any) per step in changeset order and writes nothing: it runs in one
@@ -69,6 +72,19 @@ step's own error. That happens when the failed step was Caverns' own `ledger` st
 that cannot create the schema), so there is no ledger to record into, or when the `failed` row cannot be
 written (a read-only session). A connection lost during a step raises the driver's error and records
 nothing. The rows written are returned and logged.
+
+A run that writes ledger rows stores one fingerprint in `caverns.fingerprint` (below), in the transaction of
+its last ledger row: the last planned step's transaction when that step writes a row, or, when a step fails,
+the transaction that records its `failed` row (the database is then as the steps before it left it). If that
+failure cannot be recorded, no fingerprint is. A run that writes nothing stores nothing, and neither does
+`install`. The fingerprint covers the watched schemas: those of the latest recorded fingerprint, else every
+schema but `pg_*`, `information_schema` and `caverns`; a `baseline` that named schemas thus sets what later
+runs watch. If another runner applied the run's last planned step first, the run's rows have no fingerprint.
+Before its first step, and only when the run has a step to write, `apply` compares the live schemas with the
+latest recorded fingerprint in a read-only transaction and logs one warning per difference through the
+`caverns_of_time.nozdormu` logger (`drift before applying changeset <name>: <change> <kind> <name>`); it never
+refuses, and says nothing when no fingerprint is recorded. The warning only reaches logs: in CI run
+`chromie drift` before `apply` to fail the build on drift.
 `install` takes the same path for Caverns' own changeset; when the ledger table exists without its row (a
 schema-only restore) it records its own step as `accepted` without running it, and logs a warning.
 
@@ -91,7 +107,9 @@ default the last; that step's checksum; a fingerprint) and executes nothing; fro
 and including `through` is `applied`, the later ones follow the normal rules. It runs in one transaction
 under the advisory lock and is refused (`BaselineRefused`) when the changeset already has any ledger row.
 The fingerprint is the hash of Infinite's fingerprint (below) of the given schemas; without `schemas` it
-covers every schema except `pg_*`, `information_schema` and `caverns`. A named schema that does not exist is refused.
+covers the watched schemas (the latest recorded fingerprint's, else every schema except `pg_*`,
+`information_schema` and `caverns`). A named schema that does not exist is refused. The baseline also stores
+the fingerprint in `caverns.fingerprint`, in the same transaction, at the baseline row's version.
 
 **Infinite, the fingerprint.** `infinite.fingerprint(connection, *, schemas=None)` reads the shape of a
 database's schemas from the system catalogs, in one read-only transaction that writes nothing and is always
@@ -111,7 +129,32 @@ named appears with all six kinds, empty when it holds none, so an empty or dropp
 An object that belongs to an extension is left out (an extension's table takes its indexes and constraints with
 it). Not covered: triggers, sequences, types, grants, ownership, comments and extensions themselves. The hash is the
 SHA-256 of the document's canonical JSON (sorted keys, no whitespace). Without `schemas` the fingerprint covers
-every schema except `pg_*`, `information_schema` and `caverns`; the result's `schemas` are sorted and unique.
+the watched schemas, which are those of the latest recorded fingerprint, else every schema except `pg_*`,
+`information_schema` and `caverns`; the result's `schemas` are sorted and unique.
+
+**Infinite, drift.** `infinite.drift(connection, changeset=None, *, schemas=None)` compares the live schemas with
+the latest row of `caverns.fingerprint` in one read-only transaction and writes nothing. It reads the live document
+of the recorded fingerprint's schemas (`schemas` narrows both sides to those of them it names) and reports each
+object only in the live one as `added`, only in the recorded one as `removed`, and in both with another value
+as `changed`, one `Difference(kind, name, change)` each, sorted by schema, kind and key; `name` is
+`<schema>.<key>`, for example `public.users.nickname` or `public.touch_updated()`. A dropped schema reads as all
+its objects removed. With a `changeset`, a step the ledger records as `applied` whose check is now false is a
+disagreement between the ledger and the database, returned as its `StepStatus`; a step without a check, or
+`unknown`, never is. The checks run before the catalogs are read, with the session's `search_path`.
+
+**The fingerprint table.** `caverns.fingerprint`, created by the own step `fingerprint`, holds one row per
+apply run that writes ledger rows and per baseline:
+
+| Column | Holds |
+|---|---|
+| `version` | primary key; the ledger version of the run's last row (a foreign key to `caverns.ledger`) |
+| `schemas` | the schemas read (`text[]`, sorted) |
+| `document` | the fingerprint's document (`jsonb`) |
+| `hash` | its SHA-256 (64 lower-case hex digits) |
+| `recorded_at` | `clock_timestamp()` at insert |
+
+It is append-only like the ledger: triggers reject UPDATE, DELETE and TRUNCATE. Truncating the ledger is also
+refused, by the foreign key, unless it cascades, and then by the ledger's trigger.
 
 **Chromie, the command line.** `chromie` is installed with the `cli` extra
 (`pip install 'caverns-of-time[cli]'`), which brings its driver, psycopg 3; the library itself imports
@@ -144,6 +187,25 @@ LABEL     STATUS   VERSION
 ❌ 1 of 2 steps of changeset app not applied: 2_table (pending).
 ```
 
+`chromie drift [DIRECTORY] [--changeset NAME] [--schema NAME ...]` compares the live schema with the last
+recorded fingerprint (`infinite.drift`). `DIRECTORY` is optional: given, its changeset's applied steps whose
+check is now false are reported too (`--changeset` names it as for `status`; without a `DIRECTORY` it is a usage
+error). `--schema` (repeatable) narrows the report to those watched schemas. Each difference is a line, `+`
+added, `-` removed, `~` changed, then its kind and name; a disagreement is `~  step`. Exit 0 when nothing differs,
+1 on drift (an error line counts them), 2 on a usage error: no fingerprint recorded yet, a ledger that is not
+installed, an unwatched schema, a missing directory. `--format json` prints
+`{"fingerprint_version", "schemas", "differences": [{"kind", "name", "change"}], "disagreements":
+[{"changeset", "label", "version"}]}` with the same exit codes and no status lines:
+
+```text
+ℹ️ Comparing with the fingerprint at ledger version 4 (schemas: public).
++  column  public.users.nickname
+~  step    app/2_table: recorded applied, check now false
+❌ Drift: 2 differences.
+```
+
+With nothing found: `✅ No drift — the live schema matches the fingerprint at ledger version 4.`
+
 ## Interfaces & contracts
 
 - `caverns_of_time.__version__`: the version from `pyproject.toml`; `0+unknown` in a checkout that was
@@ -173,8 +235,8 @@ LABEL     STATUS   VERSION
   `SET`, transaction-level locks). A psycopg 3 connection inside `with conn.transaction():` is unsupported,
   because Caverns must commit and roll back itself. A step's SQL and check run exactly as written, with no parameters, so a
   `%` in them is literal.
-- `install(connection) -> list[LedgerEntry]`: the rows written, `[]` when the ledger is already installed;
-  one `accepted` row when the table exists without its row.
+- `install(connection) -> list[LedgerEntry]`: the rows written, one per own step not yet applied, `[]` when
+  Caverns is already installed; an `accepted` row for an own step whose table exists without its row.
 - The ledger, `caverns.ledger`, one row per recorded event:
 
   | Column | Holds |
@@ -195,7 +257,8 @@ LABEL     STATUS   VERSION
 - `preflight(connection, changeset) -> list[StepStatus]` and `Status` (`applied`, `pending`, `unknown`,
   `conflict`). A check that does not return exactly one row with one boolean column, or raises a database
   error, is a `ChangesetError` naming the step; so is a `baseline` row at a step the changeset lacks.
-  `LedgerNotInstalled` is raised when Caverns' own changeset is not fully applied (call `install` first).
+  `LedgerNotInstalled` is raised when Caverns' own changeset is not fully applied (call `install` first,
+  also after an upgrade that added an own step).
   `PreflightRefused` carries `statuses`; `StepFailed` carries `label` and `version`.
   The changeset name `caverns` is refused with a `ChangesetError`: the public functions take a consumer's
   changeset only.
@@ -209,20 +272,28 @@ LABEL     STATUS   VERSION
   Raises `PreflightRefused` (attribute `statuses`, the offending steps), `StepFailed` (attributes `label`
   and `version`, the failed row's ledger version; its `__cause__` is the driver's error), a plain
   `CavernsError` (its `__cause__` is the step's error) when a failed step cannot be recorded, and the
-  errors of `preflight`.
+  errors of `preflight`. A run that writes rows stores a fingerprint and may log drift warnings (see apply).
 - `baseline(connection, changeset, *, through=None, schemas=None) -> LedgerEntry`: the row written. Raises
   `BaselineRefused` (the changeset has rows; a named schema that does not exist) and `ChangesetError` (a
-  `through` the changeset lacks, a bare string for `schemas`, an empty `schemas`).
+  `through` the changeset lacks, a bare string for `schemas`, an empty `schemas`). It stores the fingerprint.
 - `infinite.fingerprint(connection, *, schemas=None) -> Fingerprint`: `Fingerprint(schemas, document, hash)`, a
-  frozen dataclass of the sorted, unique schema names (a tuple), the document and its SHA-256 hex. It runs in one
-  read-only transaction and writes nothing. Raises `ChangesetError` for a bare string, a name that is not a string
+  frozen dataclass of the sorted, unique schema names (a tuple), the document and its SHA-256 hex; without
+  `schemas`, the watched ones. It runs in one read-only transaction and writes nothing. Raises `ChangesetError` for a bare string, a name that is not a string
   or an empty collection for `schemas`, and for a named schema that does not exist; the connection is checked as
   for every public function.
-- The public names are `Connection`, `LedgerEntry`, `Status`, `StepStatus`, `Step`, `Changeset`, `Fingerprint` and the
-  functions above; the exceptions, all in `caverns_of_time.errors`, are `CavernsError` (the base),
-  `ChangesetError`, `LedgerNotInstalled`, `PreflightRefused`, `StepFailed` and `BaselineRefused`.
-- The own changeset is never edited once released: a change to the ledger is a new own step (hard rule 6).
-  The ledger's DDL is idempotent, and `caverns` is a reserved changeset name.
+- `infinite.drift(connection, changeset=None, *, schemas=None) -> Drift`: `Drift(fingerprint_version, schemas,
+  differences, disagreements)`, a frozen dataclass of the ledger version of the fingerprint compared with, the
+  schemas compared (a tuple), the `Difference(kind, name, change)` values (`kind` one of the six kinds, `change`
+  `added`, `removed` or `changed`) and the `StepStatus` values of the disagreements, each a tuple; `found` is true
+  when either is not empty. One read-only transaction, nothing written. Raises `LedgerNotInstalled` before
+  `install()` (the fingerprint table does not exist), `NoFingerprint` when none is recorded, `ChangesetError`
+  for a bad `schemas` or one that is not watched, and the errors of `preflight` for a `changeset`.
+- The public names are `Connection`, `LedgerEntry`, `Status`, `StepStatus`, `Step`, `Changeset`, `Fingerprint`,
+  `Difference`, `Drift` and the functions above; the exceptions, all in `caverns_of_time.errors`, are
+  `CavernsError` (the base), `ChangesetError`, `LedgerNotInstalled`, `PreflightRefused`, `StepFailed`,
+  `BaselineRefused` and `NoFingerprint`.
+- The own changeset is never edited once released: a change to the ledger or the fingerprint table is a new own
+  step (hard rule 6). The DDL of each step is idempotent, and `caverns` is a reserved changeset name.
 - No runtime dependency for the library; the CLI's driver (psycopg 3) is the optional `cli` extra. Adding
   a dependency is an ask-first decision.
 

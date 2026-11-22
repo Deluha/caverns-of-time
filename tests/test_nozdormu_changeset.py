@@ -224,7 +224,8 @@ def test_the_ledger_column_lists_are_the_ledger_entry_fields() -> None:
     assert returning.group(1).split(", ") == columns
 
 
-def test_every_sql_constant_names_the_one_ledger_table() -> None:
+@pytest.mark.parametrize("table", ["ledger", "fingerprint"])
+def test_every_sql_constant_names_the_own_tables_in_the_own_schema(table: str) -> None:
     constants = {
         f"{module.__name__}.{name}": value
         for module in (nozdormu, _connection, _fingerprint)
@@ -232,9 +233,21 @@ def test_every_sql_constant_names_the_one_ledger_table() -> None:
         if name.endswith("_SQL") and isinstance(value, str)
     }
     assert constants
+    assert any(f".{table}" in sql for sql in constants.values())
     for name, sql in constants.items():
-        for qualifier in re.findall(r"(\w+)\.ledger\b", sql):
+        for qualifier in re.findall(rf"(\w+)\.{table}\b", sql):
             assert qualifier == nozdormu._OWN_CHANGESET_NAME, name
+
+
+def test_the_own_changeset_is_the_ledger_step_then_the_fingerprint_step() -> None:
+    assert [step.label for step in nozdormu._OWN_CHANGESET.steps] == ["ledger", "fingerprint"]
+    assert all(step.check for step in nozdormu._OWN_CHANGESET.steps)
+
+
+def test_the_released_ledger_step_is_byte_identical() -> None:
+    """Its checksum is in every consumer's ledger: an edit of the statement would read as a conflict."""
+    released = "6ccdacf3430bfa341afd4f7f0d7fdba8a76c5ce344b58109387a38ca7ab1251b"
+    assert nozdormu._OWN_CHANGESET.steps[0].checksum == released
 
 
 def test_the_default_schemas_query_leaves_out_the_own_schema_by_its_name() -> None:

@@ -20,7 +20,17 @@ from pathlib import Path
 
 from caverns_of_time import __version__
 from caverns_of_time._connection import Connection, Cursor, check_connection, names, read_only, run_check, transaction
-from caverns_of_time._fingerprint import capture, named_schemas, resolve_schemas
+from caverns_of_time._fingerprint import (
+    FINGERPRINT_EXISTS_SQL,
+    capture,
+    compare,
+    named_schemas,
+    read_document,
+    record,
+    resolve_schemas,
+    watched_schemas,
+)
+from caverns_of_time._fingerprint import latest as latest_fingerprint
 from caverns_of_time.errors import (
     BaselineRefused,
     CavernsError,
@@ -235,7 +245,33 @@ CREATE OR REPLACE TRIGGER ledger_no_truncate BEFORE TRUNCATE ON caverns.ledger
     FOR EACH STATEMENT EXECUTE FUNCTION caverns.ledger_append_only();
 """
 _LEDGER_EXISTS_SQL = "SELECT to_regclass('caverns.ledger') IS NOT NULL"
-_OWN_CHANGESET = Changeset(_OWN_CHANGESET_NAME, [Step("ledger", _LEDGER_DDL_SQL, check=_LEDGER_EXISTS_SQL)])
+# WARNING: this statement ships with the release: never edit it once released; its checksum is recorded
+# in every consumer's ledger. A change to the fingerprint table is a new step of the own changeset (hard rule 6).
+_FINGERPRINT_DDL_SQL = """
+CREATE TABLE IF NOT EXISTS caverns.fingerprint (
+    version     bigint      PRIMARY KEY REFERENCES caverns.ledger (version),
+    schemas     text[]      NOT NULL,
+    document    jsonb       NOT NULL,
+    hash        text        NOT NULL CHECK (hash ~ '^[0-9a-f]{64}$'),
+    recorded_at timestamptz NOT NULL DEFAULT clock_timestamp()
+);
+CREATE OR REPLACE FUNCTION caverns.fingerprint_append_only() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    RAISE EXCEPTION 'caverns.fingerprint is append-only: % refused', TG_OP;
+END
+$$;
+CREATE OR REPLACE TRIGGER fingerprint_no_update_delete BEFORE UPDATE OR DELETE ON caverns.fingerprint
+    FOR EACH ROW EXECUTE FUNCTION caverns.fingerprint_append_only();
+CREATE OR REPLACE TRIGGER fingerprint_no_truncate BEFORE TRUNCATE ON caverns.fingerprint
+    FOR EACH STATEMENT EXECUTE FUNCTION caverns.fingerprint_append_only();
+"""
+_OWN_CHANGESET = Changeset(
+    _OWN_CHANGESET_NAME,
+    [
+        Step("ledger", _LEDGER_DDL_SQL, check=_LEDGER_EXISTS_SQL),
+        Step("fingerprint", _FINGERPRINT_DDL_SQL, check=FINGERPRINT_EXISTS_SQL),
+    ],
+)
 
 # NOTE: hard rule 3 forbids composing a statement, so `caverns.ledger` and the column lists are spelled
 # literally in each `*_SQL` constant here; tests pin every schema spelling to `_OWN_CHANGESET_NAME` and
@@ -435,13 +471,20 @@ def _recheck(changeset: Changeset, status: StepStatus, entries: Sequence[LedgerE
 
 
 def _record_failure(
-    connection: Connection, changeset: Changeset, step: Step, error: Exception, duration_ms: int
+    connection: Connection,
+    changeset: Changeset,
+    step: Step,
+    error: Exception,
+    duration_ms: int,
+    *,
+    record_fingerprint: bool,
 ) -> StepFailed:
     """Record a failed step in a transaction of its own; the error to raise.
 
-    Raises `CavernsError` from *error* when the failure cannot be recorded: the ledger does not exist
-    (the failed step was its own) or writing the row fails (a read-only session). The transaction is
-    rolled back either way.
+    With *record_fingerprint* the transaction also stores the fingerprint of the database as the steps
+    before the failed one left it. Raises `CavernsError` from *error* when the failure cannot be recorded:
+    the ledger does not exist (the failed step was its own) or writing the row fails (a read-only
+    session). The transaction is rolled back either way, so no fingerprint is recorded then.
     """
     try:
         with transaction(connection) as cursor:
@@ -449,6 +492,8 @@ def _record_failure(
             if not _ledger_exists(cursor):
                 raise CavernsError("the ledger does not exist")
             entry = _insert(cursor, changeset.name, step, _OUTCOME_FAILED, error=str(error), duration_ms=duration_ms)
+            if record_fingerprint:
+                _record_fingerprint(cursor, entry)
     except Exception as record_error:
         raise CavernsError(
             f"step {step.label!r} of changeset {changeset.name!r} failed and could not be recorded: {record_error}"
@@ -457,7 +502,32 @@ def _record_failure(
     return StepFailed(step.label, entry.version)
 
 
-def _execute_step(connection: Connection, changeset: Changeset, cursor: Cursor, step: Step) -> int:
+def _record_fingerprint(cursor: Cursor, entry: LedgerEntry) -> None:
+    """Store the fingerprint of the watched schemas, as this transaction sees them, at *entry*'s version."""
+    record(cursor, entry.version, capture(cursor, watched_schemas(cursor)))
+
+
+def _warn_of_drift(connection: Connection, changeset: Changeset) -> None:
+    """Log one warning per difference between the live schemas and the latest recorded fingerprint; no refusal."""
+    with read_only(connection) as cursor:
+        found = latest_fingerprint(cursor)
+        if found is None:
+            return
+        recorded = found[1]
+        differences = compare(recorded.document, read_document(cursor, recorded.schemas))
+    for difference in differences:
+        _log.warning(
+            "drift before applying changeset %s: %s %s %s",
+            changeset.name,
+            difference.change,
+            difference.kind,
+            difference.name,
+        )
+
+
+def _execute_step(
+    connection: Connection, changeset: Changeset, cursor: Cursor, step: Step, *, record_fingerprint: bool
+) -> int:
     """Run the step's SQL as written; its duration in milliseconds.
 
     A failure rolls the transaction back, records a `failed` row and raises `StepFailed`; when that row
@@ -468,15 +538,27 @@ def _execute_step(connection: Connection, changeset: Changeset, cursor: Cursor, 
         cursor.execute(step.sql)
     except Exception as error:
         connection.rollback()
-        raise _record_failure(connection, changeset, step, error, _elapsed_ms(started)) from error
+        raise _record_failure(
+            connection, changeset, step, error, _elapsed_ms(started), record_fingerprint=record_fingerprint
+        ) from error
     return _elapsed_ms(started)
 
 
-def _write_step(connection: Connection, changeset: Changeset, status: StepStatus, outcome: str) -> LedgerEntry | None:
+def _write_step(
+    connection: Connection,
+    changeset: Changeset,
+    status: StepStatus,
+    outcome: str,
+    *,
+    record_fingerprint: bool,
+    last: bool,
+) -> LedgerEntry | None:
     """Run or accept one step in one transaction; None when another runner applied it first.
 
     The ledger is read again under the lock: a status that changed since preflight (an `applied`
-    one means the work is done) must not be acted on.
+    one means the work is done) must not be acted on. With *record_fingerprint* a failure of the step
+    records a fingerprint with its `failed` row, and, when the step is the *last* of the run, so does
+    its own row.
     """
     step = status.step
     with transaction(connection) as cursor:
@@ -486,8 +568,13 @@ def _write_step(connection: Connection, changeset: Changeset, status: StepStatus
             return None
         if current.status is not status.status:
             raise PreflightRefused([current])
-        duration = _execute_step(connection, changeset, cursor, step) if outcome == _OUTCOME_APPLIED else None
-        return _insert(cursor, changeset.name, step, outcome, duration_ms=duration)
+        duration = None
+        if outcome == _OUTCOME_APPLIED:
+            duration = _execute_step(connection, changeset, cursor, step, record_fingerprint=record_fingerprint)
+        entry = _insert(cursor, changeset.name, step, outcome, duration_ms=duration)
+        if record_fingerprint and last:
+            _record_fingerprint(cursor, entry)
+        return entry
 
 
 def _apply_statuses(
@@ -496,11 +583,27 @@ def _apply_statuses(
     statuses: Sequence[StepStatus],
     reapply: frozenset[str],
     accept: frozenset[str],
+    *,
+    record_fingerprint: bool = False,
 ) -> list[LedgerEntry]:
-    """Walk the planned steps in order, each in its own transaction; the rows written."""
+    """Walk the planned steps in order, each in its own transaction; the rows written.
+
+    With *record_fingerprint* (a consumer's changeset, never Caverns' own) a run that has steps to write
+    first warns of drift, then stores one fingerprint, in the transaction of its last ledger row.
+    """
+    plan = _plan(changeset, statuses, reapply, accept)
+    if record_fingerprint and plan:
+        _warn_of_drift(connection, changeset)
     written = []
-    for status, outcome in _plan(changeset, statuses, reapply, accept):
-        entry = _write_step(connection, changeset, status, outcome)
+    for position, (status, outcome) in enumerate(plan, start=1):
+        entry = _write_step(
+            connection,
+            changeset,
+            status,
+            outcome,
+            record_fingerprint=record_fingerprint,
+            last=position == len(plan),
+        )
         if entry is not None:
             _log.info(
                 "%s step %s of changeset %s: ledger version %d", outcome, entry.label, entry.changeset, entry.version
@@ -518,7 +621,7 @@ def install(connection: Connection) -> list[LedgerEntry]:
     unknown = frozenset(s.step.label for s in statuses if s.status is Status.UNKNOWN)
     for label in sorted(unknown):
         _log.warning("own step %s is present without a ledger row: recording it as accepted", label)
-    return _apply_statuses(connection, _OWN_CHANGESET, statuses, frozenset(), unknown)
+    return _apply_statuses(connection, _OWN_CHANGESET, statuses, frozenset(), unknown, record_fingerprint=False)
 
 
 def apply(
@@ -535,10 +638,14 @@ def apply(
     SQL, record a new `applied` row) or *accept* (conflict or unknown: record `accepted` without
     running). A step that fails is rolled back, recorded as `failed` and raised as `StepFailed`;
     later steps do not run. Returns the rows written, in order.
+
+    A run that writes ledger rows stores one fingerprint, in the transaction of its last row (a failed
+    step's `failed` row included); before its first step it logs a warning per difference between the
+    live schemas and the latest recorded fingerprint.
     """
     reapply_names, accept_names = names("reapply", reapply), names("accept", accept)
     statuses = preflight(connection, changeset)
-    return _apply_statuses(connection, changeset, statuses, reapply_names, accept_names)
+    return _apply_statuses(connection, changeset, statuses, reapply_names, accept_names, record_fingerprint=True)
 
 
 def _baseline_step(changeset: Changeset, through: str | None) -> Step:
@@ -561,8 +668,9 @@ def baseline(
     """Record an existing database as the starting point of *changeset*; nothing is executed.
 
     One `baseline` row for the step *through* (default the last) carries that step's checksum and a
-    fingerprint (`infinite.fingerprint`'s hash) of *schemas* (default: every schema but `pg_*`,
-    `information_schema` and `caverns`). Afterwards every step up to *through* is `applied`. Refused
+    fingerprint (`infinite.fingerprint`'s hash) of *schemas* (default: the schemas of the latest recorded
+    fingerprint, else every schema but `pg_*`, `information_schema` and `caverns`), which is also stored in
+    `caverns.fingerprint` in the same transaction. Afterwards every step up to *through* is `applied`. Refused
     (`BaselineRefused`) when the changeset already has ledger rows or a named schema does not exist.
     """
     check_connection(connection)
@@ -577,5 +685,6 @@ def baseline(
             raise BaselineRefused(f"changeset {changeset.name!r} already has ledger rows")
         fingerprint = capture(cursor, resolve_schemas(cursor, named, BaselineRefused))
         entry = _insert(cursor, changeset.name, step, _OUTCOME_BASELINE, fingerprint=fingerprint.hash)
+        record(cursor, entry.version, fingerprint)
     _log.info("baseline of changeset %s at step %s: ledger version %d", entry.changeset, entry.label, entry.version)
     return entry

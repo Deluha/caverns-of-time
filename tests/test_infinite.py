@@ -10,9 +10,9 @@ from typing import Any
 import pytest
 
 from caverns_of_time import _fingerprint, infinite
-from caverns_of_time.errors import CavernsError, ChangesetError
-from caverns_of_time.infinite import Fingerprint, fingerprint
-from caverns_of_time.nozdormu import Changeset, Step, baseline, history, install
+from caverns_of_time.errors import CavernsError, ChangesetError, LedgerNotInstalled, NoFingerprint
+from caverns_of_time.infinite import Difference, Drift, Fingerprint, drift, fingerprint
+from caverns_of_time.nozdormu import Changeset, Status, Step, apply, baseline, history, install
 
 SCHEMA = "infinite_test"
 EXT_SCHEMA = "infinite_ext"
@@ -92,7 +92,7 @@ def test_the_hash_ignores_key_order_and_sees_content() -> None:
 
 def test_infinite_re_exports_the_fingerprint_type() -> None:
     assert infinite.Fingerprint is _fingerprint.Fingerprint
-    assert sorted(infinite.__all__) == ["Fingerprint", "fingerprint"]
+    assert sorted(infinite.__all__) == ["Difference", "Drift", "Fingerprint", "drift", "fingerprint"]
     assert [field.name for field in dataclasses.fields(Fingerprint)] == ["schemas", "document", "hash"]
 
 
@@ -362,4 +362,242 @@ def test_reading_writes_nothing_and_leaves_no_open_transaction(conn: Any) -> Non
     _assert_idle(conn)
     assert history(conn) == ledger
     assert _query(conn, catalog) == before
+    assert _query(conn, "SELECT pg_current_xact_id_if_assigned() IS NULL") == [(True,)]
+
+
+# --- the fingerprint's default schemas follow the last recorded one -------------------------
+
+
+def test_the_default_schemas_are_those_of_the_latest_recorded_fingerprint(conn: Any) -> None:
+    _created(conn, TABLE)
+    install(conn)
+    baseline(conn, Changeset("app", [Step("base", "SELECT 1")]), schemas=[SCHEMA])
+    assert fingerprint(conn).schemas == (SCHEMA,)
+    assert fingerprint(conn, schemas=["public"]).schemas == ("public",)
+
+
+# --- compare ---------------------------------------------------------------------------------
+
+
+def _document(**schemas: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    return {name: {kind: kinds.get(kind, {}) for kind in KINDS} for name, kinds in schemas.items()}
+
+
+def test_compare_of_equal_documents_finds_nothing() -> None:
+    document = _document(a={"table": {"t": {"kind": "r"}}, "index": {"i": "CREATE INDEX i"}})
+    assert _fingerprint.compare(document, document) == []
+    assert _fingerprint.compare({}, {}) == []
+
+
+def test_compare_names_what_was_added_removed_and_changed_in_schema_kind_key_order() -> None:
+    recorded = _document(
+        b={"function": {"f()": "old"}},
+        a={"column": {"t.x": {"type": "integer"}, "t.y": 1}, "index": {"gone": "CREATE INDEX gone"}},
+    )
+    live = _document(
+        b={"function": {"f()": "new"}, "view": {"v": {"kind": "v"}}},
+        a={"column": {"t.x": {"type": "bigint"}, "t.z": 1}, "table": {"t": {"kind": "r"}}},
+    )
+    assert _fingerprint.compare(recorded, live) == [
+        Difference("table", "a.t", "added"),
+        Difference("column", "a.t.x", "changed"),
+        Difference("column", "a.t.y", "removed"),
+        Difference("column", "a.t.z", "added"),
+        Difference("index", "a.gone", "removed"),
+        Difference("view", "b.v", "added"),
+        Difference("function", "b.f()", "changed"),
+    ]
+
+
+def test_compare_reads_a_schema_in_one_document_only_as_all_added_or_all_removed() -> None:
+    kept = _document(a={"table": {"t": {"kind": "r"}}})
+    both = _document(a={"table": {"t": {"kind": "r"}}}, b={"table": {"u": {"kind": "r"}}})
+    assert _fingerprint.compare(kept, both) == [Difference("table", "b.u", "added")]
+    assert _fingerprint.compare(both, kept) == [Difference("table", "b.u", "removed")]
+
+
+# --- drift -----------------------------------------------------------------------------------
+
+STEPS = [
+    Step("schema", f"CREATE SCHEMA {SCHEMA}", check=f"SELECT to_regnamespace('{SCHEMA}') IS NOT NULL"),
+    Step("table", TABLE, check=f"SELECT to_regclass('{SCHEMA}.t') IS NOT NULL"),
+    Step("note", "SELECT 1"),  # no check: it can never disagree
+]
+APP = Changeset("app", STEPS)
+FUNCTION = f"CREATE FUNCTION {SCHEMA}.f(a integer) RETURNS integer LANGUAGE sql AS 'SELECT 1'"
+LEDGER_AND_FINGERPRINTS = (
+    "SELECT version, hash FROM caverns.fingerprint UNION ALL SELECT version, checksum FROM caverns.ledger"
+)
+
+
+def _applied(conn: Any) -> None:
+    """Install, then apply `APP`: the ledger records it and a fingerprint of every schema follows."""
+    install(conn)
+    apply(conn, APP)
+
+
+def _baselined(conn: Any, *statements: str, schemas: tuple[str, ...] = (SCHEMA,)) -> None:
+    """Install, build the test schema by hand and baseline it: a fingerprint of *schemas*, nothing applied."""
+    install(conn)
+    _created(conn, *statements)
+    baseline(conn, Changeset("app", [Step("base", "SELECT 1")]), schemas=schemas)
+
+
+def _changes(conn: Any, **kwargs: Any) -> list[tuple[str, str, str]]:
+    return [(d.change, d.kind, d.name) for d in drift(conn, **kwargs).differences]
+
+
+def test_drift_without_a_fingerprint_is_refused(conn: Any) -> None:
+    install(conn)
+    with pytest.raises(NoFingerprint, match="apply a changeset or take a baseline first"):
+        drift(conn)
+    _assert_idle(conn)
+
+
+def test_drift_before_install_is_refused(conn: Any) -> None:
+    with pytest.raises(LedgerNotInstalled, match="call install"):
+        drift(conn)
+    _assert_idle(conn)
+
+
+def test_drift_of_an_unchanged_database_finds_nothing(conn: Any) -> None:
+    _applied(conn)
+    result = drift(conn, APP)
+    assert isinstance(result, Drift) and not result.found
+    assert (result.differences, result.disagreements) == ((), ())
+    assert result.fingerprint_version == history(conn, changeset="app", limit=1)[0].version
+    assert SCHEMA in result.schemas and "public" in result.schemas
+    assert drift(conn).differences == ()
+
+
+def test_drift_finds_what_was_added(conn: Any) -> None:
+    _baselined(conn, TABLE)
+    _run(conn, f"ALTER TABLE {SCHEMA}.t ADD COLUMN extra text", f"CREATE INDEX t_id_idx ON {SCHEMA}.t (id)", FUNCTION)
+    assert _changes(conn) == [
+        ("added", "column", f"{SCHEMA}.t.extra"),
+        ("added", "index", f"{SCHEMA}.t_id_idx"),
+        ("added", "function", f"{SCHEMA}.f(a integer)"),
+    ]
+    assert drift(conn).found
+
+
+def test_drift_finds_what_was_removed(conn: Any) -> None:
+    _baselined(conn, TABLE, f"CREATE INDEX t_id_idx ON {SCHEMA}.t (id)", FUNCTION)
+    _run(conn, f"DROP INDEX {SCHEMA}.t_id_idx", f"DROP FUNCTION {SCHEMA}.f(integer)")
+    assert _changes(conn) == [
+        ("removed", "index", f"{SCHEMA}.t_id_idx"),
+        ("removed", "function", f"{SCHEMA}.f(a integer)"),
+    ]
+
+
+def test_drift_finds_a_dropped_schema_as_everything_removed(conn: Any) -> None:
+    _baselined(conn, TABLE)
+    _run(conn, f"DROP SCHEMA {SCHEMA} CASCADE")
+    assert _changes(conn) == [
+        ("removed", "table", f"{SCHEMA}.t"),
+        ("removed", "column", f"{SCHEMA}.t.id"),
+        ("removed", "column", f"{SCHEMA}.t.note"),
+    ]
+
+
+def test_drift_finds_a_changed_column_and_a_changed_function_body(conn: Any) -> None:
+    _baselined(conn, TABLE, FUNCTION)
+    _run(
+        conn,
+        f"ALTER TABLE {SCHEMA}.t ALTER COLUMN note SET DEFAULT 'b'",
+        f"CREATE OR REPLACE FUNCTION {SCHEMA}.f(a integer) RETURNS integer LANGUAGE sql AS 'SELECT 2'",
+    )
+    assert _changes(conn) == [
+        ("changed", "column", f"{SCHEMA}.t.note"),
+        ("changed", "function", f"{SCHEMA}.f(a integer)"),
+    ]
+
+
+def test_drift_finds_a_changed_index(conn: Any) -> None:
+    _baselined(conn, TABLE, f"CREATE INDEX t_idx ON {SCHEMA}.t (id)")
+    _run(conn, f"DROP INDEX {SCHEMA}.t_idx", f"CREATE INDEX t_idx ON {SCHEMA}.t (note)")
+    assert _changes(conn) == [("changed", "index", f"{SCHEMA}.t_idx")]
+
+
+def test_drift_compares_with_the_latest_fingerprint_only(conn: Any) -> None:
+    _applied(conn)
+    _run(conn, f"ALTER TABLE {SCHEMA}.t ADD COLUMN extra text")
+    assert drift(conn).found
+    apply(conn, Changeset("app", [*STEPS, Step("later", f"CREATE TABLE {SCHEMA}.later ()")]))
+    result = drift(conn)  # the new run's fingerprint holds the column
+    assert not result.found and result.fingerprint_version == history(conn, limit=1)[0].version
+
+
+def test_drift_schemas_narrow_the_report(conn: Any) -> None:
+    _baselined(conn, TABLE, f"CREATE SCHEMA {EXT_SCHEMA}", schemas=(SCHEMA, EXT_SCHEMA))
+    _run(conn, f"ALTER TABLE {SCHEMA}.t ADD COLUMN extra text", f"CREATE TABLE {EXT_SCHEMA}.u ()")
+    everything = drift(conn)
+    assert everything.schemas == (EXT_SCHEMA, SCHEMA)
+    assert [d.name for d in everything.differences] == [f"{EXT_SCHEMA}.u", f"{SCHEMA}.t.extra"]
+    narrowed = drift(conn, schemas=[SCHEMA])
+    assert narrowed.schemas == (SCHEMA,)
+    assert [d.name for d in narrowed.differences] == [f"{SCHEMA}.t.extra"]
+    assert drift(conn, schemas=[SCHEMA, SCHEMA, EXT_SCHEMA]).schemas == (EXT_SCHEMA, SCHEMA)
+
+
+def test_drift_refuses_a_schema_that_is_not_watched(conn: Any) -> None:
+    _baselined(conn, TABLE)
+    with pytest.raises(ChangesetError, match=rf"the schema 'public' is not watched \(watched: {SCHEMA}\)"):
+        drift(conn, schemas=["public"])
+    _assert_idle(conn)
+
+
+@pytest.mark.parametrize(
+    ("schemas", "message"), [([], "empty"), ("public", "not the string"), ([3], "must hold names")]
+)
+def test_drift_refuses_bad_schemas(conn: Any, schemas: Any, message: str) -> None:
+    _applied(conn)
+    with pytest.raises(ChangesetError, match=message):
+        drift(conn, schemas=schemas)
+    _assert_idle(conn)
+
+
+def test_drift_reports_a_step_recorded_as_applied_whose_check_is_now_false(conn: Any) -> None:
+    _applied(conn)
+    _run(conn, f"DROP TABLE {SCHEMA}.t")
+    result = drift(conn, APP)
+    assert [(s.step.label, s.status) for s in result.disagreements] == [("table", Status.APPLIED)]
+    assert result.disagreements[0].entry is not None and result.disagreements[0].entry.changeset == "app"
+    assert [(d.change, d.kind) for d in result.differences] == [
+        ("removed", "table"),
+        ("removed", "column"),
+        ("removed", "column"),
+    ]
+    assert result.found
+    assert drift(conn).disagreements == ()  # without a changeset there is nothing to run
+
+
+def test_drift_does_not_call_an_unknown_step_a_disagreement(conn: Any) -> None:
+    _applied(conn)
+    _run(conn, f"CREATE TABLE {SCHEMA}.extra ()")
+    extra = Step("extra", f"CREATE TABLE {SCHEMA}.extra ()", check=f"SELECT to_regclass('{SCHEMA}.extra') IS NOT NULL")
+    result = drift(conn, Changeset("app", [*STEPS, extra]))
+    assert result.disagreements == ()
+    assert [d.name for d in result.differences] == [f"{SCHEMA}.extra"]
+
+
+def test_drift_runs_the_checks_with_the_sessions_search_path(conn: Any) -> None:
+    pinned = Step(
+        "pinned",
+        "SELECT 1",
+        check=f"SELECT current_setting('search_path') <> 'pg_catalog' AND to_regclass('{SCHEMA}.t') IS NOT NULL",
+    )
+    changeset = Changeset("app", [*STEPS, pinned])
+    install(conn)
+    apply(conn, changeset)
+    assert drift(conn, changeset).disagreements == ()  # reading the catalogs pins the path only after the checks
+
+
+def test_drift_writes_nothing_and_leaves_no_open_transaction(conn: Any) -> None:
+    _applied(conn)
+    _run(conn, f"ALTER TABLE {SCHEMA}.t ADD COLUMN extra text")
+    before = _query(conn, LEDGER_AND_FINGERPRINTS)
+    assert drift(conn, APP).found
+    _assert_idle(conn)
+    assert _query(conn, LEDGER_AND_FINGERPRINTS) == before
     assert _query(conn, "SELECT pg_current_xact_id_if_assigned() IS NULL") == [(True,)]
