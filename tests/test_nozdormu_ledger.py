@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 import psycopg
@@ -9,8 +10,15 @@ import psycopg2
 import pytest
 
 from caverns_of_time import __version__, nozdormu
-from caverns_of_time.errors import CavernsError, ChangesetError, LedgerNotInstalled, PreflightRefused, StepFailed
-from caverns_of_time.nozdormu import Changeset, Status, Step, apply, install, preflight
+from caverns_of_time.errors import (
+    BaselineRefused,
+    CavernsError,
+    ChangesetError,
+    LedgerNotInstalled,
+    PreflightRefused,
+    StepFailed,
+)
+from caverns_of_time.nozdormu import Changeset, Status, Step, apply, baseline, install, preflight
 
 DRIVER_ERRORS = (psycopg.Error, psycopg2.Error)
 SCHEMA = Step("schema", "CREATE SCHEMA nozdormu_test", check="SELECT to_regnamespace('nozdormu_test') IS NOT NULL")
@@ -459,3 +467,138 @@ def test_a_step_with_several_statements_applies(ledger_conn: Any) -> None:
     install(ledger_conn)
     apply(ledger_conn, Changeset("app", [SCHEMA, several]))
     assert _query(ledger_conn, "SELECT count(*) FROM nozdormu_test.two") == [(1,)]
+
+
+# --- baseline ------------------------------------------------------------------------------
+
+FINGERPRINT = re.compile(r"[0-9a-f]{64}")
+
+
+def _existing_database(conn: Any) -> None:
+    """The objects of the first two steps of `APP`, made by hand: a database that predates the ledger."""
+    _execute(conn, SCHEMA.sql)
+    _execute(conn, TABLE.sql)
+
+
+def test_baseline_refuses_a_ledger_that_is_not_installed(ledger_conn: Any) -> None:
+    with pytest.raises(LedgerNotInstalled):
+        baseline(ledger_conn, APP)
+
+
+def test_baseline_refuses_the_reserved_changeset_name(ledger_conn: Any) -> None:
+    install(ledger_conn)
+    with pytest.raises(ChangesetError, match="reserved"):
+        baseline(ledger_conn, Changeset("caverns", [SCHEMA]))
+
+
+def test_baseline_refuses_a_connection_with_autocommit_on(ledger_conn: Any) -> None:
+    install(ledger_conn)
+    ledger_conn.autocommit = True
+    try:
+        with pytest.raises(CavernsError, match="autocommit"):
+            baseline(ledger_conn, APP)
+    finally:
+        ledger_conn.autocommit = False
+
+
+def test_baseline_records_one_row_for_the_last_step_and_runs_nothing(ledger_conn: Any) -> None:
+    install(ledger_conn)
+    entry = baseline(ledger_conn, APP)
+    assert (entry.changeset, entry.label, entry.outcome) == ("app", "index", "baseline")
+    assert entry.checksum == INDEX.checksum
+    assert FINGERPRINT.fullmatch(entry.fingerprint or "")
+    assert (entry.duration_ms, entry.error, entry.caverns_version) == (None, None, __version__)
+    assert _query(ledger_conn, APP_ROWS) == [("index", "baseline")]
+    assert not _exists(ledger_conn, "nozdormu_test.t")
+    assert set(_statuses(ledger_conn).values()) == {Status.APPLIED}
+    assert apply(ledger_conn, APP) == []
+
+
+def test_baseline_through_a_step_leaves_the_later_steps_pending(ledger_conn: Any) -> None:
+    install(ledger_conn)
+    _existing_database(ledger_conn)
+    entry = baseline(ledger_conn, APP, through="table")
+    assert (entry.label, entry.checksum) == ("table", TABLE.checksum)
+    assert _statuses(ledger_conn) == {"schema": Status.APPLIED, "table": Status.APPLIED, "index": Status.PENDING}
+    assert [(e.label, e.outcome) for e in apply(ledger_conn, APP)] == [("index", "applied")]
+
+
+def test_baseline_refuses_a_step_the_changeset_lacks(ledger_conn: Any) -> None:
+    install(ledger_conn)
+    with pytest.raises(ChangesetError, match="'ghost'"):
+        baseline(ledger_conn, APP, through="ghost")
+    assert _query(ledger_conn, APP_ROWS) == []
+
+
+def test_a_second_baseline_is_refused(ledger_conn: Any) -> None:
+    install(ledger_conn)
+    baseline(ledger_conn, APP)
+    with pytest.raises(BaselineRefused, match="already has ledger rows"):
+        baseline(ledger_conn, APP, through="table")
+    assert _query(ledger_conn, APP_ROWS) == [("index", "baseline")]
+
+
+def test_a_baseline_is_refused_for_a_changeset_that_was_applied(ledger_conn: Any) -> None:
+    install(ledger_conn)
+    apply(ledger_conn, Changeset("app", [SCHEMA]))
+    with pytest.raises(BaselineRefused):
+        baseline(ledger_conn, APP)
+
+
+def test_another_changeset_does_not_block_a_baseline(ledger_conn: Any) -> None:
+    install(ledger_conn)
+    baseline(ledger_conn, Changeset("other", [SCHEMA]))
+    assert baseline(ledger_conn, APP).changeset == "app"
+
+
+def test_baseline_refuses_a_schema_that_does_not_exist(ledger_conn: Any) -> None:
+    install(ledger_conn)
+    with pytest.raises(BaselineRefused, match="'nozdormu_missing'"):
+        baseline(ledger_conn, APP, schemas=["public", "nozdormu_missing"])
+    assert _query(ledger_conn, APP_ROWS) == []
+
+
+@pytest.mark.parametrize(("schemas", "message"), [([], "empty"), ("public", "not the string")])
+def test_baseline_refuses_schemas_that_are_not_a_list_of_names(ledger_conn: Any, schemas: Any, message: str) -> None:
+    install(ledger_conn)
+    with pytest.raises(ChangesetError, match=message):
+        baseline(ledger_conn, APP, schemas=schemas)
+
+
+def _fingerprint(conn: Any, name: str, **kwargs: Any) -> str:
+    entry = baseline(conn, Changeset(name, [SCHEMA]), **kwargs)
+    assert entry.fingerprint is not None
+    return entry.fingerprint
+
+
+def test_the_fingerprint_is_stable_and_follows_the_tables(ledger_conn: Any) -> None:
+    install(ledger_conn)
+    _existing_database(ledger_conn)
+    first = _fingerprint(ledger_conn, "one", schemas=["nozdormu_test"])
+    assert _fingerprint(ledger_conn, "two", schemas=["nozdormu_test"]) == first
+    _execute(ledger_conn, ADD_NOTE)
+    with_column = _fingerprint(ledger_conn, "three", schemas=["nozdormu_test"])
+    assert with_column != first
+    _execute(ledger_conn, "CREATE TABLE nozdormu_test.bare ()")  # a table without columns still counts
+    assert _fingerprint(ledger_conn, "four", schemas=["nozdormu_test"]) != with_column
+
+
+def test_the_fingerprint_ignores_a_schema_that_was_not_asked_for(ledger_conn: Any) -> None:
+    install(ledger_conn)
+    _existing_database(ledger_conn)
+    public_only = _fingerprint(ledger_conn, "one", schemas=["public"])
+    _execute(ledger_conn, ADD_NOTE)
+    assert _fingerprint(ledger_conn, "two", schemas=["public"]) == public_only
+
+
+def test_the_default_schemas_are_every_one_but_the_system_ones_and_caverns(ledger_conn: Any) -> None:
+    install(ledger_conn)
+    _existing_database(ledger_conn)
+    names = _query(
+        ledger_conn,
+        "SELECT nspname::text FROM pg_namespace"
+        " WHERE nspname NOT LIKE 'pg\\_%' AND nspname NOT IN ('information_schema', 'caverns')",
+    )
+    default = _fingerprint(ledger_conn, "one")
+    assert default == _fingerprint(ledger_conn, "two", schemas=[row[0] for row in names])
+    assert default != _fingerprint(ledger_conn, "three", schemas=[row[0] for row in names] + ["caverns"])

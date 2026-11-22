@@ -41,3 +41,7 @@ class StepFailed(CavernsError):
         self.label = label
         self.version = version
         super().__init__(f"step {label!r} failed and was recorded as ledger version {version}")
+
+
+class BaselineRefused(CavernsError):
+    """A baseline was refused: the changeset already has ledger rows, or a named schema does not exist."""

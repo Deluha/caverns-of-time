@@ -279,3 +279,9 @@ def test_a_baseline_at_a_step_the_changeset_lacks_is_an_error() -> None:
     ghost = Step("ghost", "SELECT 1")
     with pytest.raises(ChangesetError, match="'ghost'"):
         _decide([_entry(1, ghost, "baseline")])
+
+
+def test_the_fingerprint_hash_ignores_key_order_and_sees_content() -> None:
+    assert nozdormu._hash_document({"b": 1, "a": [2]}) == nozdormu._hash_document({"a": [2], "b": 1})
+    assert nozdormu._hash_document({"a": 1}) != nozdormu._hash_document({"a": 2})
+    assert re.fullmatch(r"[0-9a-f]{64}", nozdormu._hash_document({}))
