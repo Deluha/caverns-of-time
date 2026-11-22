@@ -1,0 +1,85 @@
+# Pre-commit hooks for Caverns of Time.
+#
+# Enable once per clone: `pip install -e ".[dev]"` then `pre-commit install` (the
+# cloud session-start hook and the dev container do both).
+#
+# Thereafter the hooks below run automatically on `git commit`. Bypass a single
+# commit with `git commit --no-verify`.
+#
+# `default_install_hook_types` makes a plain `pre-commit install` wire up the
+# pre-commit stage (file checks), the commit-msg stage (the docs-sync guard reads
+# the in-progress commit message for its [skip-docs] escape token) and the
+# pre-push stage (the fast pytest run).
+default_install_hook_types: [pre-commit, commit-msg, pre-push]
+# Hooks without `stages` run at pre-commit only.
+default_stages: [pre-commit]
+repos:
+  # Secret scan of the STAGED changes with the default ruleset in .gitleaks.toml.
+  # It sees nothing in CI, which scans the commit range and the tree itself
+  # (ci-pre-commit.yml, step "Scan for secrets"), so CI skips this hook. The `rev`
+  # is bumped by hand, together with the version and sha256 in
+  # .github/workflows/ci-pre-commit.yml.
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.30.1
+    hooks:
+      - id: gitleaks
+        args: [--config=.gitleaks.toml]
+
+  - repo: local
+    hooks:
+      # The mechanically-checkable conventions (rules C1-C9: skill
+      # references/checkers.md#checker-project-conventions). Whole-repo check
+      # (lists the files itself), so it runs whenever a .py or .md is part of the commit.
+      - id: project-conventions
+        name: project conventions (check_conventions.py rules C1-C9)
+        entry: python dev_tools/check_conventions.py
+        language: system
+        files: \.(py|md)$
+        pass_filenames: false
+
+      # Ruff: pycodestyle, pyflakes, bugbear, import order, pyupgrade (config in
+      # pyproject.toml). `language: python` + additional_dependencies lets
+      # pre-commit install ruff into its own isolated venv; the version range is
+      # kept in step with pyproject.toml.
+      - id: ruff
+        name: ruff (lint)
+        entry: ruff check --force-exclude
+        language: python
+        additional_dependencies: ["ruff>=0.6,<1.0"]
+        files: \.py$
+
+      # Guidance-stack integrity: pointers and anchors resolve, CLAUDE.md stays in
+      # its budget, the skill routes to every reference, rule files and command
+      # skills stay pointer-only. Whole-repo check, so it runs whenever any .py or
+      # .md is part of the commit.
+      - id: guidance-integrity
+        name: guidance stack integrity (CLAUDE.md + skill pointers/budget/structure)
+        entry: python dev_tools/check_guidance_integrity.py
+        language: system
+        files: \.(py|md)$
+        pass_filenames: false
+
+      # Forcing-function reminder: a commit that changes code in a documented area
+      # (the `AREAS` touch-map in check_docs_sync.py) must also touch that area's
+      # doc, CLAUDE.md, or the skill. Runs at the commit-msg stage because it reads
+      # the in-progress message for the [skip-docs] token; pre-commit passes the
+      # message-file path as the trailing arg. ci-docs-sync.yml runs the same
+      # script against the PR base.
+      - id: docs-sync
+        name: docs in sync with code (README / CLAUDE.md / skill)
+        entry: python dev_tools/check_docs_sync.py --staged
+        language: system
+        stages: [commit-msg]
+        always_run: true
+        pass_filenames: true
+
+      # Fast pass before a push: the tests that need no database, stopping at the
+      # first failure. The full suite, database required, is the verify command
+      # (dev_tools/verify.py) and ci-tests.yml.
+      - id: pytest-fast
+        name: pytest (no database, stop at first failure)
+        entry: python -m pytest -q -x -m "not db"
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages: [pre-push]

@@ -1,0 +1,129 @@
+name: ci-tests
+
+# The test suite against a real PostgreSQL 18: a throwaway service container that
+# lives for the job, holds no data and needs no secret (its password is written
+# below). CAVERNS_REQUIRE_DB=1 turns a database test that cannot connect into a
+# failure instead of a skip (hard rule 8). The image tag and the connection
+# string must equal the ones in dev_tools/database.py; tests/test_database.py
+# fails otherwise. The pytest job also records coverage (coverage.xml, a 14-day
+# artifact). Two more gating jobs ride along: mypy (strict; config in
+# pyproject.toml) and actionlint over .github/workflows. The final `gate` job
+# (check name "CI gate") depends on all three: it is the one check branch
+# protection needs to require.
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  pytest:
+    name: Run tests (PostgreSQL 18)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_PASSWORD: caverns
+        ports:
+          - 55432:5432
+        options: >-
+          --health-cmd "pg_isready -h 127.0.0.1 -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      CAVERNS_TEST_DSN: postgresql://postgres:caverns@127.0.0.1:55432/postgres
+      CAVERNS_REQUIRE_DB: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - name: Install the project with the dev extra
+        run: pip install -e ".[dev]"
+      - name: Run pytest with coverage
+        run: python -m pytest -q -rs --cov=caverns_of_time --cov=dev_tools --cov-report=xml --cov-report=term-missing:skip-covered
+      - name: Keep the coverage report
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: coverage-${{ github.run_id }}
+          path: coverage.xml
+          if-no-files-found: ignore
+          retention-days: 14
+
+  mypy:
+    name: Type check
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - name: Install the project with the dev extra
+        run: pip install -e ".[dev]"
+      - name: Run mypy
+        run: python -m mypy
+
+  actionlint:
+    name: Lint the workflows
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.11"
+      # The pin lives in pyproject.toml (Dependabot's pip entry bumps it).
+      - name: Install actionlint
+        run: pip install "$(grep -oE 'actionlint-py==[0-9.]+' pyproject.toml)"
+      # The hosted runner ships shellcheck; info-level style notes must not gate.
+      - name: Run actionlint
+        env:
+          SHELLCHECK_OPTS: --severity=warning
+        run: actionlint .github/workflows/*.yml
+
+  # One required check for branch protection: it covers the gating jobs above, so
+  # adding or renaming one of them never touches the repository's required-check list.
+  gate:
+    name: CI gate
+    needs: [pytest, mypy, actionlint]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      # Results arrive through env, never interpolated into the script.
+      - name: Fail unless every needed job succeeded
+        env:
+          RESULT_PYTEST: ${{ needs.pytest.result }}
+          RESULT_MYPY: ${{ needs.mypy.result }}
+          RESULT_ACTIONLINT: ${{ needs.actionlint.result }}
+        run: |
+          status=0
+          for pair in "pytest=$RESULT_PYTEST" "mypy=$RESULT_MYPY" "actionlint=$RESULT_ACTIONLINT"; do
+            echo "${pair%%=*}: ${pair#*=}"
+            case "${pair#*=}" in
+              success) ;;
+              *) status=1 ;;
+            esac
+          done
+          exit "$status"
