@@ -4,6 +4,26 @@ What shipped, newest first. What is planned: `ROADMAP.md`.
 
 ## v0.1.0 — in development
 
+### Phase 2 — Chromie and Infinite
+
+The command line and the drift detector:
+
+- `chromie`, installed with the `cli` extra (psycopg 3; the library still has no runtime dependency).
+  The connection string is `--dsn`, else `CAVERNS_DSN`; `--format text|json`; exit codes 0 success,
+  1 a finding, 2 a usage or environment error.
+- `chromie log` (the ledger, newest first, `--changeset`, `--limit`), `chromie status DIRECTORY` (each
+  step's status) and `chromie drift [DIRECTORY]` (live schema against the last fingerprint, `--schema`).
+- `nozdormu.history`: the ledger rows, newest first, optionally of one changeset and limited.
+- Infinite: `infinite.fingerprint` reads six object kinds (tables, columns, indexes, constraints, views,
+  functions) from the catalogs; `infinite.drift` returns a `Drift` of `Difference` values and, given a
+  changeset, applied steps whose check is now false; `NoFingerprint` when none is recorded.
+- Caverns' own changeset gains the step `fingerprint`, creating the append-only `caverns.fingerprint`.
+  One fingerprint is stored per apply run that writes ledger rows and per baseline. `apply` logs a
+  warning per difference before its first step when the live schema drifted from the last fingerprint.
+- The baseline's fingerprint is redefined: the hash of Infinite's wider fingerprint.
+- **Upgrade:** a database installed by Phase 1 code must run `install()` again, which adds the
+  `fingerprint` step; until then `preflight`, `apply`, `baseline` and `drift` raise `LedgerNotInstalled`.
+
 ### Phase 1 — Nozdormu
 
 The migration ledger, as a library (no CLI yet; that is Phase 2):

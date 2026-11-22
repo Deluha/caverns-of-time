@@ -44,7 +44,7 @@ Comments explain **why**, not **what**.
 | Flag | Meaning |
 |---|---|
 | `--dsn` | connection string (else the environment) |
-| `--schema` | a schema name |
+| `--schema` | a schema name (repeatable where a command narrows to schemas) |
 | `--changeset` | a changeset name |
 | `--limit` | the most rows to show (0: all) |
 | `--dry-run` | report what would change, write nothing |
