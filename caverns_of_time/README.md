@@ -12,7 +12,7 @@ migration ledger (in progress; this file describes what is built).
 |---|---|
 | `__init__.py` | `__version__`, read from the installed distribution's metadata |
 | `errors.py` | The exception types, all in one module |
-| `nozdormu.py` | Nozdormu: the `Step` and `Changeset` model, the checksum, the loaders, the connection contract, the ledger, `install`, `preflight` and `apply` |
+| `nozdormu.py` | Nozdormu: the `Step` and `Changeset` model, the checksum, the loaders, the connection contract, the ledger, `install`, `preflight`, `apply` and `baseline` |
 
 ## How it works
 
@@ -52,6 +52,16 @@ and commit, so the step's effect and its row stand or fall together. A step that
 then recorded as a `failed` row in a transaction of its own, and `StepFailed` is raised from the database
 error; later steps do not run, and the step is `pending` again. The rows written are returned and logged.
 `install` takes the same path for Caverns' own changeset.
+
+**Nozdormu, baseline.** `baseline(connection, changeset, *, through=None, schemas=None)` adopts a database
+that already holds a changeset's effects. It writes one `baseline` row (label: the `through` step, by
+default the last; that step's checksum; a fingerprint) and executes nothing; from then on every step up to
+and including `through` is `applied`, the later ones follow the normal rules. It runs in one transaction
+under the advisory lock and is refused (`BaselineRefused`) when the changeset already has any ledger row.
+The fingerprint is the SHA-256 of a canonical JSON document of the tables (kinds `r` and `p`) and their
+columns (name, type, not-null, default) in the given schemas, read from the system catalogs; without
+`schemas` it covers every schema except `pg_*`, `information_schema` and `caverns`. A named schema that does
+not exist is refused. Phase 2 widens the fingerprint.
 
 A `conflict` or `unknown` step refuses the whole run before anything is executed or written
 (`PreflightRefused`, listing the steps) unless the caller acknowledges it:
@@ -114,6 +124,9 @@ unsupported in v0.1: such a step fails and is recorded as a failed step.
   Raises `PreflightRefused` (attribute `statuses`, the offending steps), `StepFailed` (attributes `label`
   and `version`, the failed row's ledger version; its `__cause__` is the driver's error) and the errors of
   `preflight`.
+- `baseline(connection, changeset, *, through=None, schemas=None) -> LedgerEntry`: the row written. Raises
+  `BaselineRefused` (the changeset has rows; an unknown schema) and `ChangesetError` (a `through` the
+  changeset lacks, an empty `schemas`).
 - The own changeset is never edited once released: a change to the ledger is a new own step (hard rule 6).
   The ledger's DDL is idempotent, and `caverns` is a reserved changeset name.
 - No runtime dependency. Adding one is an ask-first decision.

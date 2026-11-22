@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import enum
 import hashlib
+import json
 import logging
 import os
 import time
@@ -21,9 +22,27 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from caverns_of_time import __version__
-from caverns_of_time.errors import CavernsError, ChangesetError, LedgerNotInstalled, PreflightRefused, StepFailed
+from caverns_of_time.errors import (
+    BaselineRefused,
+    CavernsError,
+    ChangesetError,
+    LedgerNotInstalled,
+    PreflightRefused,
+    StepFailed,
+)
 
-__all__ = ["Changeset", "Connection", "LedgerEntry", "Status", "Step", "StepStatus", "apply", "install", "preflight"]
+__all__ = [
+    "Changeset",
+    "Connection",
+    "LedgerEntry",
+    "Status",
+    "Step",
+    "StepStatus",
+    "apply",
+    "baseline",
+    "install",
+    "preflight",
+]
 
 _log = logging.getLogger(__name__)
 
@@ -248,6 +267,23 @@ _INSERT_ENTRY_SQL = (
 )
 _LOCK_SQL = "SELECT pg_advisory_xact_lock(%s::bigint)"
 _READ_ONLY_SQL = "SET TRANSACTION READ ONLY"
+# The schemas a baseline fingerprints when the caller names none: every one but the system's and Caverns' own.
+_DEFAULT_SCHEMAS_SQL = (
+    "SELECT nspname::text FROM pg_namespace"
+    " WHERE left(nspname, 3) <> 'pg_' AND nspname NOT IN ('information_schema', 'caverns') ORDER BY nspname"
+)
+_EXISTING_SCHEMAS_SQL = "SELECT nspname::text FROM pg_namespace WHERE nspname = ANY(%s::text[])"
+# A LEFT JOIN keeps a table without columns in the result.
+_TABLE_COLUMNS_SQL = """
+SELECT n.nspname::text, c.relname::text, c.relkind::text, a.attname::text,
+       format_type(a.atttypid, a.atttypmod), a.attnotnull, pg_get_expr(d.adbin, d.adrelid)
+FROM pg_class c
+JOIN pg_namespace n ON n.oid = c.relnamespace
+LEFT JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped
+LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum
+WHERE c.relkind IN ('r', 'p') AND n.nspname = ANY(%s::text[])
+ORDER BY n.nspname, c.relname, a.attnum
+"""
 
 
 def _check_connection(connection: Connection) -> None:
@@ -551,3 +587,74 @@ def apply(
     """
     statuses = preflight(connection, changeset)
     return _apply_statuses(connection, changeset, statuses, _names("reapply", reapply), _names("accept", accept))
+
+
+def _baseline_step(changeset: Changeset, through: str | None) -> Step:
+    """The step a baseline stands at: *through*, by default the last."""
+    if through is None:
+        return changeset.steps[-1]
+    for step in changeset.steps:
+        if step.label == through:
+            return step
+    raise ChangesetError(f"changeset {changeset.name!r} has no step {through!r} to baseline through")
+
+
+def _resolve_schemas(cursor: _Cursor, schemas: list[str] | None) -> list[str]:
+    """The schemas to fingerprint: the given ones, which must exist, else every non-system one."""
+    if schemas is None:
+        cursor.execute(_DEFAULT_SCHEMAS_SQL)
+        return [row[0] for row in cursor.fetchall()]
+    cursor.execute(_EXISTING_SCHEMAS_SQL, (schemas,))
+    missing = sorted(set(schemas) - {row[0] for row in cursor.fetchall()})
+    if missing:
+        raise BaselineRefused(f"the schema {missing[0]!r} does not exist")
+    return schemas
+
+
+def _read_document(cursor: _Cursor, schemas: list[str]) -> dict[str, Any]:
+    """The tables and columns of *schemas* as a canonical document, read from the system catalogs."""
+    cursor.execute(_TABLE_COLUMNS_SQL, (schemas,))
+    tables: dict[tuple[str, str], dict[str, Any]] = {}
+    for schema, name, kind, column, column_type, not_null, default in cursor.fetchall():
+        table = tables.setdefault((schema, name), {"schema": schema, "name": name, "kind": kind, "columns": []})
+        if column is not None:
+            table["columns"].append({"name": column, "type": column_type, "not_null": not_null, "default": default})
+    return {"tables": [tables[key] for key in sorted(tables)]}
+
+
+def _hash_document(document: dict[str, Any]) -> str:
+    """SHA-256 hex of the document's canonical JSON."""
+    canonical = json.dumps(document, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def baseline(
+    connection: Connection,
+    changeset: Changeset,
+    *,
+    through: str | None = None,
+    schemas: Collection[str] | None = None,
+) -> LedgerEntry:
+    """Record an existing database as the starting point of *changeset*; nothing is executed.
+
+    One `baseline` row for the step *through* (default the last) carries that step's checksum and a
+    fingerprint of the tables and columns in *schemas* (default: every schema but `pg_*`,
+    `information_schema` and `caverns`). Afterwards every step up to *through* is `applied`. Refused
+    (`BaselineRefused`) when the changeset already has ledger rows or a named schema does not exist.
+    """
+    _check_connection(connection)
+    _reject_reserved(changeset)
+    step = _baseline_step(changeset, through)
+    names = None if schemas is None else sorted(_names("schemas", schemas))
+    if names is not None and not names:
+        raise ChangesetError("schemas is empty; name at least one schema or leave it out")
+    with _read_only(connection) as cursor:
+        _require_installed(cursor)
+    with _transaction(connection) as cursor:
+        _lock(cursor)
+        if _read_entries(cursor, changeset.name):
+            raise BaselineRefused(f"changeset {changeset.name!r} already has ledger rows")
+        fingerprint = _hash_document(_read_document(cursor, _resolve_schemas(cursor, names)))
+        entry = _insert(cursor, changeset.name, step, _OUTCOME_BASELINE, fingerprint=fingerprint)
+    _log.info("baseline of changeset %s at step %s: ledger version %d", entry.changeset, entry.label, entry.version)
+    return entry
