@@ -14,7 +14,7 @@ pinned range-and-tree scan.
 | Hook id | Stage | Enforces | Runs locally when |
 |---|---|---|---|
 | `gitleaks` | pre-commit | Secret scan of the staged changes with `.gitleaks.toml` (`references/checkers.md#checker-secret-scan`) | any commit |
-| `project-conventions` | pre-commit | Checker rules C1–C9 (`dev_tools/check_conventions.py`), whole-repo scan | any `.py` / `.md` |
+| `project-conventions` | pre-commit | Checker rules C1–C9 (`dev_tools/check_conventions.py`), whole-repo scan | every commit |
 | `ruff` | pre-commit | `E`, `F`, `B`, `I`, `UP` (config in `pyproject.toml`); isolated venv | any `.py` |
 | `guidance-integrity` | pre-commit | Doc pointers + anchors resolve, `CLAUDE.md` budget, skill routing, single-home tokens (`dev_tools/check_guidance_integrity.py`) | any `.py` / `.md` |
 | `docs-sync` | **commit-msg** | Code change in a documented area also touches its doc (`dev_tools/check_docs_sync.py --staged`) | every commit |
@@ -42,8 +42,9 @@ What it runs:
 2. `python dev_tools/check_guidance_integrity.py`
 3. `ruff check .`
 4. `mypy` — strict, over the package, `dev_tools/` and `.claude/hooks/`
-5. `pytest -q` with the database **required**: the step exports `CAVERNS_REQUIRE_DB=1`, so a database
-   test that cannot connect fails instead of skipping (R8). A changed behaviour means updating its test
+5. `pytest -q` with the database **required**: the step exports `CAVERNS_REQUIRE_DB=1` and drops a
+   caller's `PYTEST_ADDOPTS`, so a database test that cannot connect fails instead of skipping, and a
+   run in which no database test passed fails as a whole (R8). A changed behaviour means updating its test
    deliberately in the same PR — never by loosening an assertion.
 6. `python dev_tools/check_docs_sync.py --base origin/main` — the PR-level docs guard. It sees
    committed changes only; the commit-msg hook covers the commit being made.
@@ -64,7 +65,8 @@ One PostgreSQL 18 instance, local to the machine running the tests, holding no d
 
 - The image tag is stated in `dev_tools/database.py`; `tests/test_database.py` fails when the CI workflow
   or the dev container names a different one, and when the server is not major version 18.
-- The fixtures refuse a connection string whose host is not this machine (`tests/conftest.py`).
+- The fixtures refuse a connection string that can reach another machine: every `host` and `hostaddr`
+  entry must be local, a host must be named and a service entry is refused (`tests/conftest.py`).
 - There is no fallback to another PostgreSQL version: if the instance cannot start, the database tests
   fail and the work stops there.
 - ⚑ Pointing any of this at another database, or changing the version, is ask-first.
@@ -79,7 +81,11 @@ request, never on `main`. Header comments in each file are the detailed contract
 |---|---|---|
 | `ci-pre-commit.yml` | PR, push to `main` | `pre-commit run --all-files` (dev extra installed; skips the commit-msg `docs-sync` and pre-push `pytest-fast` hooks and the staged-only `gitleaks` hook); then the pinned, sha256-verified gitleaks scan of the PR's commits and the tree (`references/checkers.md#checker-secret-scan`) |
 | `ci-docs-sync.yml` | PR | `check_docs_sync.py --base origin/<PR base> --actor <PR author>` (full history for the per-commit `[skip-docs]` attribution; the actor drives the Dependabot exemption) |
-| `ci-tests.yml` | PR, push to `main` | `pytest -q` with coverage against a PostgreSQL 18 service container with the database required; gating `mypy`; gating `actionlint` (version pinned in `pyproject.toml`); `CI gate` (`needs` all three, `if: always()`, passes only when every need succeeded) is the one check branch protection requires |
+| `ci-tests.yml` | PR, push to `main` | `pytest -q` with coverage against a PostgreSQL 18 service container with the database required; gating `mypy`; gating `actionlint` (version pinned in `pyproject.toml`); `CI gate` (`needs` all three, `if: always()`, passes only when every need succeeded) stands for the whole workflow in branch protection |
+
+**Required checks.** Branch protection on `main` requires three checks, one per workflow: `CI gate`,
+`Run pre-commit hooks` and `Docs in sync with code`. `CI gate` covers only the jobs of `ci-tests.yml`; a
+red pre-commit or docs-sync run blocks a merge only when its own check is required too.
 
 No workflow holds a secret, and none connects to anything but its own service container.
 

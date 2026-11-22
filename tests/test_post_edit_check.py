@@ -77,5 +77,5 @@ def test_failures_tolerates_a_missing_ruff_and_lets_conventions_decide(monkeypat
 
 
 def test_failures_returns_the_conventions_output_when_ruff_passes(monkeypatch):
-    monkeypatch.setattr(hook, "run", _fake_run((0, "", ""), (1, "R3 missing marker\n", ""), []))
-    assert hook.failures("a.py") == "R3 missing marker\n"
+    monkeypatch.setattr(hook, "run", _fake_run((0, "", ""), (1, "C2 print() in package code\n", ""), []))
+    assert hook.failures("a.py") == "C2 print() in package code\n"

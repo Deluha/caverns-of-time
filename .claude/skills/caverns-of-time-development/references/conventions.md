@@ -70,7 +70,8 @@ A change in a documented area updates that area's doc in the same PR: the area's
 message exempts that commit's files; it is an escape hatch, not the default. Area map and mechanics:
 `references/checkers.md#checker-docs-sync`.
 
-Enforced: the docs-sync guard (commit-msg hook, verify, CI).
+Enforced: the docs-sync guard (commit-msg hook, verify, and CI where its check is required:
+`references/qa-and-ci.md#workflows`).
 
 ## R8 real database tests
 
@@ -84,7 +85,8 @@ Enforced: the docs-sync guard (commit-msg hook, verify, CI).
 
 Details: `tests/README.md`, `references/qa-and-ci.md#test-database`.
 
-Enforced: C6, C9, the fixtures, and the verify step's required-database switch.
+Enforced: C6, C9, the fixtures' local-only guard, and the required-database switch, under which a run
+without a passed database test fails.
 
 ## R9 one module per component
 
