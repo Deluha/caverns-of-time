@@ -1,0 +1,52 @@
+# Caverns of Time — packaging, version and tool configuration.
+# Install for development: pip install -e ".[dev]"   (runtime only: pip install -e .)
+# The version here is the single product version; the package reads it at import.
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "caverns-of-time"
+version = "0.1.0.dev0"
+description = "A recorded timeline for PostgreSQL: migration ledger, run-level snapshots, drift detection"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+# Runtime dependencies are an ask-first decision (CLAUDE.md "Ask first"); none until Phase 1 signs one off.
+dependencies = []
+
+[project.optional-dependencies]
+# psycopg is the test suite's driver only; the package's connection contract is a Phase 1 decision.
+dev = [
+    "pytest>=7.4.0",
+    "pytest-cov>=4.1.0",
+    "pre-commit>=3.5.0",
+    "ruff>=0.6,<1.0",
+    "mypy>=1.10",
+    "psycopg[binary]>=3.2,<4",
+    # Pinned exactly: the gating actionlint job installs this line; a new release's
+    # rules must arrive as a Dependabot PR, not red CI on every PR.
+    "actionlint-py==1.7.12.25",
+]
+
+[tool.setuptools]
+packages = ["caverns_of_time"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+markers = ["db: needs the PostgreSQL 18 test instance (tests/README.md); the pre-push hook skips them, verify and CI require them"]
+
+[tool.mypy]
+python_version = "3.11"
+files = ["caverns_of_time", "dev_tools", ".claude/hooks"]
+strict = true
+
+# Ruff: pycodestyle, pyflakes, bugbear, import order and pyupgrade.
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "B", "I", "UP"]

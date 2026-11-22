@@ -1,0 +1,37 @@
+*.pyc
+__pycache__/
+
+# Development and build artifacts
+*.egg-info/
+dist/
+build/
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs and temporary files
+*.log
+.tmp/
+
+# Virtual environments and local settings
+venv/
+env/
+.env
+.env.*
+.venv/
+.claude/settings.local.json
+
+# Coverage and tool caches
+.coverage
+coverage.xml
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
