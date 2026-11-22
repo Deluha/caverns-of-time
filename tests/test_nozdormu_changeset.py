@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import hashlib
 import re
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 
 from caverns_of_time import nozdormu
 from caverns_of_time.errors import ChangesetError
-from caverns_of_time.nozdormu import Changeset, Step
+from caverns_of_time.nozdormu import Changeset, LedgerEntry, Status, Step
 
 SQL = "CREATE TABLE t (id int);"
 
@@ -203,3 +204,78 @@ def test_every_sql_constant_names_the_one_ledger_table() -> None:
     for name, sql in constants.items():
         for qualifier in re.findall(r"(\w+)\.ledger\b", sql):
             assert qualifier == nozdormu._OWN_CHANGESET_NAME, name
+
+
+# --- the status decision -----------------------------------------------------------------
+
+A, B, C = Step("a", "SELECT 'a'", "check a"), Step("b", "SELECT 'b'", "check b"), Step("c", "SELECT 'c'")
+APP = Changeset("app", [A, B, C])
+
+
+def _entry(version: int, step: Step, outcome: str = "applied", *, checksum: str | None = None) -> LedgerEntry:
+    return LedgerEntry(
+        version, "app", step.label, checksum or step.checksum, outcome,
+        "f" if outcome == "baseline" else None, "boom" if outcome == "failed" else None,
+        None, datetime(2026, 1, 1, tzinfo=UTC), "me", "0",
+    )  # fmt: skip
+
+
+def _decide(entries: list[LedgerEntry], found: set[str] | None = None) -> list[tuple[str, Status, int | None]]:
+    """(label, status, version of the deciding row) per step; *found* names the checks that are true."""
+    statuses = nozdormu._decide(APP, entries, lambda label, check: label in (found or set()))
+    return [(s.step.label, s.status, s.entry.version if s.entry else None) for s in statuses]
+
+
+def test_an_empty_ledger_leaves_every_step_to_its_check() -> None:
+    assert _decide([]) == [("a", Status.PENDING, None), ("b", Status.PENDING, None), ("c", Status.PENDING, None)]
+
+
+def test_a_check_that_finds_the_effect_makes_the_step_unknown() -> None:
+    assert _decide([], {"a", "c"}) == [
+        ("a", Status.UNKNOWN, None),
+        ("b", Status.PENDING, None),
+        ("c", Status.PENDING, None),
+    ]
+
+
+def test_a_matching_row_makes_a_step_applied_and_skips_its_check() -> None:
+    def refuse(label: str, check: str) -> bool:
+        raise AssertionError(f"the check of {label} must not run")
+
+    statuses = nozdormu._decide(Changeset("app", [A]), [_entry(1, A)], refuse)
+    assert [(s.status, s.entry) for s in statuses] == [(Status.APPLIED, _entry(1, A))]
+
+
+def test_a_row_with_another_checksum_is_a_conflict() -> None:
+    assert _decide([_entry(1, A, checksum="0" * 64)])[0] == ("a", Status.CONFLICT, 1)
+
+
+def test_the_latest_row_decides() -> None:
+    old, new = _entry(1, A, checksum="0" * 64), _entry(2, A, "accepted")
+    assert _decide([old, new])[0] == ("a", Status.APPLIED, 2)
+    assert _decide([new, _entry(3, A, checksum="1" * 64)])[0] == ("a", Status.CONFLICT, 3)
+
+
+def test_a_failed_row_does_not_count() -> None:
+    assert _decide([_entry(1, A, "failed")])[0] == ("a", Status.PENDING, None)
+    assert _decide([_entry(1, A), _entry(2, A, "failed")])[0] == ("a", Status.APPLIED, 1)
+    assert _decide([_entry(1, A, "failed")], {"a"})[0] == ("a", Status.UNKNOWN, None)
+
+
+def test_the_baseline_covers_its_step_and_every_step_before_it() -> None:
+    assert _decide([_entry(1, B, "baseline")]) == [
+        ("a", Status.APPLIED, 1),
+        ("b", Status.APPLIED, 1),
+        ("c", Status.PENDING, None),
+    ]
+
+
+def test_a_row_of_a_step_before_the_baseline_wins_over_the_baseline() -> None:
+    entries = [_entry(1, B, "baseline"), _entry(2, A, checksum="0" * 64)]
+    assert _decide(entries)[0] == ("a", Status.CONFLICT, 2)
+
+
+def test_a_baseline_at_a_step_the_changeset_lacks_is_an_error() -> None:
+    ghost = Step("ghost", "SELECT 1")
+    with pytest.raises(ChangesetError, match="'ghost'"):
+        _decide([_entry(1, ghost, "baseline")])

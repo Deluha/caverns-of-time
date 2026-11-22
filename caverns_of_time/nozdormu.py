@@ -8,11 +8,12 @@ database driver. Contract and behaviour: `caverns_of_time/README.md`.
 
 from __future__ import annotations
 
+import enum
 import hashlib
 import logging
 import os
 import time
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, fields
 from datetime import datetime
@@ -20,9 +21,9 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from caverns_of_time import __version__
-from caverns_of_time.errors import CavernsError, ChangesetError
+from caverns_of_time.errors import CavernsError, ChangesetError, LedgerNotInstalled
 
-__all__ = ["Changeset", "Connection", "LedgerEntry", "Step", "install"]
+__all__ = ["Changeset", "Connection", "LedgerEntry", "Status", "Step", "StepStatus", "install", "preflight"]
 
 _log = logging.getLogger(__name__)
 
@@ -33,6 +34,8 @@ _MILLISECONDS = 1000
 # Caverns' own changeset; its name is also the schema that holds the ledger.
 _OWN_CHANGESET_NAME = "caverns"
 _OUTCOME_APPLIED = "applied"
+_OUTCOME_FAILED = "failed"
+_OUTCOME_BASELINE = "baseline"
 # One key for every ledger write: Caverns' writers take turns, whatever the changeset.
 _ADVISORY_LOCK_KEY = 0x43617665726E73  # "Caverns"
 
@@ -185,6 +188,24 @@ class LedgerEntry:
     caverns_version: str
 
 
+class Status(enum.StrEnum):
+    """Where a step stands: recorded as applied, not yet applied, present but unrecorded, or edited."""
+
+    APPLIED = "applied"
+    PENDING = "pending"
+    UNKNOWN = "unknown"
+    CONFLICT = "conflict"
+
+
+@dataclass(frozen=True)
+class StepStatus:
+    """A step's status and the ledger row that decided it (None when no row did)."""
+
+    step: Step
+    status: Status
+    entry: LedgerEntry | None
+
+
 # WARNING: this statement shipped once it is released. Never edit it: its checksum is recorded in
 # every consumer's ledger. A change to the ledger is a new step of the own changeset (hard rule 6).
 _LEDGER_DDL_SQL = """
@@ -225,6 +246,7 @@ _INSERT_ENTRY_SQL = (
     " VALUES (%s, %s, %s, %s, %s, %s, %s, %s) RETURNING " + _LEDGER_COLUMNS
 )
 _LOCK_SQL = "SELECT pg_advisory_xact_lock(%s::bigint)"
+_READ_ONLY_SQL = "SET TRANSACTION READ ONLY"
 
 
 def _check_connection(connection: Connection) -> None:
@@ -254,6 +276,22 @@ def _transaction(connection: Connection) -> Iterator[_Cursor]:
         connection.rollback()
         raise
     connection.commit()
+
+
+@contextmanager
+def _read_only(connection: Connection) -> Iterator[_Cursor]:
+    """A read-only transaction that is always rolled back."""
+    try:
+        with _cursor(connection) as cursor:
+            cursor.execute(_READ_ONLY_SQL)
+            yield cursor
+    finally:
+        connection.rollback()
+
+
+def _reject_reserved(changeset: Changeset) -> None:
+    if changeset.name == _OWN_CHANGESET_NAME:
+        raise ChangesetError(f"the changeset name {changeset.name!r} is reserved for Caverns' own changeset")
 
 
 def _lock(cursor: _Cursor) -> None:
@@ -290,6 +328,93 @@ def _insert(
     cursor.execute(_INSERT_ENTRY_SQL, values)
     (row,) = cursor.fetchall()
     return LedgerEntry(*row)
+
+
+def _baseline_position(changeset: Changeset, entries: Sequence[LedgerEntry]) -> tuple[LedgerEntry, int] | None:
+    """The changeset's baseline row and the index of its step, or None when it has no baseline."""
+    baseline = next((entry for entry in reversed(entries) if entry.outcome == _OUTCOME_BASELINE), None)
+    if baseline is None:
+        return None
+    labels = [step.label for step in changeset.steps]
+    if baseline.label not in labels:
+        raise ChangesetError(
+            f"the baseline of changeset {changeset.name!r} is at step {baseline.label!r}, which the changeset lacks"
+        )
+    return baseline, labels.index(baseline.label)
+
+
+def _ledger_decision(
+    changeset: Changeset, entries: Sequence[LedgerEntry], index: int
+) -> tuple[Status, LedgerEntry] | None:
+    """What the ledger alone says of the step at *index*, or None when only its check can tell.
+
+    The latest row that is not a failure decides: the same checksum is applied, another is a conflict.
+    Without one, a step at or before the baseline's step is applied.
+    """
+    step = changeset.steps[index]
+    baseline = _baseline_position(changeset, entries)
+    latest = next((e for e in reversed(entries) if e.label == step.label and e.outcome != _OUTCOME_FAILED), None)
+    if latest is not None:
+        return (Status.APPLIED if latest.checksum == step.checksum else Status.CONFLICT), latest
+    if baseline is not None and index <= baseline[1]:
+        return Status.APPLIED, baseline[0]
+    return None
+
+
+def _decide(
+    changeset: Changeset, entries: Sequence[LedgerEntry], run_check: Callable[[str, str], bool]
+) -> list[StepStatus]:
+    """The status of every step: the ledger first, then the step's check, run only when the ledger is silent.
+
+    *entries* are the changeset's ledger rows, oldest first; *run_check* takes a step's label and check
+    SQL and says whether the check found the step's effect.
+    """
+    statuses = []
+    for index, step in enumerate(changeset.steps):
+        decision = _ledger_decision(changeset, entries, index)
+        if decision is not None:
+            statuses.append(StepStatus(step, *decision))
+        elif step.check is not None and run_check(step.label, step.check):
+            statuses.append(StepStatus(step, Status.UNKNOWN, None))
+        else:
+            statuses.append(StepStatus(step, Status.PENDING, None))
+    return statuses
+
+
+def _run_check(cursor: _Cursor, label: str, check: str) -> bool:
+    """Run a step's check; it must return exactly one row with one boolean column."""
+    try:
+        cursor.execute(check)
+        rows = cursor.fetchall()
+    except Exception as error:
+        raise ChangesetError(f"the check of step {label!r} failed: {error}") from error
+    if len(rows) == 1 and len(rows[0]) == 1 and isinstance(rows[0][0], bool):
+        return rows[0][0]
+    raise ChangesetError(f"the check of step {label!r} must return one row with one boolean column")
+
+
+def _statuses(cursor: _Cursor, changeset: Changeset) -> list[StepStatus]:
+    entries = _read_entries(cursor, changeset.name)
+    return _decide(changeset, entries, lambda label, check: _run_check(cursor, label, check))
+
+
+def _require_installed(cursor: _Cursor) -> None:
+    own = _statuses(cursor, _OWN_CHANGESET)
+    if any(status.status is not Status.APPLIED for status in own):
+        raise LedgerNotInstalled("the ledger is not installed (Caverns' own changeset is not applied): call install()")
+
+
+def preflight(connection: Connection, changeset: Changeset) -> list[StepStatus]:
+    """The status of every step of *changeset*, in changeset order; writes nothing.
+
+    Raises `LedgerNotInstalled` before `install()` and `ChangesetError` for a reserved name, a broken
+    check or a baseline at a step the changeset lacks.
+    """
+    _check_connection(connection)
+    _reject_reserved(changeset)
+    with _read_only(connection) as cursor:
+        _require_installed(cursor)
+        return _statuses(cursor, changeset)
 
 
 def install(connection: Connection) -> list[LedgerEntry]:

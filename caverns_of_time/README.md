@@ -12,7 +12,7 @@ migration ledger (in progress; this file describes what is built).
 |---|---|
 | `__init__.py` | `__version__`, read from the installed distribution's metadata |
 | `errors.py` | The exception types, all in one module |
-| `nozdormu.py` | Nozdormu: the `Step` and `Changeset` model, the checksum, the loaders, the connection contract, the ledger and `install` |
+| `nozdormu.py` | Nozdormu: the `Step` and `Changeset` model, the checksum, the loaders, the connection contract, the ledger, `install` and `preflight` |
 
 ## How it works
 
@@ -30,6 +30,19 @@ readable from one file (`Step.from_file`).
 step as the ledger's first row, in the same transaction as the DDL. Installing again writes nothing and
 returns `[]`. Until the ledger exists, reading it behaves as an empty ledger; that is how the own
 changeset bootstraps.
+
+**Nozdormu, preflight.** `preflight(connection, changeset)` reports one `StepStatus` (step, status and the
+ledger row that decided it, if any) per step in changeset order and writes nothing: it runs in one
+read-only transaction that is always rolled back. It decides the ledger first, then the check:
+
+| Status | When |
+|---|---|
+| `applied` | the latest row of the step that is not `failed` has the step's current checksum; or the changeset has a `baseline` row and the step is at or before the baseline's step |
+| `conflict` | the latest row of the step that is not `failed` has another checksum (the SQL was edited) |
+| `pending` | no such row, and the step has no check or its check is false |
+| `unknown` | no such row, but the check is true: the effect is present and nothing recorded it |
+
+A `failed` row never decides a status. A step's check runs only when the ledger is silent about the step.
 
 ## Interfaces & contracts
 
@@ -69,6 +82,12 @@ changeset bootstraps.
   An index on (`changeset`, `label`, `version`) serves the reads. The ledger is append-only: triggers
   reject UPDATE, DELETE and TRUNCATE (hard rule 5); a correction is a new row. `LedgerEntry` carries these
   columns in this order.
+- `preflight(connection, changeset) -> list[StepStatus]` and `Status` (`applied`, `pending`, `unknown`,
+  `conflict`). A check that does not return exactly one row with one boolean column, or raises a database
+  error, is a `ChangesetError` naming the step; so is a `baseline` row at a step the changeset lacks.
+  `LedgerNotInstalled` is raised when Caverns' own changeset is not fully applied (call `install` first).
+  The changeset name `caverns` is refused with a `ChangesetError`: the public functions take a consumer's
+  changeset only.
 - The own changeset is never edited once released: a change to the ledger is a new own step (hard rule 6).
   The ledger's DDL is idempotent, and `caverns` is a reserved changeset name.
 - No runtime dependency. Adding one is an ask-first decision.
