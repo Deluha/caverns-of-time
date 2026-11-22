@@ -1,7 +1,8 @@
 """Caverns of Time: a recorded timeline for PostgreSQL.
 
 The components (Nozdormu, Chromie, Epochs, Infinite, Murozond, Timewalking) arrive
-phase by phase; see ROADMAP.md. Until then the package only states its version.
+phase by phase; see ROADMAP.md. Present so far: Nozdormu (`caverns_of_time.nozdormu`, the
+migration ledger) and the shared exceptions (`caverns_of_time.errors`).
 """
 
 from importlib.metadata import PackageNotFoundError, version

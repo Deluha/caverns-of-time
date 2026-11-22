@@ -45,8 +45,8 @@ changed outside the timeline. Project Blackwing is the first consumer, not the d
 
 | Phase | Status | Pull request |
 |---|---|---|
-| 0 — Development process | In review | [#1](https://github.com/Deluha/caverns-of-time/pull/1) |
-| 1 — Nozdormu | Not started | |
+| 0 — Development process | Merged | [#1](https://github.com/Deluha/caverns-of-time/pull/1) |
+| 1 — Nozdormu | In review | [#2](https://github.com/Deluha/caverns-of-time/pull/2) |
 | 2 — Chromie and Infinite | Not started | |
 | 3 — Epochs | Not started | |
 | 4 — Murozond and Timewalking | Not started | |
@@ -116,6 +116,21 @@ Sign-off decisions (owner, 2026-11-22: S1–S5 confirmed as proposed):
 Sign-off: ledger schema name and columns; the `Step` signature; the connection contract (a DB-API
 connection, so both psycopg2 and psycopg 3 consumers work — *proposed*); what a checksum covers; how a
 deliberately edited step is re-applied.
+
+Sign-off decisions (owner, 2026-11-22: N1–N8 confirmed as recommended; N9 confirmed after the phase review; N10 confirmed after the pull-request review):
+
+| # | Item | Decision |
+|---|---|---|
+| N1 | Ledger schema | Fixed schema `caverns`, table `caverns.ledger`: `version` (identity, the ledger version), `changeset`, `label`, `checksum` (64 hex), `outcome` (`applied` / `failed` / `baseline` / `accepted`), `fingerprint` (required on `baseline`), `error` (exactly on `failed`), `duration_ms`, `recorded_at`, `recorded_by`, `caverns_version`; index on (changeset, label, version); triggers reject UPDATE, DELETE and TRUNCATE. Created by step `ledger` of Caverns' own changeset `caverns` (name reserved). |
+| N2 | `Step` and `Changeset` | Frozen `Step(label, sql, check=None)`, `Step.from_file(path, *, label=None, check=None)`, `Step.checksum`; a check is SQL returning one boolean, true when the effect is present. `Changeset(name, steps)` and `Changeset.from_directory(name, path)`: each `*.sql` a step in filename order, `<stem>.check.sql` its check, no recursion. Labels non-empty, one line, no surrounding whitespace, unique; empty SQL or changeset refused. |
+| N3 | Public functions | `install(conn)`, `preflight(conn, changeset)`, `apply(conn, changeset, *, reapply=(), accept=())`, `baseline(conn, changeset, *, through=None, schemas=None)`. Statuses: applied (latest non-failed row matches, or at or before the baseline's step), conflict (latest row differs), pending (no row; no check or check false), unknown (no row; check true). Apply refuses the whole run up front on an unacknowledged conflict or unknown; one transaction per step under an advisory lock; a failure is rolled back, recorded as a `failed` row and raised. Exceptions in one module, `errors`. |
+| N4 | Connection contract | Any DB-API 2.0 connection with `%s` parameters (psycopg 3, psycopg2); no driver imported, no runtime dependency; a connection with autocommit on is refused; Caverns commits and rolls back itself. `psycopg2-binary` joins the `dev` extra and the database tests run on both drivers. Statements that cannot run in a transaction are out of scope for v0.1. Flag for Phase 3: identifier quoting without a driver module is done server-side. |
+| N5 | Checksum | SHA-256 hex of the step's SQL as UTF-8, line endings normalised to `\n`, leading and trailing whitespace of the whole text trimmed; label, check and changeset name not covered. |
+| N6 | Edited step | Preferred: a new step. `reapply` runs the edited SQL and records a new `applied` row; `accept` records the new checksum as `accepted` without running (also for an unknown step). Naming a step that is not a conflict or unknown is an error. |
+| N7 | Baseline | One `baseline` row for the `through` step (default the last), with its checksum and a fingerprint; nothing executed; refused when the changeset already has rows. Phase 1 fingerprint: SHA-256 over a canonical document of tables and columns in the given schemas (default all but `pg_*`, `information_schema`, `caverns`); Phase 2 widens it and moves it to Infinite. |
+| N8 | Layout | One module `nozdormu` plus the shared `errors` module; split into a sub-package behind a facade only past ~800 lines. |
+| N9 | Review amendment | Public names `Connection`, `LedgerEntry`, `Status`, `StepStatus` and the exceptions `CavernsError`, `ChangesetError`, `LedgerNotInstalled`, `PreflightRefused` (`statuses`), `StepFailed` (`label`, `version`), `BaselineRefused`. Returns: `install` and `apply` the rows written (`[]` when nothing to do), `preflight` one `StepStatus` per step, `baseline` its row. Refused: a bare string for `reapply`, `accept` or `schemas`, a label in both `reapply` and `accept`, an empty `schemas` (`ChangesetError`); a named schema that does not exist (`BaselineRefused`); a connection with uncommitted writes (`CavernsError`, nothing rolled back). The checksum (N5) trims ASCII whitespace only: space, tab, LF, CR, FF, VT. |
+| N10 | Pull-request review amendment | Refused with `ChangesetError`: an empty check; a `<x>.check.sql` without its `<x>.sql`; a label in `reapply` or `accept` that the changeset lacks; `None` for `reapply` or `accept`; a `baseline` row whose step the changeset no longer has (the way out is a new changeset name); a check that returns a second result set where the driver reports it (psycopg 3): a check is exactly one statement. `PreflightRefused`: acknowledging a step that is not a conflict or unknown; a step whose ledger status changed under the lock, even mid-run after earlier steps committed. A failure that cannot be recorded raises `CavernsError` from the step's error. A connection whose transaction has failed or that is lost is refused (`CavernsError`); an open transaction that only read is rolled back, ending its `SET LOCAL`, uncommitted `SET` and transaction-level locks. `install` records its own step as `accepted` when its effect is present without a row (a schema-only restore). The baseline fingerprint is read with `search_path` pinned to `pg_catalog`. |
 
 ### Phase 2 — Chromie and Infinite
 
