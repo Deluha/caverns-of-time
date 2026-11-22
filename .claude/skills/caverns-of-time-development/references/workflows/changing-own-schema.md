@@ -2,8 +2,8 @@
 
 For a change to an object Caverns itself owns inside a consumer's database: the ledger, the epoch
 catalog, a history table. Rules: R5 and R6 (`references/conventions.md#r5`, `references/conventions.md#r6`).
-The first such objects arrive in Phase 1 (`ROADMAP.md`); that phase adds the file and module names this
-workflow points at.
+Caverns' own changeset is `_OWN_CHANGESET` in `caverns_of_time/nozdormu.py` (its first step, `ledger`,
+creates `caverns.ledger`); its database tests are in `tests/test_nozdormu_ledger.py`.
 
 ## Preconditions
 
