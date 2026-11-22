@@ -46,7 +46,7 @@ changed outside the timeline. Project Blackwing is the first consumer, not the d
 | Phase | Status | Pull request |
 |---|---|---|
 | 0 — Development process | Merged | [#1](https://github.com/Deluha/caverns-of-time/pull/1) |
-| 1 — Nozdormu | In progress | |
+| 1 — Nozdormu | In review | |
 | 2 — Chromie and Infinite | Not started | |
 | 3 — Epochs | Not started | |
 | 4 — Murozond and Timewalking | Not started | |
