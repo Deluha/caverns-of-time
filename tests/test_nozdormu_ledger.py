@@ -72,10 +72,16 @@ def _statuses(conn: Any, changeset: Changeset = APP) -> dict[str, Status]:
     return {s.step.label: s.status for s in preflight(conn, changeset)}
 
 
-def _refused(conn: Any, sql: str, message: str) -> None:
+def _refused(conn: Any, sql: str, message: str, params: tuple[Any, ...] | None = None) -> None:
     with pytest.raises(DRIVER_ERRORS, match=message), conn.cursor() as cursor:
-        cursor.execute(sql)
+        cursor.execute(sql, params)
     conn.rollback()
+
+
+def _assert_idle(conn: Any) -> None:
+    """The connection has no open transaction: both drivers refuse to switch autocommit inside one."""
+    conn.autocommit = True
+    conn.autocommit = False
 
 
 # --- install -------------------------------------------------------------------------------
@@ -97,6 +103,17 @@ def test_install_twice_writes_nothing_the_second_time(ledger_conn: Any) -> None:
     install(ledger_conn)
     assert install(ledger_conn) == []
     assert _query(ledger_conn, LEDGER_ROWS) == [(1, "caverns", "ledger", "applied")]
+
+
+def test_install_accepts_its_own_step_when_the_table_exists_without_its_row(ledger_conn: Any) -> None:
+    _execute(ledger_conn, nozdormu._LEDGER_DDL_SQL)  # a schema-only restore: the table, but no row
+    with pytest.raises(LedgerNotInstalled):
+        preflight(ledger_conn, APP)
+    _assert_idle(ledger_conn)
+    entries = install(ledger_conn)
+    assert [(e.changeset, e.label, e.outcome) for e in entries] == [("caverns", "ledger", "accepted")]
+    assert entries[0].duration_ms is None
+    assert len(preflight(ledger_conn, APP)) == len(APP.steps)
 
 
 def test_install_refuses_a_connection_with_autocommit_on(ledger_conn: Any) -> None:
@@ -136,23 +153,26 @@ def test_the_ledger_is_append_only(ledger_conn: Any, statement: str) -> None:
     assert _query(ledger_conn, LEDGER_ROWS) == [(1, "caverns", "ledger", "applied")]
 
 
+INSERT_ROW_SQL = (
+    "INSERT INTO caverns.ledger (changeset, label, checksum, outcome, fingerprint, error, caverns_version)"
+    " VALUES (%s, %s, %s, %s, %s, %s, 'v')"
+)
+ZEROS = "0" * 64
+
+
 @pytest.mark.parametrize(
     "values",
     [
-        "'c', 'l', 'not-a-checksum', 'applied', NULL, NULL",
-        f"'c', 'l', '{'0' * 64}', 'unknown', NULL, NULL",
-        f"'c', 'l', '{'0' * 64}', 'baseline', NULL, NULL",
-        f"'c', 'l', '{'0' * 64}', 'failed', NULL, NULL",
-        f"'c', 'l', '{'0' * 64}', 'applied', NULL, 'an error'",
+        ("c", "l", "not-a-checksum", "applied", None, None),
+        ("c", "l", ZEROS, "unknown", None, None),
+        ("c", "l", ZEROS, "baseline", None, None),
+        ("c", "l", ZEROS, "failed", None, None),
+        ("c", "l", ZEROS, "applied", None, "an error"),
     ],
 )
-def test_the_ledger_refuses_an_inconsistent_row(ledger_conn: Any, values: str) -> None:
+def test_the_ledger_refuses_an_inconsistent_row(ledger_conn: Any, values: tuple[Any, ...]) -> None:
     install(ledger_conn)
-    insert = (
-        "INSERT INTO caverns.ledger (changeset, label, checksum, outcome, fingerprint, error, caverns_version) "
-        f"VALUES ({values}, 'v')"
-    )
-    _refused(ledger_conn, insert, "violates check constraint")
+    _refused(ledger_conn, INSERT_ROW_SQL, "violates check constraint", values)
 
 
 # --- preflight -----------------------------------------------------------------------------
@@ -161,6 +181,7 @@ def test_the_ledger_refuses_an_inconsistent_row(ledger_conn: Any, values: str) -
 def test_preflight_refuses_a_ledger_that_is_not_installed(ledger_conn: Any) -> None:
     with pytest.raises(LedgerNotInstalled, match="install"):
         preflight(ledger_conn, APP)
+    _assert_idle(ledger_conn)
 
 
 def test_preflight_refuses_the_reserved_changeset_name(ledger_conn: Any) -> None:
@@ -247,15 +268,35 @@ def test_preflight_names_the_step_of_a_broken_check(ledger_conn: Any, check: str
     _execute(ledger_conn, TABLE.sql)
     with pytest.raises(ChangesetError, match="'broken'"):
         preflight(ledger_conn, Changeset("app", [Step("broken", "SELECT 1", check)]))
+    _assert_idle(ledger_conn)
     assert _query(ledger_conn, "SELECT count(*) FROM nozdormu_test.t") == [(0,)]
+
+
+def test_a_check_is_one_statement_where_the_driver_reports_a_second(ledger_conn: Any, request: Any) -> None:
+    install(ledger_conn)
+    one = Changeset("app", [Step("one", "SELECT 1", "SELECT false")])
+    assert [s.status for s in preflight(ledger_conn, one)] == [Status.PENDING]
+    two = Changeset("app", [Step("two", "SELECT 1", "SELECT false; SELECT true")])
+    if request.node.callspec.params["ledger_conn"] == "psycopg":
+        with pytest.raises(ChangesetError, match="'two'.*one statement"):
+            preflight(ledger_conn, two)
+        _assert_idle(ledger_conn)
+    else:  # psycopg2 cannot report a further result set: the rule is documented there, not detected
+        assert len(preflight(ledger_conn, two)) == 1
+
+
+def test_preflight_refuses_a_connection_that_was_lost(second_conn: Any) -> None:
+    second_conn.close()
+    with pytest.raises(CavernsError, match="cannot run a statement") as refused:
+        preflight(second_conn, APP)
+    assert isinstance(refused.value.__cause__, DRIVER_ERRORS)
 
 
 def test_preflight_is_read_only_and_leaves_the_connection_clean(ledger_conn: Any) -> None:
     install(ledger_conn)
     preflight(ledger_conn, APP)
     assert _query(ledger_conn, LEDGER_ROWS) == [(1, "caverns", "ledger", "applied")]
-    ledger_conn.autocommit = True  # only possible when no transaction is open
-    ledger_conn.autocommit = False
+    _assert_idle(ledger_conn)
 
 
 @pytest.mark.parametrize(
@@ -320,6 +361,7 @@ def _columns(conn: Any) -> list[str]:
 def test_apply_refuses_a_ledger_that_is_not_installed(ledger_conn: Any) -> None:
     with pytest.raises(LedgerNotInstalled):
         apply(ledger_conn, APP)
+    _assert_idle(ledger_conn)
 
 
 def test_apply_refuses_the_reserved_changeset_name(ledger_conn: Any) -> None:
@@ -367,6 +409,7 @@ def test_apply_refuses_an_unacknowledged_conflict_and_writes_nothing(ledger_conn
     with pytest.raises(PreflightRefused) as refused:
         apply(ledger_conn, EDITED)
     assert [(s.step.label, s.status) for s in refused.value.statuses] == [("table", Status.CONFLICT)]
+    _assert_idle(ledger_conn)
     assert "table (conflict)" in str(refused.value)
     assert not _exists(ledger_conn, "nozdormu_test.t_id")
     assert _query(ledger_conn, APP_ROWS) == [("schema", "applied"), ("table", "applied")]
@@ -377,6 +420,7 @@ def test_apply_refuses_an_unacknowledged_unknown_step_and_writes_nothing(ledger_
     _execute(ledger_conn, SCHEMA.sql)
     with pytest.raises(PreflightRefused) as refused:
         apply(ledger_conn, APP)
+    _assert_idle(ledger_conn)
     assert [(s.step.label, s.status) for s in refused.value.statuses] == [("schema", Status.UNKNOWN)]
     assert _query(ledger_conn, APP_ROWS) == []
     assert not _exists(ledger_conn, "nozdormu_test.t")
@@ -429,6 +473,7 @@ def test_apply_refuses_to_acknowledge_a_step_that_is_not_in_conflict(
     before = _query(ledger_conn, LEDGER_ROWS)
     with pytest.raises(PreflightRefused) as refused:
         apply(ledger_conn, APP, **kwargs)
+    _assert_idle(ledger_conn)
     assert [s.step.label for s in refused.value.statuses] == labels
     assert _query(ledger_conn, LEDGER_ROWS) == before
 
@@ -438,6 +483,7 @@ def test_reapply_refuses_a_step_that_is_unknown(ledger_conn: Any) -> None:
     _execute(ledger_conn, SCHEMA.sql)
     with pytest.raises(PreflightRefused, match=r"schema \(unknown\)"):
         apply(ledger_conn, APP, reapply=["schema"])
+    _assert_idle(ledger_conn)
 
 
 @pytest.mark.parametrize(
@@ -453,6 +499,7 @@ def test_apply_refuses_a_bad_acknowledgement(ledger_conn: Any, kwargs: dict[str,
     _applied_prefix(ledger_conn)
     with pytest.raises(ChangesetError, match=message):
         apply(ledger_conn, EDITED, **kwargs)
+    _assert_idle(ledger_conn)
     assert _query(ledger_conn, APP_ROWS) == [("schema", "applied"), ("table", "applied")]
 
 
@@ -471,6 +518,7 @@ def test_a_failing_step_is_rolled_back_recorded_and_raised(ledger_conn: Any) -> 
     install(ledger_conn)
     with pytest.raises(StepFailed) as failed:
         apply(ledger_conn, FAILING)
+    _assert_idle(ledger_conn)
     assert (failed.value.label, failed.value.version) == ("bad", 3)
     assert isinstance(failed.value.__cause__, DRIVER_ERRORS)
     assert _query(ledger_conn, APP_ROWS) == [("schema", "applied"), ("bad", "failed")]
@@ -496,6 +544,7 @@ def test_a_failing_own_step_raises_a_caverns_error_and_records_nothing(
     monkeypatch.setattr(nozdormu, "_OWN_CHANGESET", failing)
     with pytest.raises(CavernsError, match="could not be recorded") as refused:
         install(ledger_conn)
+    _assert_idle(ledger_conn)
     assert not isinstance(refused.value, StepFailed)
     assert isinstance(refused.value.__cause__, DRIVER_ERRORS) and "division by zero" in str(refused.value.__cause__)
     assert not _exists(ledger_conn, "caverns.ledger")  # the connection is usable and nothing was written
@@ -510,6 +559,7 @@ def test_a_failure_that_cannot_be_recorded_raises_a_caverns_error(ledger_conn: A
             apply(ledger_conn, Changeset("app", [Step("ro", "CREATE TABLE nozdormu_test.ro_t ()")]))
     finally:
         _execute(ledger_conn, READ_WRITE_SESSION_SQL)
+    _assert_idle(ledger_conn)
     assert not isinstance(refused.value, StepFailed)
     assert isinstance(refused.value.__cause__, DRIVER_ERRORS)
     assert _query(ledger_conn, APP_ROWS) == []
@@ -532,6 +582,7 @@ def test_apply_refuses_a_step_that_changed_after_preflight(ledger_conn: Any) -> 
     _record(ledger_conn, SCHEMA, checksum="0" * 64)  # another runner applied another version
     with pytest.raises(PreflightRefused, match=r"schema \(conflict\)"):
         nozdormu._apply_statuses(ledger_conn, APP, stale, frozenset(), frozenset())
+    _assert_idle(ledger_conn)
     assert _query(ledger_conn, APP_ROWS) == [("schema", "applied")]
 
 
@@ -565,7 +616,7 @@ def test_a_runner_waits_for_the_lock_and_reads_the_ledger_after_it(ledger_conn: 
     _execute(ledger_conn, SCHEMA.sql)
     _execute(ledger_conn, REPEATABLE_READ_SQL)  # a snapshot taken before the wait would miss the other runner
     with second_conn.cursor() as cursor:
-        cursor.execute("SELECT pg_advisory_xact_lock(%s::bigint)", (nozdormu._ADVISORY_LOCK_KEY,))
+        cursor.execute(nozdormu._LOCK_SQL, (nozdormu._ADVISORY_LOCK_KEY,))
     result: dict[str, Any] = {}
 
     def run() -> None:
@@ -622,6 +673,7 @@ def _existing_database(conn: Any) -> None:
 def test_baseline_refuses_a_ledger_that_is_not_installed(ledger_conn: Any) -> None:
     with pytest.raises(LedgerNotInstalled):
         baseline(ledger_conn, APP)
+    _assert_idle(ledger_conn)
 
 
 def test_baseline_refuses_the_reserved_changeset_name(ledger_conn: Any) -> None:
@@ -674,6 +726,7 @@ def test_a_second_baseline_is_refused(ledger_conn: Any) -> None:
     baseline(ledger_conn, APP)
     with pytest.raises(BaselineRefused, match="already has ledger rows"):
         baseline(ledger_conn, APP, through="table")
+    _assert_idle(ledger_conn)
     assert _query(ledger_conn, APP_ROWS) == [("index", "baseline")]
 
 
@@ -682,6 +735,7 @@ def test_a_baseline_is_refused_for_a_changeset_that_was_applied(ledger_conn: Any
     apply(ledger_conn, Changeset("app", [SCHEMA]))
     with pytest.raises(BaselineRefused):
         baseline(ledger_conn, APP)
+    _assert_idle(ledger_conn)
 
 
 def test_another_changeset_does_not_block_a_baseline(ledger_conn: Any) -> None:
@@ -694,6 +748,7 @@ def test_baseline_refuses_a_schema_that_does_not_exist(ledger_conn: Any) -> None
     install(ledger_conn)
     with pytest.raises(BaselineRefused, match="'nozdormu_missing'"):
         baseline(ledger_conn, APP, schemas=["public", "nozdormu_missing"])
+    _assert_idle(ledger_conn)
     assert _query(ledger_conn, APP_ROWS) == []
 
 
@@ -720,6 +775,19 @@ def test_the_fingerprint_is_stable_and_follows_the_tables(ledger_conn: Any) -> N
     assert with_column != first
     _execute(ledger_conn, "CREATE TABLE nozdormu_test.bare ()")  # a table without columns still counts
     assert _fingerprint(ledger_conn, "four", schemas=["nozdormu_test"]) != with_column
+
+
+def test_the_fingerprint_does_not_depend_on_the_search_path(ledger_conn: Any) -> None:
+    install(ledger_conn)
+    _execute(ledger_conn, SCHEMA.sql)
+    _execute(ledger_conn, "CREATE TABLE nozdormu_test.t (id serial)")
+    first = _fingerprint(ledger_conn, "fp_a", schemas=["nozdormu_test"])
+    _execute(ledger_conn, "SET search_path = nozdormu_test, public")
+    try:
+        second = _fingerprint(ledger_conn, "fp_b", schemas=["nozdormu_test"])
+    finally:
+        _execute(ledger_conn, "RESET search_path")
+    assert second == first
 
 
 def test_the_fingerprint_ignores_a_schema_that_was_not_asked_for(ledger_conn: Any) -> None:
