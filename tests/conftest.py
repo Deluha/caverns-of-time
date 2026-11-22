@@ -21,7 +21,7 @@ from psycopg.conninfo import conninfo_to_dict
 DSN_VARIABLE = "CAVERNS_TEST_DSN"
 REQUIRE_DB_VARIABLE = "CAVERNS_REQUIRE_DB"
 LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1"}
-DB_FIXTURES = {"db_dsn", "db_conn", "ledger_conn"}
+DB_FIXTURES = {"db_dsn", "db_conn", "ledger_conn", "second_conn"}
 DB_MARKER = "db"
 LEDGER_DRIVERS = {"psycopg": psycopg, "psycopg2": psycopg2}
 # Schemas the ledger tests create objects in, dropped around each test: `caverns` is Caverns' own,
@@ -161,5 +161,18 @@ def ledger_conn(request: pytest.FixtureRequest, db_dsn: str) -> Iterator[Any]:
         _drop_ledger_schemas(conn)
         yield conn
         _drop_ledger_schemas(conn)
+    finally:
+        conn.close()
+
+
+@pytest.fixture
+def second_conn(request: pytest.FixtureRequest, ledger_conn: Any, db_dsn: str) -> Iterator[Any]:
+    """A second non-autocommit connection on the driver of `ledger_conn`, for tests of two runners.
+
+    It depends on `ledger_conn`, so it is closed first: its open transaction cannot block the schema drops.
+    """
+    conn = LEDGER_DRIVERS[request.node.callspec.params["ledger_conn"]].connect(db_dsn)
+    try:
+        yield conn
     finally:
         conn.close()

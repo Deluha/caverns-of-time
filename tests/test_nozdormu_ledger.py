@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import re
+import threading
+import time
 from typing import Any
 
 import psycopg
@@ -432,6 +434,18 @@ def test_a_failed_step_can_be_fixed_and_applied(ledger_conn: Any) -> None:
     assert [(e.label, e.outcome) for e in apply(ledger_conn, fixed)] == [("bad", "applied"), ("later", "applied")]
 
 
+def test_a_failing_own_step_raises_the_driver_error_and_records_nothing(
+    ledger_conn: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    failing = Changeset("caverns", [Step("ledger", "SELECT 1/0", check=nozdormu._LEDGER_EXISTS_SQL)])
+    monkeypatch.setattr(nozdormu, "_OWN_CHANGESET", failing)
+    with pytest.raises(CavernsError, match="could not be recorded") as refused:
+        install(ledger_conn)
+    assert not isinstance(refused.value, StepFailed)
+    assert isinstance(refused.value.__cause__, DRIVER_ERRORS) and "division by zero" in str(refused.value.__cause__)
+    assert not _exists(ledger_conn, "caverns.ledger")  # the connection is usable and nothing was written
+
+
 def test_apply_skips_a_step_another_runner_applied_after_preflight(ledger_conn: Any) -> None:
     install(ledger_conn)
     stale = preflight(ledger_conn, APP)
@@ -449,6 +463,56 @@ def test_apply_refuses_a_step_that_changed_after_preflight(ledger_conn: Any) -> 
     with pytest.raises(PreflightRefused, match=r"schema \(conflict\)"):
         nozdormu._apply_statuses(ledger_conn, APP, stale, frozenset(), frozenset())
     assert _query(ledger_conn, APP_ROWS) == [("schema", "applied")]
+
+
+RACE_STEP = Step("race", "CREATE TABLE nozdormu_test.race_t ()")
+RACE = Changeset("race", [RACE_STEP])
+RACE_ROWS = "SELECT label, outcome FROM caverns.ledger WHERE changeset = 'race' ORDER BY version"
+REPEATABLE_READ_SQL = "SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL REPEATABLE READ"
+WAITING_LOCKS_SQL = "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND NOT granted"
+WAIT_SECONDS = 10.0
+POLL_SECONDS = 0.02
+
+
+def _wait_for_a_waiting_lock(conn: Any) -> None:
+    deadline = time.monotonic() + WAIT_SECONDS
+    with conn.cursor() as cursor:
+        while time.monotonic() < deadline:
+            cursor.execute(WAITING_LOCKS_SQL)
+            if cursor.fetchone()[0] == 1:
+                return
+            time.sleep(POLL_SECONDS)
+    pytest.fail(f"no runner waited for the advisory lock within {WAIT_SECONDS} s")
+
+
+def test_a_runner_waits_for_the_lock_and_reads_the_ledger_after_it(ledger_conn: Any, second_conn: Any) -> None:
+    install(ledger_conn)
+    _execute(ledger_conn, SCHEMA.sql)
+    _execute(ledger_conn, REPEATABLE_READ_SQL)  # a snapshot taken before the wait would miss the other runner
+    with second_conn.cursor() as cursor:
+        cursor.execute("SELECT pg_advisory_xact_lock(%s::bigint)", (nozdormu._ADVISORY_LOCK_KEY,))
+    result: dict[str, Any] = {}
+
+    def run() -> None:
+        try:
+            result["entries"] = apply(ledger_conn, RACE)
+        except BaseException as error:  # reported by the assertions below
+            result["error"] = error
+
+    runner = threading.Thread(target=run)
+    runner.start()
+    try:
+        _wait_for_a_waiting_lock(second_conn)
+        with second_conn.cursor() as cursor:  # the other runner's work, under the lock it holds
+            cursor.execute(RACE_STEP.sql)
+            nozdormu._insert(cursor, RACE.name, RACE_STEP, "applied")
+        second_conn.commit()
+    finally:
+        second_conn.rollback()  # releases the lock when the test failed before the commit
+        runner.join(WAIT_SECONDS)
+    assert not runner.is_alive()
+    assert result == {"entries": []}
+    assert _query(ledger_conn, RACE_ROWS) == [("race", "applied")]
 
 
 def test_a_percent_sign_in_a_step_is_literal_on_both_drivers(ledger_conn: Any) -> None:

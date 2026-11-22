@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+from dataclasses import fields
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -30,6 +31,11 @@ def test_step_rejects_a_label_that_is_not_text() -> None:
         Step(1, SQL)  # type: ignore[arg-type]
 
 
+def test_step_rejects_sql_that_is_not_text() -> None:
+    with pytest.raises(ChangesetError, match="SQL that is not a string"):
+        Step("x", 1)  # type: ignore[arg-type]
+
+
 @pytest.mark.parametrize("sql", ["", "   \n\t"])
 def test_step_rejects_empty_sql(sql: str) -> None:
     with pytest.raises(ChangesetError, match="'x'"):
@@ -40,6 +46,11 @@ def test_step_rejects_empty_sql(sql: str) -> None:
 def test_step_rejects_an_empty_check(check: str) -> None:
     with pytest.raises(ChangesetError, match="empty check"):
         Step("x", SQL, check)
+
+
+def test_step_rejects_a_check_that_is_not_text() -> None:
+    with pytest.raises(ChangesetError, match="check that is not a string"):
+        Step("x", SQL, 1)  # type: ignore[arg-type]
 
 
 def test_step_accepts_a_label_with_inner_spaces_and_no_check() -> None:
@@ -194,6 +205,15 @@ def test_from_directory_names_an_empty_step_file(tmp_path: Path) -> None:
 
 
 # --- the SQL constants ---------------------------------------------------------------------
+
+
+def test_the_ledger_column_lists_are_the_ledger_entry_fields() -> None:
+    columns = [field.name for field in fields(LedgerEntry)]
+    select = re.fullmatch(r"SELECT (.+?) FROM caverns\.ledger .*", nozdormu._SELECT_ENTRIES_SQL)
+    returning = re.fullmatch(r".* RETURNING (.+)", nozdormu._INSERT_ENTRY_SQL)
+    assert select and returning
+    assert select.group(1).split(", ") == columns
+    assert returning.group(1).split(", ") == columns
 
 
 def test_every_sql_constant_names_the_one_ledger_table() -> None:

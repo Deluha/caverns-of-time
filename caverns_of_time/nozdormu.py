@@ -1,4 +1,4 @@
-"""Nozdormu, the migration ledger: the step and changeset model, the ledger and its installation.
+"""Nozdormu, the migration ledger: steps and changesets, the ledger, preflight, apply and baseline.
 
 Input: a DB-API 2.0 connection (autocommit off) and `Step` / `Changeset` values built from SQL text,
 a list or a directory of `.sql` files. Output: validated, immutable values, and ledger rows in the
@@ -16,7 +16,7 @@ import os
 import time
 from collections.abc import Callable, Collection, Iterator, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass, fields
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Protocol
@@ -99,10 +99,15 @@ class Step:
 
     def __post_init__(self) -> None:
         _validate_name("step label", self.label)
-        if not isinstance(self.sql, str) or not self.sql.strip():
+        if not isinstance(self.sql, str):
+            raise ChangesetError(f"step {self.label!r} has SQL that is not a string")
+        if not self.sql.strip():
             raise ChangesetError(f"step {self.label!r} has no SQL")
-        if self.check is not None and (not isinstance(self.check, str) or not self.check.strip()):
-            raise ChangesetError(f"step {self.label!r} has an empty check")
+        if self.check is not None:
+            if not isinstance(self.check, str):
+                raise ChangesetError(f"step {self.label!r} has a check that is not a string")
+            if not self.check.strip():
+                raise ChangesetError(f"step {self.label!r} has an empty check")
 
     @classmethod
     def from_file(cls, path: str | os.PathLike[str], *, label: str | None = None, check: str | None = None) -> Step:
@@ -226,8 +231,8 @@ class StepStatus:
     entry: LedgerEntry | None
 
 
-# WARNING: this statement shipped once it is released. Never edit it: its checksum is recorded in
-# every consumer's ledger. A change to the ledger is a new step of the own changeset (hard rule 6).
+# WARNING: this statement ships with the release: never edit it once released; its checksum is recorded
+# in every consumer's ledger. A change to the ledger is a new step of the own changeset (hard rule 6).
 _LEDGER_DDL_SQL = """
 CREATE SCHEMA IF NOT EXISTS caverns;
 CREATE TABLE IF NOT EXISTS caverns.ledger (
@@ -257,15 +262,21 @@ CREATE OR REPLACE TRIGGER ledger_no_truncate BEFORE TRUNCATE ON caverns.ledger
 _LEDGER_EXISTS_SQL = "SELECT to_regclass('caverns.ledger') IS NOT NULL"
 _OWN_CHANGESET = Changeset(_OWN_CHANGESET_NAME, [Step("ledger", _LEDGER_DDL_SQL, check=_LEDGER_EXISTS_SQL)])
 
-# NOTE: hard rule 3 forbids composing a statement, so `caverns.ledger` is spelled literally in each
-# `*_SQL` constant here; a test pins every spelling to `_OWN_CHANGESET_NAME`.
-_LEDGER_COLUMNS = ", ".join(field.name for field in fields(LedgerEntry))
-_SELECT_ENTRIES_SQL = "SELECT " + _LEDGER_COLUMNS + " FROM caverns.ledger WHERE changeset = %s ORDER BY version"
+# NOTE: hard rule 3 forbids composing a statement, so `caverns.ledger` and the column lists are spelled
+# literally in each `*_SQL` constant here; tests pin every schema spelling to `_OWN_CHANGESET_NAME` and
+# every column list to the fields of `LedgerEntry`.
+_SELECT_ENTRIES_SQL = (
+    "SELECT version, changeset, label, checksum, outcome, fingerprint, error, duration_ms,"
+    " recorded_at, recorded_by, caverns_version FROM caverns.ledger WHERE changeset = %s ORDER BY version"
+)
 _INSERT_ENTRY_SQL = (
     "INSERT INTO caverns.ledger (changeset, label, checksum, outcome, fingerprint, error, duration_ms, caverns_version)"
-    " VALUES (%s, %s, %s, %s, %s, %s, %s, %s) RETURNING " + _LEDGER_COLUMNS
+    " VALUES (%s, %s, %s, %s, %s, %s, %s, %s) RETURNING version, changeset, label, checksum, outcome,"
+    " fingerprint, error, duration_ms, recorded_at, recorded_by, caverns_version"
 )
 _LOCK_SQL = "SELECT pg_advisory_xact_lock(%s::bigint)"
+# Under REPEATABLE READ or SERIALIZABLE the lock statement would take the snapshot before it waits.
+_READ_COMMITTED_SQL = "SET TRANSACTION ISOLATION LEVEL READ COMMITTED"
 _READ_ONLY_SQL = "SET TRANSACTION READ ONLY"
 # The schemas a baseline fingerprints when the caller names none: every one but the system's and Caverns' own.
 _DEFAULT_SCHEMAS_SQL = (
@@ -308,6 +319,8 @@ def _transaction(connection: Connection) -> Iterator[_Cursor]:
     """One transaction: committed when the block ends, rolled back when it raises."""
     try:
         with _cursor(connection) as cursor:
+            # The ledger is re-read after the lock: that read needs a snapshot taken after the wait.
+            cursor.execute(_READ_COMMITTED_SQL)
             yield cursor
     except BaseException:
         connection.rollback()
@@ -336,11 +349,15 @@ def _lock(cursor: _Cursor) -> None:
     cursor.execute(_LOCK_SQL, (_ADVISORY_LOCK_KEY,))
 
 
-def _read_entries(cursor: _Cursor, changeset: str) -> list[LedgerEntry]:
-    """The changeset's ledger rows, oldest first; none while the ledger does not exist yet."""
+def _ledger_exists(cursor: _Cursor) -> bool:
     cursor.execute(_LEDGER_EXISTS_SQL)
     row = cursor.fetchone()
-    if row is None or not row[0]:
+    return row is not None and bool(row[0])
+
+
+def _read_entries(cursor: _Cursor, changeset: str) -> list[LedgerEntry]:
+    """The changeset's ledger rows, oldest first; none while the ledger does not exist yet."""
+    if not _ledger_exists(cursor):
         return []
     cursor.execute(_SELECT_ENTRIES_SQL, (changeset,))
     return [LedgerEntry(*values) for values in cursor.fetchall()]
@@ -381,15 +398,14 @@ def _baseline_position(changeset: Changeset, entries: Sequence[LedgerEntry]) -> 
 
 
 def _ledger_decision(
-    changeset: Changeset, entries: Sequence[LedgerEntry], index: int
+    changeset: Changeset, index: int, entries: Sequence[LedgerEntry], baseline: tuple[LedgerEntry, int] | None
 ) -> tuple[Status, LedgerEntry] | None:
     """What the ledger alone says of the step at *index*, or None when only its check can tell.
 
     The latest row that is not a failure decides: the same checksum is applied, another is a conflict.
-    Without one, a step at or before the baseline's step is applied.
+    Without one, a step at or before the *baseline*'s step (see `_baseline_position`) is applied.
     """
     step = changeset.steps[index]
-    baseline = _baseline_position(changeset, entries)
     latest = next((e for e in reversed(entries) if e.label == step.label and e.outcome != _OUTCOME_FAILED), None)
     if latest is not None:
         return (Status.APPLIED if latest.checksum == step.checksum else Status.CONFLICT), latest
@@ -406,9 +422,10 @@ def _decide(
     *entries* are the changeset's ledger rows, oldest first; *run_check* takes a step's label and check
     SQL and says whether the check found the step's effect.
     """
+    baseline = _baseline_position(changeset, entries)
     statuses = []
     for index, step in enumerate(changeset.steps):
-        decision = _ledger_decision(changeset, entries, index)
+        decision = _ledger_decision(changeset, index, entries, baseline)
         if decision is not None:
             statuses.append(StepStatus(step, *decision))
         elif step.check is not None and run_check(step.label, step.check):
@@ -496,16 +513,24 @@ def _plan(
 def _recheck(changeset: Changeset, status: StepStatus, entries: Sequence[LedgerEntry]) -> StepStatus:
     """The step's status as the ledger says it now; where the ledger is silent the earlier status stands."""
     index = changeset.steps.index(status.step)
-    decision = _ledger_decision(changeset, entries, index)
+    decision = _ledger_decision(changeset, index, entries, _baseline_position(changeset, entries))
     return status if decision is None else StepStatus(status.step, *decision)
 
 
 def _record_failure(
     connection: Connection, changeset: Changeset, step: Step, error: Exception, duration_ms: int
 ) -> StepFailed:
-    """Record a failed step in a transaction of its own; the error to raise."""
+    """Record a failed step in a transaction of its own; the error to raise.
+
+    Raises `CavernsError` from *error* when the ledger does not exist: the failed step was its own.
+    """
     with _transaction(connection) as cursor:
         _lock(cursor)
+        if not _ledger_exists(cursor):
+            raise CavernsError(
+                f"step {step.label!r} of changeset {changeset.name!r} failed and could not be recorded: "
+                f"the ledger does not exist: {error}"
+            ) from error
         entry = _insert(cursor, changeset.name, step, _OUTCOME_FAILED, error=str(error), duration_ms=duration_ms)
     _log.warning("step %s of changeset %s failed: ledger version %d", step.label, changeset.name, entry.version)
     return StepFailed(step.label, entry.version)
@@ -514,7 +539,8 @@ def _record_failure(
 def _execute_step(connection: Connection, changeset: Changeset, cursor: _Cursor, step: Step) -> int:
     """Run the step's SQL as written; its duration in milliseconds.
 
-    A failure rolls the transaction back, records a `failed` row and raises `StepFailed`.
+    A failure rolls the transaction back, records a `failed` row and raises `StepFailed`; when the
+    ledger does not exist, nothing is recorded and `CavernsError` is raised from the database error.
     """
     started = time.monotonic()
     try:
@@ -585,8 +611,9 @@ def apply(
     running). A step that fails is rolled back, recorded as `failed` and raised as `StepFailed`;
     later steps do not run. Returns the rows written, in order.
     """
+    reapply_names, accept_names = _names("reapply", reapply), _names("accept", accept)
     statuses = preflight(connection, changeset)
-    return _apply_statuses(connection, changeset, statuses, _names("reapply", reapply), _names("accept", accept))
+    return _apply_statuses(connection, changeset, statuses, reapply_names, accept_names)
 
 
 def _baseline_step(changeset: Changeset, through: str | None) -> Step:

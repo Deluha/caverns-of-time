@@ -46,12 +46,15 @@ read-only transaction that is always rolled back. It decides the ledger first, t
 A `failed` row never decides a status. A step's check runs only when the ledger is silent about the step.
 
 **Nozdormu, apply.** `apply(connection, changeset, *, reapply=(), accept=())` runs preflight, then walks the
-steps in changeset order: `applied` is skipped, `pending` runs. Each step is its own transaction: take
-the ledger's advisory lock, read the ledger again (a step another runner applied meanwhile is skipped; one
+steps in changeset order: `applied` is skipped, `pending` runs. Each write transaction starts at READ
+COMMITTED whatever the session's isolation level, so that what is read under the lock is current. Each step
+is its own transaction: take the ledger's advisory lock, read the ledger again (a step another runner applied meanwhile is skipped; one
 whose status changed otherwise refuses the run), execute the step's SQL as written, insert the ledger row
 and commit, so the step's effect and its row stand or fall together. A step that raises is rolled back,
 then recorded as a `failed` row in a transaction of its own, and `StepFailed` is raised from the database
-error; later steps do not run, and the step is `pending` again. The rows written are returned and logged.
+error; later steps do not run, and the step is `pending` again. If the failed step is Caverns' own `ledger`
+step (`install` as a role that cannot create the schema), there is no ledger to record into: nothing is
+recorded and `CavernsError` is raised from the driver's error. The rows written are returned and logged.
 `install` takes the same path for Caverns' own changeset.
 
 A `conflict` or `unknown` step refuses the whole run before anything is executed or written
@@ -90,7 +93,8 @@ not exist is refused. Phase 2 widens the fingerprint.
   whole file does not.
 - `Changeset(name, steps)`: the name follows the label rules; at least one step; labels are unique. The
   name `caverns` is Caverns' own.
-- Every invalid input raises `ChangesetError`, naming the offending value.
+- An invalid step, changeset or argument raises `ChangesetError`, naming the offending value; other refusals
+  have their own errors, listed with each function below.
 - The connection: any DB-API 2.0 connection with `%s` parameters. The `Connection` protocol names what is
   used (`cursor()`, `commit()`, `rollback()`, a readable `autocommit`; a cursor's `execute`, `fetchone`,
   `fetchall`, `close`), so psycopg 3 and psycopg2 connections both fit and the package imports no driver.
