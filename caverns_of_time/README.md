@@ -3,8 +3,8 @@
 ## Purpose & scope
 
 The importable package. It is generic: nothing here names a consumer or assumes a consumer's schema
-(hard rule 1). It holds the version, the shared exceptions and, so far, one component: Nozdormu, the
-migration ledger.
+(hard rule 1). It holds the version, the shared exceptions, the console helpers and, so far, two
+components: Nozdormu, the migration ledger, and Chromie, the command line.
 
 ## Files & entry points
 
@@ -12,6 +12,8 @@ migration ledger.
 |---|---|
 | `__init__.py` | `__version__`, read from the installed distribution's metadata |
 | `errors.py` | The exception types, all in one module |
+| `console.py` | The console helpers: status lines with their icons, tables and JSON; the only module that prints |
+| `chromie.py` | Chromie: the `chromie` command's parsing, connection configuration and dispatch (command flow only) |
 | `nozdormu.py` | Nozdormu: the `Step` and `Changeset` model, the checksum, the loaders, the connection contract, the ledger, `install`, `preflight`, `apply` and `baseline` |
 
 ## How it works
@@ -91,6 +93,14 @@ pinned to `pg_catalog` (type and default expressions print relative to it); with
 `schemas` it covers every schema except `pg_*`, `information_schema` and `caverns`. A named schema that does
 not exist is refused. Phase 2 widens the fingerprint.
 
+**Chromie, the command line.** `chromie` is installed with the `cli` extra
+(`pip install 'caverns-of-time[cli]'`), which brings its driver, psycopg 3; the library itself imports
+none. The connection string comes from `--dsn`, else the `CAVERNS_DSN` environment variable; there is no
+other fallback, so a stray libpq environment never chooses the database. Every command takes
+`--format text|json` (default `text`). Results go to stdout, warnings and errors to stderr. Exit codes:
+0 success, 1 a finding the command exists to report, 2 a usage or environment error (bad arguments, no
+connection string, a refused connection, a Caverns error).
+
 ## Interfaces & contracts
 
 - `caverns_of_time.__version__`: the version from `pyproject.toml`; `0+unknown` in a checkout that was
@@ -160,7 +170,8 @@ not exist is refused. Phase 2 widens the fingerprint.
   `ChangesetError`, `LedgerNotInstalled`, `PreflightRefused`, `StepFailed` and `BaselineRefused`.
 - The own changeset is never edited once released: a change to the ledger is a new own step (hard rule 6).
   The ledger's DDL is idempotent, and `caverns` is a reserved changeset name.
-- No runtime dependency. Adding one is an ask-first decision.
+- No runtime dependency for the library; the CLI's driver (psycopg 3) is the optional `cli` extra. Adding
+  a dependency is an ask-first decision.
 
 ## Extending
 
