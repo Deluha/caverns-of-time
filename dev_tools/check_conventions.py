@@ -37,8 +37,10 @@ PERMANENT_DOCS = {
 TEST_FILE_RE = re.compile(r"(^|/)(test_[^/]*|[^/]*_test)\.py$")
 # C6: the only test-side files that may open a database connection or name a DSN.
 CONNECTION_OWNERS = {TESTS + "conftest.py"}
+# C6: tests whose subject is a connection string (the fixtures' guard, this checker); they may spell one.
+DSN_LITERAL_OWNERS = CONNECTION_OWNERS | {TESTS + "test_database.py", TESTS + "test_check_conventions.py"}
 # C9: names that skip or excuse a test.
-SKIP_NAMES = {"skip", "skipif", "xfail", "importorskip", "SkipTest"}
+SKIP_NAMES = {"skip", "skipif", "xfail", "importorskip", "SkipTest", "skipIf", "skipUnless", "expectedFailure"}
 # C7: command-line parsing lives in the Chromie entry module only.
 CLI_MODULES = {"argparse", "click", "typer"}
 CLI_ENTRY = PACKAGE + "chromie.py"
@@ -177,7 +179,12 @@ def check_test_connections(sources: Iterable[Source]) -> list[str]:
                 out.append(f"{path}:{node.lineno}: C6 connect() in a test — take the conftest fixture (R8)")
             if isinstance(node, ast.ImportFrom) and any(alias.name == "connect" for alias in node.names):
                 out.append(f"{path}:{node.lineno}: C6 `connect` imported in a test — take the conftest fixture (R8)")
-            if isinstance(node, ast.Constant) and isinstance(node.value, str) and "postgresql://" in node.value:
+            if (
+                isinstance(node, ast.Constant)
+                and isinstance(node.value, str)
+                and "postgresql://" in node.value
+                and path not in DSN_LITERAL_OWNERS
+            ):
                 out.append(f"{path}:{node.lineno}: C6 connection string in a test — take the conftest fixture (R8)")
     return out
 

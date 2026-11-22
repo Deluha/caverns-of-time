@@ -2,7 +2,8 @@
 
 The connection string comes from CAVERNS_TEST_DSN and must point at this machine.
 Without it a database test is skipped with a notice, unless CAVERNS_REQUIRE_DB=1
-(set by dev_tools/verify.py and CI), which turns the skip into a failure.
+(set by dev_tools/verify.py and CI), which turns the skip into a failure and also
+fails a whole run in which no database test passed.
 """
 
 from __future__ import annotations
@@ -20,6 +21,11 @@ REQUIRE_DB_VARIABLE = "CAVERNS_REQUIRE_DB"
 LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1"}
 DB_FIXTURES = {"db_dsn", "db_conn"}
 DB_MARKER = "db"
+# libpq reads these when the connection string leaves them out, or (PGHOSTADDR) even when
+# it names a host, so any of them can redirect a local-looking connection string.
+REDIRECTING_VARIABLES = ("PGHOSTADDR", "PGSERVICE", "PGSERVICEFILE")
+_PROBLEM_KEY = pytest.StashKey[str]()
+_db_test_ids: set[str] = set()
 _db_tests_passed = 0
 
 
@@ -28,6 +34,7 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
     for item in items:
         if DB_FIXTURES & set(getattr(item, "fixturenames", ())):
             item.add_marker(getattr(pytest.mark, DB_MARKER))
+            _db_test_ids.add(item.nodeid)
 
 
 def resolve_dsn(environ: dict[str, str]) -> tuple[str | None, str | None]:
@@ -39,7 +46,8 @@ def resolve_dsn(environ: dict[str, str]) -> tuple[str | None, str | None]:
     dsn = environ.get(DSN_VARIABLE)
     if not dsn:
         return None, f"{DSN_VARIABLE} is not set — database tests did not run (tests/README.md)"
-    target = non_local_target(dsn)
+    target = next((f"${name}" for name in REDIRECTING_VARIABLES if environ.get(name)), None)
+    target = f"wherever {target} says" if target else non_local_target(dsn)
     if target:
         return dsn, f"{DSN_VARIABLE} points at {target} — tests connect to this machine only"
     return dsn, None
@@ -78,7 +86,7 @@ def missing_db_run_problem(environ: dict[str, str], db_tests_passed: int) -> str
 
 def pytest_runtest_logreport(report: pytest.TestReport) -> None:
     global _db_tests_passed
-    if report.when == "call" and report.passed and DB_MARKER in report.keywords:
+    if report.when == "call" and report.passed and report.nodeid in _db_test_ids:
         _db_tests_passed += 1
 
 
@@ -94,9 +102,6 @@ def pytest_terminal_summary(terminalreporter: pytest.TerminalReporter, config: p
     problem = config.stash.get(_PROBLEM_KEY, None)
     if problem:
         terminalreporter.write_line(f"❌ {problem}", red=True)
-
-
-_PROBLEM_KEY = pytest.StashKey[str]()
 
 
 @pytest.fixture(scope="session")

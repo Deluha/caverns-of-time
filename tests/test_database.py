@@ -21,7 +21,6 @@ from tests.conftest import (
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-SCHEME = "postgresql" + "://"
 
 
 def test_server_is_the_agreed_major_version(db_conn: psycopg.Connection) -> None:
@@ -75,12 +74,18 @@ def test_remote_dsn_is_refused() -> None:
     ],
 )
 def test_every_way_to_reach_another_machine_is_refused(suffix: str, target: str) -> None:
-    assert non_local_target(SCHEME + "u:p" + suffix) == target
+    assert non_local_target("postgresql://u:p" + suffix) == target
 
 
 @pytest.mark.parametrize("host", ["localhost", "127.0.0.1", "[::1]", "localhost,127.0.0.1"])
 def test_local_hosts_are_accepted(host: str) -> None:
-    assert non_local_target(f"{SCHEME}u:p@{host}/x") is None
+    assert non_local_target(f"postgresql://u:p@{host}/x") is None
+
+
+@pytest.mark.parametrize("variable", ["PGHOSTADDR", "PGSERVICE", "PGSERVICEFILE"])
+def test_an_environment_redirect_is_refused(variable: str) -> None:
+    dsn, problem = resolve_dsn({DSN_VARIABLE: DEFAULT_DSN, variable: "10.1.2.3"})
+    assert dsn == DEFAULT_DSN and problem is not None and variable in problem
 
 
 def test_a_required_run_without_a_passed_database_test_is_a_problem() -> None:
