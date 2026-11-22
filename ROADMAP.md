@@ -3,7 +3,7 @@
 The planned scope of the next release. `RELEASE_NOTES.md` records what shipped; this file records
 what is planned. A release's section leaves this file when the release is tagged. Owner decisions are dated.
 
-Status of this file: **draft for owner sign-off** (2026-11-22). No product code exists yet.
+Approved by the owner on 2026-11-22.
 
 ## v0.1 — A recorded timeline for PostgreSQL
 
@@ -89,9 +89,18 @@ Not ported: Blackwing's domain rules (championships, enrichment, reports, pipeli
 references, pipeline and enrichment workflows, and the hard rules that only make sense there (R1, R5, R8, R9).
 
 Sign-off: the hard rules and ask-first list of the new `CLAUDE.md`; which Blackwing script conventions
-carry over (the `#%%` markers, the icon logging helpers); the package name; the licence (the repository
-is MIT today, Blackwing is proprietary); how development sessions get PostgreSQL 18 (the cloud container
-ships 16 today).
+carry over (the `#%%` markers, the icon logging helpers); the package name; the licence; how development
+sessions get PostgreSQL 18.
+
+Sign-off decisions (owner, 2026-11-22: S1–S5 confirmed as proposed):
+
+| # | Item | Decision |
+|---|---|---|
+| S1 | Package and layout | Distribution `caverns-of-time`, import package `caverns_of_time`, flat at the repository root; one module per component (`nozdormu`, `epochs`, `infinite`, `murozond`, `timewalking`); `chromie` the only CLI entry; dev tooling in `dev_tools/`, not shipped; verify command `python dev_tools/verify.py`; Python 3.11 or newer. |
+| S2 | Hard rules and ask-first list | Nine hard rules: generic core, one canonical helper, safe SQL, no unasked files, append-only ledger, own changes through the ledger, docs move with the code, real database tests, one module per component. The four Blackwing operating principles unchanged. Ask-first: ledger schema and checksum, public API, destructive behaviour on a consumer database, Murozond's list and guard relaxations, runtime dependencies and PostgreSQL versions, the guidance machinery and CI. Text: `CLAUDE.md`. |
+| S3 | Blackwing conventions | Dropped: `#%%` markers and the no-module-docstring rule. Kept: icon status helpers for CLI output only (library code uses `logging`), codenames, actions pinned by commit SHA, the single `CI gate` check, gitleaks, pre-commit, the path-rule and eval mechanisms, the `settings.json` shape and agent tiers. Changed: mypy is strict and gating. |
+| S4 | Licence | MIT, unchanged. |
+| S5 | PostgreSQL 18 in development | The official `postgres:18` Docker image, started by the cloud session-start hook and by `python dev_tools/database.py start`; the same image in the dev container and CI. No fallback to another version: if the instance cannot start, the database tests fail. |
 
 ### Phase 1 — Nozdormu
 
@@ -158,7 +167,7 @@ what the baseline must store for a replay to be possible (a schema dump — *pro
 | 3 | v0.1.0 release: version, release notes, this section removed. |
 
 The Blackwing side is a separate pull request in `Deluha/Project_Blackwing`, under that repository's own
-rules: `db_utilities/apply_db_changes.py` and its hard rule 6 are ask-first items there.
+rules: its changeset runner (apply_db_changes.py) and its hard rule 6 are ask-first items there.
 
 Sign-off: how Blackwing installs the package (git dependency or a package index); who takes the baseline
 on the live database and when; whether Blackwing uses Epochs at all — its v4.3 Phase 1 already adds
