@@ -317,7 +317,8 @@ def _check_connection(connection: Connection) -> None:
         except Exception as error:
             # No rollback here either: the caller decides what becomes of its failed transaction.
             raise CavernsError(
-                "the connection's transaction has failed; roll it back before calling Caverns"
+                "the connection cannot run a statement: its transaction has failed or the connection is lost; "
+                "roll it back or reconnect before calling Caverns"
             ) from error
         if row is None or not row[0]:
             # No rollback: the caller's work must survive the refusal.
