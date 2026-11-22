@@ -6,7 +6,7 @@ Module map, components, the consumer boundary, packaging and the tech stack.
 
 | Path | Holds |
 |---|---|
-| `caverns_of_time/` | The package: one module per component, behind an explicit public surface (`caverns_of_time/README.md`) |
+| `caverns_of_time/` | The package: one module per component, behind an explicit public surface (`caverns_of_time/README.md`); exceptions live in one shared module, `caverns_of_time/errors.py` |
 | `dev_tools/` | Verify command, checkers, the test-database command; stdlib only, never shipped (`dev_tools/README.md`) |
 | `tests/` | The only test location; database fixtures in `tests/conftest.py` (`tests/README.md`) |
 | `.claude/` | Guidance machinery: settings, agents, hooks, path rules, the development skill and the command skills |
@@ -44,7 +44,7 @@ and no doc describes behaviour that is not built.
 - One distribution, `caverns-of-time`; one import package, `caverns_of_time`; the version is stated
   once, in `pyproject.toml`, and read at import.
 - `dev_tools/` and `tests/` are not packaged.
-- Runtime dependencies are ask-first; the `dev` extra carries the tooling and the test suite's driver.
+- Runtime dependencies are ask-first; the `dev` extra carries the tooling and the test suite's drivers (psycopg 3 and psycopg2).
 
 ## Tech stack
 
