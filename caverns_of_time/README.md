@@ -44,7 +44,7 @@ read-only transaction that is always rolled back. It decides the ledger first, t
 | `unknown` | no such row, but the check is true: the effect is present and nothing recorded it |
 
 A `failed` row never decides a status. A step's check runs only when the ledger is silent about the step.
-A check is exactly one SELECT statement: psycopg 3 refuses a second result set (`ChangesetError`), psycopg2
+A check is exactly one statement: psycopg 3 refuses a second result set (`ChangesetError`), psycopg2
 cannot report one, so there the rule is documented rather than detected.
 
 A step inserted before the baseline's step counts as applied and never runs: add new steps after it. A
