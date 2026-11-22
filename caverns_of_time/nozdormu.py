@@ -40,6 +40,7 @@ __all__ = [
     "StepStatus",
     "apply",
     "baseline",
+    "history",
     "install",
     "preflight",
 ]
@@ -272,6 +273,11 @@ _OWN_CHANGESET = Changeset(_OWN_CHANGESET_NAME, [Step("ledger", _LEDGER_DDL_SQL,
 _SELECT_ENTRIES_SQL = (
     "SELECT version, changeset, label, checksum, outcome, fingerprint, error, duration_ms,"
     " recorded_at, recorded_by, caverns_version FROM caverns.ledger WHERE changeset = %s ORDER BY version"
+)
+_HISTORY_SQL = (
+    "SELECT version, changeset, label, checksum, outcome, fingerprint, error, duration_ms,"
+    " recorded_at, recorded_by, caverns_version FROM caverns.ledger"
+    " WHERE (%s::text IS NULL OR changeset = %s) ORDER BY version DESC LIMIT %s"
 )
 _INSERT_ENTRY_SQL = (
     "INSERT INTO caverns.ledger (changeset, label, checksum, outcome, fingerprint, error, duration_ms, caverns_version)"
@@ -507,6 +513,24 @@ def preflight(connection: Connection, changeset: Changeset) -> list[StepStatus]:
     with _read_only(connection) as cursor:
         _require_installed(cursor)
         return _statuses(cursor, changeset)
+
+
+def history(connection: Connection, *, changeset: str | None = None, limit: int | None = None) -> list[LedgerEntry]:
+    """The ledger rows, newest first: only *changeset*'s when given, at most *limit* (None: all); writes nothing.
+
+    Raises `LedgerNotInstalled` before `install()` and `ChangesetError` for an invalid *changeset* or a
+    *limit* that is not a positive integer.
+    """
+    _check_connection(connection)
+    if changeset is not None:
+        _validate_name("changeset name", changeset)
+    if limit is not None and (isinstance(limit, bool) or not isinstance(limit, int) or limit < 1):
+        raise ChangesetError(f"limit must be a positive integer, not {limit!r}")
+    with _read_only(connection) as cursor:
+        if not _ledger_exists(cursor):
+            raise LedgerNotInstalled("the ledger is not installed (caverns.ledger does not exist): call install()")
+        cursor.execute(_HISTORY_SQL, (changeset, changeset, limit))
+        return [LedgerEntry(*values) for values in cursor.fetchall()]
 
 
 def _names(argument: str, values: Collection[str]) -> frozenset[str]:

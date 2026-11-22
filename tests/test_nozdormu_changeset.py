@@ -216,9 +216,11 @@ def test_from_directory_names_an_empty_step_file(tmp_path: Path) -> None:
 def test_the_ledger_column_lists_are_the_ledger_entry_fields() -> None:
     columns = [field.name for field in fields(LedgerEntry)]
     select = re.fullmatch(r"SELECT (.+?) FROM caverns\.ledger .*", nozdormu._SELECT_ENTRIES_SQL)
+    history = re.fullmatch(r"SELECT (.+?) FROM caverns\.ledger .*", nozdormu._HISTORY_SQL)
     returning = re.fullmatch(r".* RETURNING (.+)", nozdormu._INSERT_ENTRY_SQL)
-    assert select and returning
+    assert select and history and returning
     assert select.group(1).split(", ") == columns
+    assert history.group(1).split(", ") == columns
     assert returning.group(1).split(", ") == columns
 
 
