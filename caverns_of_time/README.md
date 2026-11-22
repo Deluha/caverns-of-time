@@ -48,13 +48,15 @@ A `failed` row never decides a status. A step's check runs only when the ledger 
 **Nozdormu, apply.** `apply(connection, changeset, *, reapply=(), accept=())` runs preflight, then walks the
 steps in changeset order: `applied` is skipped, `pending` runs. Each write transaction starts at READ
 COMMITTED whatever the session's isolation level, so that what is read under the lock is current. Each step
-is its own transaction: take the ledger's advisory lock, read the ledger again (a step another runner applied meanwhile is skipped; one
-whose status changed otherwise refuses the run), execute the step's SQL as written, insert the ledger row
-and commit, so the step's effect and its row stand or fall together. A step that raises is rolled back,
-then recorded as a `failed` row in a transaction of its own, and `StepFailed` is raised from the database
-error; later steps do not run, and the step is `pending` again. If the failed step is Caverns' own `ledger`
-step (`install` as a role that cannot create the schema), there is no ledger to record into: nothing is
-recorded and `CavernsError` is raised from the driver's error. The rows written are returned and logged.
+is its own transaction: take the ledger's advisory lock, read the ledger again (a step another runner
+applied meanwhile is skipped; one whose status changed otherwise refuses the run), execute the step's SQL
+as written, insert the ledger row and commit, so the step's effect and its row stand or fall together. A
+step that raises is rolled back, then recorded as a `failed` row in a transaction of its own, and
+`StepFailed` is raised from the database error; later steps do not run, and the step is `pending` again.
+If the failure cannot be recorded, nothing is recorded and a `CavernsError` is raised instead, from the
+step's own error, so a caller always gets a `CavernsError`: the failed step was Caverns' own `ledger` step
+(`install` as a role that cannot create the schema), so there is no ledger to record into, or the `failed`
+row cannot be written (a read-only session). The rows written are returned and logged.
 `install` takes the same path for Caverns' own changeset.
 
 A `conflict` or `unknown` step refuses the whole run before anything is executed or written
@@ -103,8 +105,11 @@ not exist is refused. Phase 2 widens the fingerprint.
   Every public function first refuses, with a `CavernsError` that names the fix, a connection with
   autocommit on, and a connection whose open transaction has written something (checked with
   `pg_current_xact_id_if_assigned()`); the caller's work is not rolled back, so it can commit it and call
-  again. A transaction that only read is accepted and ended with a rollback. A step's SQL and
-  check run exactly as written, with no parameters, so a `%` in them is literal.
+  again. A connection whose transaction has already failed is refused the same way, and also left
+  untouched: roll it back, then call again. A transaction that only read is accepted and ended with a
+  rollback, which also ends anything transaction-scoped the caller set in it (`SET LOCAL`, an uncommitted
+  `SET`, transaction-level locks). A step's SQL and check run exactly as written, with no parameters, so a
+  `%` in them is literal.
 - `install(connection) -> list[LedgerEntry]`: the rows written, `[]` when the ledger is already installed.
 - The ledger, `caverns.ledger`, one row per recorded event:
 
@@ -133,8 +138,9 @@ not exist is refused. Phase 2 widens the fingerprint.
 - `apply(connection, changeset, *, reapply=(), accept=()) -> list[LedgerEntry]`: the rows written, in order
   (`[]` when nothing is to do). A bare string for `reapply` or `accept`, or a label in both, is a `ChangesetError`.
   Raises `PreflightRefused` (attribute `statuses`, the offending steps), `StepFailed` (attributes `label`
-  and `version`, the failed row's ledger version; its `__cause__` is the driver's error) and the errors of
-  `preflight`.
+  and `version`, the failed row's ledger version; its `__cause__` is the driver's error), a plain
+  `CavernsError` (its `__cause__` is the step's error) when a failed step cannot be recorded, and the
+  errors of `preflight`.
 - `baseline(connection, changeset, *, through=None, schemas=None) -> LedgerEntry`: the row written. Raises
   `BaselineRefused` (the changeset has rows; a named schema that does not exist) and `ChangesetError` (a
   `through` the changeset lacks, a bare string for `schemas`, an empty `schemas`).

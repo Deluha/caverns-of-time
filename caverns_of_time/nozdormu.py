@@ -311,8 +311,14 @@ def _check_connection(connection: Connection) -> None:
             "so pass a connection with autocommit off"
         )
     with _cursor(connection) as cursor:
-        cursor.execute(_CLEAN_TRANSACTION_SQL)
-        row = cursor.fetchone()
+        try:
+            cursor.execute(_CLEAN_TRANSACTION_SQL)
+            row = cursor.fetchone()
+        except Exception as error:
+            # No rollback here either: the caller decides what becomes of its failed transaction.
+            raise CavernsError(
+                "the connection's transaction has failed; roll it back before calling Caverns"
+            ) from error
         if row is None or not row[0]:
             # No rollback: the caller's work must survive the refusal.
             raise CavernsError("the connection has uncommitted work; commit or roll it back before calling Caverns")
@@ -536,16 +542,20 @@ def _record_failure(
 ) -> StepFailed:
     """Record a failed step in a transaction of its own; the error to raise.
 
-    Raises `CavernsError` from *error* when the ledger does not exist: the failed step was its own.
+    Raises `CavernsError` from *error* when the failure cannot be recorded: the ledger does not exist
+    (the failed step was its own) or writing the row fails (a read-only session). The transaction is
+    rolled back either way.
     """
-    with _transaction(connection) as cursor:
-        _lock(cursor)
-        if not _ledger_exists(cursor):
-            raise CavernsError(
-                f"step {step.label!r} of changeset {changeset.name!r} failed and could not be recorded: "
-                f"the ledger does not exist: {error}"
-            ) from error
-        entry = _insert(cursor, changeset.name, step, _OUTCOME_FAILED, error=str(error), duration_ms=duration_ms)
+    try:
+        with _transaction(connection) as cursor:
+            _lock(cursor)
+            if not _ledger_exists(cursor):
+                raise CavernsError("the ledger does not exist")
+            entry = _insert(cursor, changeset.name, step, _OUTCOME_FAILED, error=str(error), duration_ms=duration_ms)
+    except Exception as record_error:
+        raise CavernsError(
+            f"step {step.label!r} of changeset {changeset.name!r} failed and could not be recorded: {record_error}"
+        ) from error
     _log.warning("step %s of changeset %s failed: ledger version %d", step.label, changeset.name, entry.version)
     return StepFailed(step.label, entry.version)
 
@@ -553,8 +563,8 @@ def _record_failure(
 def _execute_step(connection: Connection, changeset: Changeset, cursor: _Cursor, step: Step) -> int:
     """Run the step's SQL as written; its duration in milliseconds.
 
-    A failure rolls the transaction back, records a `failed` row and raises `StepFailed`; when the
-    ledger does not exist, nothing is recorded and `CavernsError` is raised from the database error.
+    A failure rolls the transaction back, records a `failed` row and raises `StepFailed`; when that row
+    cannot be written, nothing is recorded and `CavernsError` is raised from the database error.
     """
     started = time.monotonic()
     try:

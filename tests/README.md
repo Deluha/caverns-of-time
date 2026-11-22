@@ -13,7 +13,7 @@ database.
 | `conftest.py` | The `db_dsn`, `db_conn`, `ledger_conn` and `second_conn` fixtures, the local-only guard, the `db` marker, the required-run check | — |
 | `test_database.py` | The instance itself: major version 18, rollback of uncommitted work, the image tag and connection string agreeing across CI, the dev container and `dev_tools/database.py`; the fixtures' guards | yes |
 | `test_nozdormu_changeset.py` | Nozdormu's pure parts: step and changeset validation, the checksum, the file and directory loaders, the status decision on synthetic ledger rows, the SQL constants naming one ledger table | no |
-| `test_nozdormu_ledger.py` | Nozdormu against PostgreSQL, once per driver (psycopg 3, psycopg2): installation, the refusal of a connection with uncommitted work, the ledger's constraints and its append-only triggers, preflight's four statuses and refusals, apply (skip, refusal, `reapply`, `accept`, failure, a runner that applied a step after preflight, two connections contending for the advisory lock), baseline and its fingerprint | yes |
+| `test_nozdormu_ledger.py` | Nozdormu against PostgreSQL, once per driver (psycopg 3, psycopg2): installation, the refusal of a connection with uncommitted work or a failed transaction, the ledger's constraints and its append-only triggers, preflight's four statuses and refusals, apply (skip, refusal, `reapply`, `accept`, failure, a failure that cannot be recorded, a runner that applied a step after preflight, two connections contending for the advisory lock), baseline and its fingerprint | yes |
 | `test_check_conventions.py` | Convention rules C1–C9 on synthetic input, then the real repository | no |
 | `test_check_docs_sync.py` | The docs-sync classifier, token rules, git parsing | no |
 | `test_check_guidance_integrity.py` | Each guidance check on a miniature tree, then the real repository | no |
@@ -28,8 +28,8 @@ database.
   psycopg2 (Caverns must work for both). Nozdormu commits, so before and after each test the fixture drops
   the `caverns` schema (the ledger) and `nozdormu_test` (the schema test changesets build their objects in).
   A test using it ends its own reads with a commit or rollback, since Caverns wants a connection with no open work.
-- `second_conn` yields a second non-autocommit connection on the driver of `ledger_conn` (torn down first); with
-  it a test holds the advisory lock on one connection while a thread applies on the other.
+- `second_conn` yields a second non-autocommit connection on the driver of `ledger_conn` (torn down first);
+  with it a test holds the advisory lock on one connection while a thread applies on the other.
 - Every test that takes `db_dsn`, `db_conn`, `ledger_conn` or `second_conn` is marked `db` automatically.
 - The connection string comes from `CAVERNS_TEST_DSN`. Every `host` and `hostaddr` entry, as libpq reads
   them, must be `localhost`, `127.0.0.1` or `::1`; a host list, a `host=` parameter, a service entry or
