@@ -38,14 +38,15 @@ def error(message: str) -> None:
     print(f"❌ {message}", file=sys.stderr)
 
 
-def table(headers: Sequence[str], rows: Sequence[Sequence[object]], *, right: Collection[int] = ()) -> None:
+def table(headers: Sequence[str] | None, rows: Sequence[Sequence[object]], *, right: Collection[int] = ()) -> None:
     """Print a table on stdout: columns padded to the widest cell, `None` shown as `-`.
 
-    Columns whose index is in `right` are right-aligned; trailing whitespace is stripped from each line.
+    Without `headers` (None) no header line is printed and the widths come from the rows alone. Columns whose
+    index is in `right` are right-aligned; trailing whitespace is stripped from each line.
     """
-    cells = [[str(h) for h in headers]]
+    cells = [[str(h) for h in headers]] if headers is not None else []
     cells += [[_NONE_CELL if value is None else str(value) for value in row] for row in rows]
-    widths = [max(len(line[i]) for line in cells) for i in range(len(headers))]
+    widths = [max(len(line[i]) for line in cells) for i in range(len(cells[0]) if cells else 0)]
     for line in cells:
         padded = [text.rjust(widths[i]) if i in right else text.ljust(widths[i]) for i, text in enumerate(line)]
         print(_GAP.join(padded).rstrip())

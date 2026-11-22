@@ -1,8 +1,9 @@
 """The schema fingerprint shared by the components: a canonical document of the catalogs and its hash.
 
 Input: a cursor in an open transaction and the names of the schemas to read. Output: a `Fingerprint`, the
-document keyed by schema, kind and object name, and the SHA-256 of its canonical JSON. Not public: Infinite
-re-exports `Fingerprint`, and Nozdormu's `baseline` records the hash. Contract: `caverns_of_time/README.md`.
+document keyed by schema, kind and object name, and the SHA-256 of its canonical JSON; the storage of
+fingerprints in `caverns.fingerprint`; the comparison of two documents. Not public: Infinite re-exports
+`Fingerprint` and `Difference`, and Nozdormu records fingerprints. Contract: `caverns_of_time/README.md`.
 """
 
 from __future__ import annotations
@@ -17,14 +18,21 @@ from caverns_of_time._connection import Cursor, names
 from caverns_of_time.errors import CavernsError, ChangesetError
 
 __all__ = [
+    "FINGERPRINT_EXISTS_SQL",
+    "Difference",
     "Fingerprint",
     "capture",
+    "compare",
     "default_schemas",
+    "fingerprint_table_exists",
     "hash_document",
+    "latest",
     "missing_schemas",
     "named_schemas",
     "read_document",
+    "record",
     "resolve_schemas",
+    "watched_schemas",
 ]
 
 # The kinds of object a document holds, in the order they are read.
@@ -38,6 +46,14 @@ _PIN_SEARCH_PATH_SQL = "SELECT set_config('search_path', 'pg_catalog', true)"
 _DEFAULT_SCHEMAS_SQL = (
     "SELECT nspname::text FROM pg_namespace"
     " WHERE left(nspname, 3) <> 'pg_' AND nspname NOT IN ('information_schema', 'caverns') ORDER BY nspname"
+)
+# The fingerprint table is Caverns' own (`caverns.fingerprint`, the own step `fingerprint` of Nozdormu).
+FINGERPRINT_EXISTS_SQL = "SELECT to_regclass('caverns.fingerprint') IS NOT NULL"
+_LATEST_FINGERPRINT_SQL = (
+    "SELECT version, schemas, document, hash FROM caverns.fingerprint ORDER BY version DESC LIMIT 1"
+)
+_RECORD_FINGERPRINT_SQL = (
+    "INSERT INTO caverns.fingerprint (version, schemas, document, hash) VALUES (%s, %s, %s::jsonb, %s)"
 )
 _EXISTING_SCHEMAS_SQL = "SELECT nspname::text FROM pg_namespace WHERE nspname = ANY(%s::text[])"
 _TABLES_SQL = """
@@ -121,6 +137,15 @@ class Fingerprint:
     hash: str
 
 
+@dataclass(frozen=True)
+class Difference:
+    """One difference between two documents: the kind of object, its `<schema>.<key>` name and what happened to it."""
+
+    kind: str
+    name: str
+    change: str  # "added", "removed" or "changed"
+
+
 def named_schemas(schemas: Collection[str] | None) -> list[str] | None:
     """The schema names a caller gave, sorted and de-duplicated; None when it gave none.
 
@@ -149,10 +174,43 @@ def missing_schemas(cursor: Cursor, schemas: Sequence[str]) -> list[str]:
     return sorted(set(schemas) - {row[0] for row in cursor.fetchall()})
 
 
+def fingerprint_table_exists(cursor: Cursor) -> bool:
+    """Whether `caverns.fingerprint` exists."""
+    cursor.execute(FINGERPRINT_EXISTS_SQL)
+    row = cursor.fetchone()
+    return row is not None and bool(row[0])
+
+
+def latest(cursor: Cursor) -> tuple[int, Fingerprint] | None:
+    """The newest recorded fingerprint and the ledger version it was recorded at; None when there is none."""
+    cursor.execute(_LATEST_FINGERPRINT_SQL)
+    row = cursor.fetchone()
+    if row is None:
+        return None
+    version, schemas, document, digest = row
+    if isinstance(document, str):  # a driver that leaves jsonb as text
+        document = json.loads(document)
+    return version, Fingerprint(tuple(schemas), document, digest)
+
+
+def record(cursor: Cursor, version: int, fingerprint: Fingerprint) -> None:
+    """Store *fingerprint* for the ledger row *version*."""
+    cursor.execute(
+        _RECORD_FINGERPRINT_SQL,
+        (version, list(fingerprint.schemas), json.dumps(fingerprint.document, sort_keys=True), fingerprint.hash),
+    )
+
+
+def watched_schemas(cursor: Cursor) -> list[str]:
+    """The schemas of the latest recorded fingerprint, else the default schemas (also before the table exists)."""
+    found = latest(cursor) if fingerprint_table_exists(cursor) else None
+    return list(found[1].schemas) if found else default_schemas(cursor)
+
+
 def resolve_schemas(cursor: Cursor, schemas: list[str] | None, refusal: type[CavernsError]) -> list[str]:
-    """The schemas to fingerprint: the named ones, which must exist (else *refusal* is raised), else the defaults."""
+    """The schemas to fingerprint: the named ones, which must exist (else *refusal* is raised), else the watched."""
     if schemas is None:
-        return default_schemas(cursor)
+        return watched_schemas(cursor)
     missing = missing_schemas(cursor, schemas)
     if missing:
         raise refusal(f"the schema {missing[0]!r} does not exist")
@@ -199,6 +257,29 @@ def hash_document(document: dict[str, Any]) -> str:
     """SHA-256 hex of the document's canonical JSON."""
     canonical = json.dumps(document, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def compare(recorded: dict[str, Any], live: dict[str, Any]) -> list[Difference]:
+    """The differences between two documents, sorted by schema, kind (in `_KINDS` order) and key.
+
+    An object only in *live* is `added`, only in *recorded* `removed`, in both with another value `changed`.
+    """
+    differences = []
+    for schema in sorted(set(recorded) | set(live)):
+        before, after = recorded.get(schema, {}), live.get(schema, {})
+        for kind in _KINDS:
+            old, new = before.get(kind, {}), after.get(kind, {})
+            for key in sorted(set(old) | set(new)):
+                if key not in old:
+                    change = "added"
+                elif key not in new:
+                    change = "removed"
+                elif old[key] != new[key]:
+                    change = "changed"
+                else:
+                    continue
+                differences.append(Difference(kind, f"{schema}.{key}", change))
+    return differences
 
 
 def capture(cursor: Cursor, schemas: Sequence[str]) -> Fingerprint:

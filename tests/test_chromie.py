@@ -54,6 +54,15 @@ def test_table_prints_none_as_a_dash_and_strips_trailing_space(capsys: pytest.Ca
     assert capsys.readouterr().out == "a  b\nx  -\n"
 
 
+def test_table_without_headers_prints_no_header_and_sizes_columns_from_the_rows(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    console.table(None, [["a", 1], ["bbb", None]])
+    assert capsys.readouterr().out == "a    1\nbbb  -\n"
+    console.table(None, [])
+    assert capsys.readouterr().out == ""
+
+
 def test_success_and_info_go_to_stdout(capsys: pytest.CaptureFixture[str]) -> None:
     console.success("done")
     console.info("note")
@@ -131,7 +140,7 @@ def test_log_without_an_installed_ledger_is_a_usage_error(
 
 
 def _installed_and_applied(conn: Any, directory: Path) -> Changeset:
-    """Install the ledger and apply the directory's changeset, so the ledger holds three rows."""
+    """Install the ledger and apply the directory's changeset, so the ledger holds four rows."""
     changeset = Changeset.from_directory(directory.name, directory)
     nozdormu.install(conn)
     nozdormu.apply(conn, changeset)
@@ -158,11 +167,12 @@ def test_log_shows_the_ledger_newest_first(
     lines = out.splitlines()
     assert lines[0].split() == ["VERSION", "CHANGESET", "LABEL", "OUTCOME", "RECORDED_AT", "(UTC)", "BY"]
     assert [line.split()[:4] for line in lines[1:]] == [
-        ["3", "app", "2_table", "applied"],
-        ["2", "app", "1_schema", "applied"],
+        ["4", "app", "2_table", "applied"],
+        ["3", "app", "1_schema", "applied"],
+        ["2", "caverns", "fingerprint", "applied"],
         ["1", "caverns", "ledger", "applied"],
     ]
-    assert re.fullmatch(r"\s*3\s+app\s+2_table\s+applied\s+\d{4}-\d\d-\d\d \d\d:\d\d:\d\d\s+\S+", lines[1])
+    assert re.fullmatch(r"\s*4\s+app\s+2_table\s+applied\s+\d{4}-\d\d-\d\d \d\d:\d\d:\d\d\s+\S+", lines[1])
 
 
 def test_log_limit_and_changeset(
@@ -170,11 +180,11 @@ def test_log_limit_and_changeset(
 ) -> None:
     _installed_and_applied(ledger_conn, _changeset_directory(tmp_path))
     _, out, _ = _run(capsys, "log", "--dsn", db_dsn, "--limit", "1")
-    assert [line.split()[0] for line in out.splitlines()[1:]] == ["3"]
+    assert [line.split()[0] for line in out.splitlines()[1:]] == ["4"]
     _, out, _ = _run(capsys, "log", "--dsn", db_dsn, "--limit", "0")
-    assert len(out.splitlines()) == 4
+    assert len(out.splitlines()) == 5
     _, out, _ = _run(capsys, "log", "--dsn", db_dsn, "--changeset", "caverns")
-    assert [line.split()[0] for line in out.splitlines()[1:]] == ["1"]
+    assert [line.split()[0] for line in out.splitlines()[1:]] == ["2", "1"]
     code, out, _ = _run(capsys, "log", "--dsn", db_dsn, "--changeset", "nobody")
     assert (code, out) == (0, "ℹ️ Nothing to show — changeset nobody has no ledger rows.\n")
 
@@ -186,7 +196,7 @@ def test_log_json_has_every_ledger_field(
     code, out, err = _run(capsys, "log", "--dsn", db_dsn, "--format", "json", "--limit", "2")
     rows = json.loads(out)
     assert (code, err) == (0, "")
-    assert [row["version"] for row in rows] == [3, 2]
+    assert [row["version"] for row in rows] == [4, 3]
     assert set(rows[0]) == {
         "version", "changeset", "label", "checksum", "outcome", "fingerprint", "error",
         "duration_ms", "recorded_at", "recorded_by", "caverns_version",
@@ -204,8 +214,8 @@ def test_status_of_applied_steps_succeeds(
     assert (code, err) == (0, "")
     assert [line.split() for line in out.splitlines()] == [
         ["LABEL", "STATUS", "VERSION"],
-        ["1_schema", "applied", "2"],
-        ["2_table", "applied", "3"],
+        ["1_schema", "applied", "3"],
+        ["2_table", "applied", "4"],
         ["✅", "All", "2", "steps", "of", "changeset", "app", "applied."],
     ]
 
@@ -244,8 +254,8 @@ def test_status_json_shape(ledger_conn: Any, db_dsn: str, tmp_path: Path, capsys
     assert json.loads(out) == {
         "changeset": "app",
         "steps": [
-            {"label": "1_schema", "status": "applied", "version": 2},
-            {"label": "2_table", "status": "applied", "version": 3},
+            {"label": "1_schema", "status": "applied", "version": 3},
+            {"label": "2_table", "status": "applied", "version": 4},
             {"label": "3_later", "status": "pending", "version": None},
         ],
     }
@@ -276,3 +286,168 @@ def test_status_without_an_installed_ledger_is_a_usage_error(
     code, out, err = _run(capsys, "status", str(_changeset_directory(tmp_path)), "--dsn", db_dsn)
     assert (code, out) == (chromie.EXIT_USAGE, "")
     assert "call install()" in err
+
+
+# --- drift ---------------------------------------------------------------------------------
+
+ADD_COLUMN = "ALTER TABLE nozdormu_test.t ADD COLUMN extra text"
+CHECK_FILE = "2_table.check.sql"
+TABLE_CHECK = "SELECT to_regclass('nozdormu_test.t') IS NOT NULL"
+
+
+def _out_of_band(conn: Any, *statements: str) -> None:
+    conn.rollback()
+    with conn.cursor() as cursor:
+        for statement in statements:
+            cursor.execute(statement)
+    conn.commit()
+
+
+def test_drift_of_an_unchanged_database_is_clean(
+    ledger_conn: Any, db_dsn: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    directory = _changeset_directory(tmp_path)
+    _installed_and_applied(ledger_conn, directory)
+    code, out, err = _run(capsys, "drift", str(directory), "--dsn", db_dsn)
+    assert (code, err) == (0, "")
+    first, last = out.splitlines()
+    assert re.fullmatch(r"ℹ️ Comparing with the fingerprint at ledger version 4 \(schemas: .*nozdormu_test.*\)\.", first)
+    assert last == "✅ No drift — the live schema matches the fingerprint at ledger version 4."
+
+
+def test_drift_lists_each_difference_and_exits_1(
+    ledger_conn: Any, db_dsn: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _installed_and_applied(ledger_conn, _changeset_directory(tmp_path))
+    _out_of_band(ledger_conn, "DROP TABLE nozdormu_test.t", "CREATE TABLE nozdormu_test.u (id int)")
+    code, out, err = _run(capsys, "drift", "--dsn", db_dsn, "--schema", "nozdormu_test")
+    assert code == chromie.EXIT_FINDING
+    assert out.splitlines() == [
+        "ℹ️ Comparing with the fingerprint at ledger version 4 (schemas: nozdormu_test).",
+        "-  table   nozdormu_test.t",
+        "+  table   nozdormu_test.u",
+        "-  column  nozdormu_test.t.id",
+        "+  column  nozdormu_test.u.id",
+    ]
+    assert err == "❌ Drift: 4 differences.\n"
+
+
+def test_drift_says_difference_in_the_singular(
+    ledger_conn: Any, db_dsn: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _installed_and_applied(ledger_conn, _changeset_directory(tmp_path))
+    _out_of_band(ledger_conn, ADD_COLUMN)
+    code, out, err = _run(capsys, "drift", "--dsn", db_dsn, "--schema", "nozdormu_test")
+    assert (code, err) == (chromie.EXIT_FINDING, "❌ Drift: 1 difference.\n")
+    assert out.splitlines()[1:] == ["+  column  nozdormu_test.t.extra"]
+
+
+def test_drift_narrows_to_the_schemas_named(
+    ledger_conn: Any, db_dsn: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _installed_and_applied(ledger_conn, _changeset_directory(tmp_path))
+    _out_of_band(ledger_conn, ADD_COLUMN)
+    code, out, _ = _run(capsys, "drift", "--dsn", db_dsn, "--schema", "public")
+    assert code == 0 and "(schemas: public)" in out
+    code, out, _ = _run(capsys, "drift", "--dsn", db_dsn, "--schema", "public", "--schema", "nozdormu_test")
+    assert code == chromie.EXIT_FINDING and "(schemas: nozdormu_test, public)" in out
+
+
+def test_drift_reports_a_step_whose_check_is_now_false(
+    ledger_conn: Any, db_dsn: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    directory = _changeset_directory(tmp_path)
+    (directory / CHECK_FILE).write_text(TABLE_CHECK, encoding="utf-8")
+    _installed_and_applied(ledger_conn, directory)
+    _out_of_band(ledger_conn, "DROP TABLE nozdormu_test.t")
+    code, out, err = _run(capsys, "drift", str(directory), "--dsn", db_dsn, "--schema", "nozdormu_test")
+    assert code == chromie.EXIT_FINDING
+    assert out.splitlines()[1:] == [
+        "-  table   nozdormu_test.t",
+        "-  column  nozdormu_test.t.id",
+        "~  step    app/2_table: recorded applied, check now false",
+    ]
+    assert err == "❌ Drift: 3 differences.\n"
+    code, out, _ = _run(capsys, "drift", str(directory), "--dsn", db_dsn, "--changeset", "other", "--schema", "public")
+    assert code == 0  # another changeset has no recorded steps: nothing disagrees, and public is unchanged
+
+
+def test_drift_json_of_a_clean_database(
+    ledger_conn: Any, db_dsn: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _installed_and_applied(ledger_conn, _changeset_directory(tmp_path))
+    code, out, err = _run(capsys, "drift", "--dsn", db_dsn, "--format", "json", "--schema", "nozdormu_test")
+    assert (code, err) == (0, "")
+    assert json.loads(out) == {
+        "fingerprint_version": 4,
+        "schemas": ["nozdormu_test"],
+        "differences": [],
+        "disagreements": [],
+    }
+
+
+def test_drift_json_of_a_drifted_database(
+    ledger_conn: Any, db_dsn: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    directory = _changeset_directory(tmp_path)
+    (directory / CHECK_FILE).write_text(TABLE_CHECK, encoding="utf-8")
+    _installed_and_applied(ledger_conn, directory)
+    _out_of_band(ledger_conn, "DROP TABLE nozdormu_test.t")
+    code, out, err = _run(
+        capsys, "drift", str(directory), "--dsn", db_dsn, "--format", "json", "--schema", "nozdormu_test"
+    )
+    assert (code, err) == (chromie.EXIT_FINDING, "")
+    assert json.loads(out) == {
+        "fingerprint_version": 4,
+        "schemas": ["nozdormu_test"],
+        "differences": [
+            {"kind": "table", "name": "nozdormu_test.t", "change": "removed"},
+            {"kind": "column", "name": "nozdormu_test.t.id", "change": "removed"},
+        ],
+        "disagreements": [{"changeset": "app", "label": "2_table", "version": 4}],
+    }
+
+
+def test_drift_takes_the_changeset_name_from_the_option(
+    ledger_conn: Any, db_dsn: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    directory = _changeset_directory(tmp_path)
+    (directory / CHECK_FILE).write_text(TABLE_CHECK, encoding="utf-8")
+    _installed_and_applied(ledger_conn, directory)
+    _out_of_band(ledger_conn, "DROP TABLE nozdormu_test.t")
+    _, out, _ = _run(capsys, "drift", str(directory), "--dsn", db_dsn, "--format", "json", "--changeset", "app")
+    assert [d["label"] for d in json.loads(out)["disagreements"]] == ["2_table"]
+
+
+def test_drift_changeset_without_a_directory_is_a_usage_error(
+    ledger_conn: Any, db_dsn: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    nozdormu.install(ledger_conn)
+    code, out, err = _run(capsys, "drift", "--dsn", db_dsn, "--changeset", "app")
+    assert (code, out) == (chromie.EXIT_USAGE, "")
+    assert "--changeset needs a DIRECTORY" in err
+
+
+def test_drift_without_a_fingerprint_is_a_usage_error(
+    ledger_conn: Any, db_dsn: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    nozdormu.install(ledger_conn)
+    code, out, err = _run(capsys, "drift", "--dsn", db_dsn)
+    assert (code, out) == (chromie.EXIT_USAGE, "")
+    assert "no fingerprint is recorded yet" in err
+
+
+def test_drift_without_an_installed_ledger_is_a_usage_error(
+    ledger_conn: Any, db_dsn: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    code, out, err = _run(capsys, "drift", "--dsn", db_dsn)
+    assert (code, out) == (chromie.EXIT_USAGE, "")
+    assert "call install()" in err
+
+
+def test_drift_of_an_unwatched_schema_is_a_usage_error(
+    ledger_conn: Any, db_dsn: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _installed_and_applied(ledger_conn, _changeset_directory(tmp_path))
+    code, _, err = _run(capsys, "drift", "--dsn", db_dsn, "--schema", "caverns")
+    assert code == chromie.EXIT_USAGE and "'caverns' is not watched" in err

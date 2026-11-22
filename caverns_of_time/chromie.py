@@ -16,7 +16,7 @@ from datetime import UTC
 from pathlib import Path
 from typing import Protocol
 
-from caverns_of_time import console, nozdormu
+from caverns_of_time import console, infinite, nozdormu
 from caverns_of_time.errors import CavernsError
 from caverns_of_time.nozdormu import Connection
 
@@ -75,6 +75,15 @@ def build_parser() -> argparse.ArgumentParser:
     status.add_argument("directory", metavar="DIRECTORY", help="the directory of the changeset's .sql files")
     status.add_argument("--changeset", help="the changeset name (default: the directory's name)")
     status.set_defaults(handler=_status)
+    drift = commands.add_parser(
+        "drift", parents=[_common], help="compare the live schema with the last recorded fingerprint"
+    )
+    drift.add_argument(
+        "directory", nargs="?", metavar="DIRECTORY", help="the changeset directory whose applied steps' checks to run"
+    )
+    drift.add_argument("--changeset", help="the changeset name (default: the directory's name)")
+    drift.add_argument("--schema", action="append", help="narrow the report to this schema (repeatable)")
+    drift.set_defaults(handler=_drift)
     return parser
 
 
@@ -119,10 +128,16 @@ def _log(args: argparse.Namespace, connection: Connection) -> int:
     return EXIT_OK
 
 
+def _directory_changeset(directory: str, name: str | None) -> nozdormu.Changeset:
+    """The changeset of *directory*, named *name* or after the directory."""
+    return nozdormu.Changeset.from_directory(name or Path(directory).resolve().name, directory)
+
+
 def _status(args: argparse.Namespace, connection: Connection) -> int:
     """`chromie status`: each step of a changeset directory against the ledger; 1 when a step is not applied."""
-    name = args.changeset or Path(args.directory).resolve().name
-    statuses = nozdormu.preflight(connection, nozdormu.Changeset.from_directory(name, args.directory))
+    changeset = _directory_changeset(args.directory, args.changeset)
+    name = changeset.name
+    statuses = nozdormu.preflight(connection, changeset)
     versions = [s.entry.version if s.entry else None for s in statuses]
     open_steps = [s for s in statuses if s.status is not nozdormu.Status.APPLIED]
     code = EXIT_FINDING if open_steps else EXIT_OK
@@ -142,6 +157,42 @@ def _status(args: argparse.Namespace, connection: Connection) -> int:
         console.error(f"{len(open_steps)} of {len(statuses)} steps of changeset {name} not applied: {listed}.")
     else:
         console.success(f"All {len(statuses)} steps of changeset {name} applied.")
+    return code
+
+
+_CHANGE_SYMBOLS = {"added": "+", "removed": "-", "changed": "~"}
+
+
+def _drift(args: argparse.Namespace, connection: Connection) -> int:
+    """`chromie drift`: the live schema against the last recorded fingerprint; 1 when anything differs."""
+    if args.directory is None and args.changeset:
+        raise UsageError("--changeset needs a DIRECTORY")
+    changeset = _directory_changeset(args.directory, args.changeset) if args.directory else None
+    result = infinite.drift(connection, changeset, schemas=args.schema)
+    disagreements = [(s.entry.changeset, s.step.label, s.entry.version) for s in result.disagreements if s.entry]
+    code = EXIT_FINDING if result.found else EXIT_OK
+    if args.format == "json":
+        console.emit_json(
+            {
+                "fingerprint_version": result.fingerprint_version,
+                "schemas": list(result.schemas),
+                "differences": [asdict(d) for d in result.differences],
+                "disagreements": [
+                    {"changeset": name, "label": label, "version": version} for name, label, version in disagreements
+                ],
+            }
+        )
+        return code
+    version = result.fingerprint_version
+    console.info(f"Comparing with the fingerprint at ledger version {version} (schemas: {', '.join(result.schemas)}).")
+    rows = [(_CHANGE_SYMBOLS[d.change], d.kind, d.name) for d in result.differences]
+    rows += [("~", "step", f"{name}/{label}: recorded applied, check now false") for name, label, _ in disagreements]
+    console.table(None, rows)
+    if result.found:
+        count = len(rows)
+        console.error(f"Drift: {count} difference{'s' if count != 1 else ''}.")
+    else:
+        console.success(f"No drift — the live schema matches the fingerprint at ledger version {version}.")
     return code
 
 
