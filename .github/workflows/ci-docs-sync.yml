@@ -1,0 +1,53 @@
+name: ci-docs-sync
+
+# Zero-setup enforcement of the docs-sync guard on every pull request: a PR that
+# changes code in a documented area (the `AREAS` touch-map in check_docs_sync.py)
+# must also update that area's doc, CLAUDE.md, or the main skill's SKILL.md / references/ — or carry a
+# [skip-docs] token on a line of its own in the commit that makes the
+# change (exempts that commit's files only). Dependabot's own PRs are
+# exempt in .github/workflows (it bumps pinned SHAs and cannot write docs), so
+# the PR author login is passed through as --actor. The local commit-msg hook in
+# .pre-commit-config.yaml is the same check; this job guarantees it runs even when
+# contributors haven't installed pre-commit locally. check_docs_sync.py is
+# stdlib-only, so nothing is installed beyond Python itself.
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  docs-sync:
+    name: Docs in sync with code
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Full history so the merge-base diff (base...HEAD) and the commit-log
+          # scan for the [skip-docs] token can see every commit on the branch.
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.11"
+      # The script diffs base...HEAD and scans the branch's commit messages, so it
+      # needs the PR base ref available locally as a tracking ref. The checkout above
+      # (fetch-depth 0) already fetched every branch; it keeps no credentials, so a
+      # further `git fetch` would fail on a private repository: the step only checks.
+      - name: Run docs-sync guard
+        env:
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+        run: |
+          git rev-parse --verify --quiet "refs/remotes/origin/$BASE_REF^{commit}" >/dev/null || {
+            echo "origin/$BASE_REF is missing from the checkout" >&2
+            exit 1
+          }
+          python dev_tools/check_docs_sync.py \
+            --base "origin/$BASE_REF" \
+            --actor "$PR_AUTHOR"

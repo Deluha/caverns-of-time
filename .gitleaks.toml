@@ -1,0 +1,7 @@
+title = "Caverns of Time gitleaks configuration"
+
+# The default ruleset, no allow-list entries. A real finding is fixed (rotate the
+# credential, remove it from the tree) and is never allow-listed to get green;
+# adding an entry here is an ask-first change (CLAUDE.md "Ask first").
+[extend]
+useDefault = true
