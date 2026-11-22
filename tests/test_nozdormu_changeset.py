@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import hashlib
+import re
 from pathlib import Path
 
 import pytest
 
+from caverns_of_time import nozdormu
 from caverns_of_time.errors import ChangesetError
 from caverns_of_time.nozdormu import Changeset, Step
 
@@ -188,3 +190,16 @@ def test_from_directory_names_an_empty_step_file(tmp_path: Path) -> None:
     _write(tmp_path, {"a.sql": "  \n"})
     with pytest.raises(ChangesetError, match="'a'"):
         Changeset.from_directory("app", tmp_path)
+
+
+# --- the SQL constants ---------------------------------------------------------------------
+
+
+def test_every_sql_constant_names_the_one_ledger_table() -> None:
+    constants = {
+        name: value for name, value in vars(nozdormu).items() if name.endswith("_SQL") and isinstance(value, str)
+    }
+    assert constants
+    for name, sql in constants.items():
+        for qualifier in re.findall(r"(\w+)\.ledger\b", sql):
+            assert qualifier == nozdormu._OWN_CHANGESET_NAME, name

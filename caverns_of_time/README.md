@@ -12,7 +12,7 @@ migration ledger (in progress; this file describes what is built).
 |---|---|
 | `__init__.py` | `__version__`, read from the installed distribution's metadata |
 | `errors.py` | The exception types, all in one module |
-| `nozdormu.py` | Nozdormu: the `Step` and `Changeset` model, the checksum and the loaders |
+| `nozdormu.py` | Nozdormu: the `Step` and `Changeset` model, the checksum, the loaders, the connection contract, the ledger and `install` |
 
 ## How it works
 
@@ -24,6 +24,12 @@ from a directory (`Changeset.from_directory`): every `*.sql` file of that direct
 sub-directories, is a step in file-name order, labelled with the file name minus `.sql`;
 `<label>.check.sql` is the check of the step `<label>.sql`. Other files are ignored. A step is also
 readable from one file (`Step.from_file`).
+
+**Nozdormu, the ledger.** Every recorded change is a row of `caverns.ledger`. Caverns creates it itself:
+`install(connection)` applies Caverns' own changeset (named `caverns`, one step `ledger`) and records that
+step as the ledger's first row, in the same transaction as the DDL. Installing again writes nothing and
+returns `[]`. Until the ledger exists, reading it behaves as an empty ledger; that is how the own
+changeset bootstraps.
 
 ## Interfaces & contracts
 
@@ -39,6 +45,32 @@ readable from one file (`Step.from_file`).
 - `Changeset(name, steps)`: the name follows the label rules; at least one step; labels are unique. The
   name `caverns` is Caverns' own.
 - Every invalid input raises `ChangesetError`, naming the offending value.
+- The connection: any DB-API 2.0 connection with `%s` parameters. The `Connection` protocol names what is
+  used (`cursor()`, `commit()`, `rollback()`, a readable `autocommit`; a cursor's `execute`, `fetchone`,
+  `fetchall`, `close`), so psycopg 3 and psycopg2 connections both fit and the package imports no driver.
+  Caverns commits and rolls back itself: pass a connection with **autocommit off** and no uncommitted work.
+  A connection with autocommit on is refused with a `CavernsError` that names the fix. A step's SQL and
+  check run exactly as written, with no parameters, so a `%` in them is literal.
+- `install(connection) -> list[LedgerEntry]`: the rows written, `[]` when the ledger is already installed.
+- The ledger, `caverns.ledger`, one row per recorded event:
+
+  | Column | Holds |
+  |---|---|
+  | `version` | identity; the ledger version, the order of events |
+  | `changeset`, `label` | the step the row is about |
+  | `checksum` | the step's checksum (64 lower-case hex digits) |
+  | `outcome` | `applied`, `failed`, `baseline` or `accepted` |
+  | `fingerprint` | required on `baseline`, else null |
+  | `error` | the database error, present exactly on `failed` |
+  | `duration_ms` | how long the step ran, when it ran |
+  | `recorded_at`, `recorded_by` | `clock_timestamp()` and `current_user` at insert |
+  | `caverns_version` | the package version that wrote the row |
+
+  An index on (`changeset`, `label`, `version`) serves the reads. The ledger is append-only: triggers
+  reject UPDATE, DELETE and TRUNCATE (hard rule 5); a correction is a new row. `LedgerEntry` carries these
+  columns in this order.
+- The own changeset is never edited once released: a change to the ledger is a new own step (hard rule 6).
+  The ledger's DDL is idempotent, and `caverns` is a reserved changeset name.
 - No runtime dependency. Adding one is an ask-first decision.
 
 ## Extending

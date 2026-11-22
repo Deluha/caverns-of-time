@@ -11,16 +11,25 @@ from __future__ import annotations
 import os
 from collections.abc import Iterator
 from contextlib import contextmanager
+from typing import Any
 
 import psycopg
+import psycopg2
 import pytest
 from psycopg.conninfo import conninfo_to_dict
 
 DSN_VARIABLE = "CAVERNS_TEST_DSN"
 REQUIRE_DB_VARIABLE = "CAVERNS_REQUIRE_DB"
 LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1"}
-DB_FIXTURES = {"db_dsn", "db_conn"}
+DB_FIXTURES = {"db_dsn", "db_conn", "ledger_conn"}
 DB_MARKER = "db"
+LEDGER_DRIVERS = {"psycopg": psycopg, "psycopg2": psycopg2}
+# Schemas the ledger tests create objects in, dropped around each test: `caverns` is Caverns' own,
+# `nozdormu_test` is where the test changesets build their tables.
+LEDGER_TEST_DROPS = (
+    "DROP SCHEMA IF EXISTS caverns CASCADE",
+    "DROP SCHEMA IF EXISTS nozdormu_test CASCADE",
+)
 # libpq reads these when the connection string leaves them out, or (PGHOSTADDR) even when
 # it names a host, so any of them can redirect a local-looking connection string.
 REDIRECTING_VARIABLES = ("PGHOSTADDR", "PGSERVICE", "PGSERVICEFILE")
@@ -130,3 +139,27 @@ def db_conn(db_dsn: str) -> Iterator[psycopg.Connection]:
     """A connection whose uncommitted work is rolled back when the test ends."""
     with rolled_back_connection(db_dsn) as conn:
         yield conn
+
+
+def _drop_ledger_schemas(conn: Any) -> None:
+    conn.rollback()
+    with conn.cursor() as cursor:
+        for statement in LEDGER_TEST_DROPS:
+            cursor.execute(statement)
+    conn.commit()
+
+
+@pytest.fixture(params=sorted(LEDGER_DRIVERS))
+def ledger_conn(request: pytest.FixtureRequest, db_dsn: str) -> Iterator[Any]:
+    """A non-autocommit connection, on each supported driver, to a database without a ledger.
+
+    Nozdormu commits, so `db_conn`'s rollback cannot isolate it: the schemas the ledger tests use are
+    dropped before and after each test instead.
+    """
+    conn = LEDGER_DRIVERS[request.param].connect(db_dsn)
+    try:
+        _drop_ledger_schemas(conn)
+        yield conn
+        _drop_ledger_schemas(conn)
+    finally:
+        conn.close()
