@@ -54,9 +54,10 @@ as written, insert the ledger row and commit, so the step's effect and its row s
 step that raises is rolled back, then recorded as a `failed` row in a transaction of its own, and
 `StepFailed` is raised from the database error; later steps do not run, and the step is `pending` again.
 If the failure cannot be recorded, nothing is recorded and a `CavernsError` is raised instead, from the
-step's own error, so a caller always gets a `CavernsError`: the failed step was Caverns' own `ledger` step
-(`install` as a role that cannot create the schema), so there is no ledger to record into, or the `failed`
-row cannot be written (a read-only session). The rows written are returned and logged.
+step's own error. That happens when the failed step was Caverns' own `ledger` step (`install` as a role
+that cannot create the schema), so there is no ledger to record into, or when the `failed` row cannot be
+written (a read-only session). A connection lost during a step raises the driver's error and records
+nothing. The rows written are returned and logged.
 `install` takes the same path for Caverns' own changeset.
 
 A `conflict` or `unknown` step refuses the whole run before anything is executed or written
