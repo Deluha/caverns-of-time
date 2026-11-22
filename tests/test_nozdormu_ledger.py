@@ -108,6 +108,17 @@ def test_install_refuses_a_connection_with_autocommit_on(ledger_conn: Any) -> No
         ledger_conn.autocommit = False
 
 
+def test_install_refuses_a_connection_with_uncommitted_work(ledger_conn: Any) -> None:
+    _execute(ledger_conn, "CREATE SCHEMA nozdormu_test")
+    with ledger_conn.cursor() as cursor:
+        cursor.execute("CREATE TABLE nozdormu_test.caller_work (id int)")
+    with pytest.raises(CavernsError, match="uncommitted work"):
+        install(ledger_conn)
+    ledger_conn.commit()
+    assert _exists(ledger_conn, "nozdormu_test.caller_work")
+    assert not _exists(ledger_conn, "caverns.ledger")
+
+
 # --- the ledger's own rules ----------------------------------------------------------------
 
 
@@ -245,6 +256,34 @@ def test_preflight_is_read_only_and_leaves_the_connection_clean(ledger_conn: Any
     assert _query(ledger_conn, LEDGER_ROWS) == [(1, "caverns", "ledger", "applied")]
     ledger_conn.autocommit = True  # only possible when no transaction is open
     ledger_conn.autocommit = False
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        lambda conn: preflight(conn, APP),
+        lambda conn: apply(conn, APP),
+        lambda conn: baseline(conn, APP),
+    ],
+    ids=["preflight", "apply", "baseline"],
+)
+def test_a_connection_with_uncommitted_work_is_refused_and_keeps_its_work(ledger_conn: Any, call: Any) -> None:
+    install(ledger_conn)
+    _execute(ledger_conn, "CREATE SCHEMA nozdormu_test")
+    with ledger_conn.cursor() as cursor:
+        cursor.execute("CREATE TABLE nozdormu_test.caller_work (id int)")
+    with pytest.raises(CavernsError, match="uncommitted work"):
+        call(ledger_conn)
+    ledger_conn.commit()
+    assert _exists(ledger_conn, "nozdormu_test.caller_work")
+    assert _query(ledger_conn, LEDGER_ROWS) == [(1, "caverns", "ledger", "applied")]
+
+
+def test_preflight_accepts_a_connection_with_an_open_read_only_transaction(ledger_conn: Any) -> None:
+    install(ledger_conn)
+    with ledger_conn.cursor() as cursor:
+        cursor.execute("SELECT 1")
+    assert len(preflight(ledger_conn, APP)) == len(APP.steps)
 
 
 # --- apply ---------------------------------------------------------------------------------

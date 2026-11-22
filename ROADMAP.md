@@ -117,7 +117,7 @@ Sign-off: ledger schema name and columns; the `Step` signature; the connection c
 connection, so both psycopg2 and psycopg 3 consumers work — *proposed*); what a checksum covers; how a
 deliberately edited step is re-applied.
 
-Sign-off decisions (owner, 2026-11-22: N1–N8 confirmed as recommended):
+Sign-off decisions (owner, 2026-11-22: N1–N8 confirmed as recommended; N9 confirmed after the phase review):
 
 | # | Item | Decision |
 |---|---|---|
@@ -129,6 +129,7 @@ Sign-off decisions (owner, 2026-11-22: N1–N8 confirmed as recommended):
 | N6 | Edited step | Preferred: a new step. `reapply` runs the edited SQL and records a new `applied` row; `accept` records the new checksum as `accepted` without running (also for an unknown step). Naming a step that is not a conflict or unknown is an error. |
 | N7 | Baseline | One `baseline` row for the `through` step (default the last), with its checksum and a fingerprint; nothing executed; refused when the changeset already has rows. Phase 1 fingerprint: SHA-256 over a canonical document of tables and columns in the given schemas (default all but `pg_*`, `information_schema`, `caverns`); Phase 2 widens it and moves it to Infinite. |
 | N8 | Layout | One module `nozdormu` plus the shared `errors` module; split into a sub-package behind a facade only past ~800 lines. |
+| N9 | Review amendment | Public names `Connection`, `LedgerEntry`, `Status`, `StepStatus` and the exceptions `CavernsError`, `ChangesetError`, `LedgerNotInstalled`, `PreflightRefused` (`statuses`), `StepFailed` (`label`, `version`), `BaselineRefused`. Returns: `install` and `apply` the rows written (`[]` when nothing to do), `preflight` one `StepStatus` per step, `baseline` its row. Refused: a bare string for `reapply`, `accept` or `schemas`, a label in both `reapply` and `accept`, an empty `schemas` (`ChangesetError`); a named schema that does not exist (`BaselineRefused`); a connection with uncommitted writes (`CavernsError`, nothing rolled back). The checksum (N5) trims ASCII whitespace only: space, tab, LF, CR, FF, VT. |
 
 ### Phase 2 — Chromie and Infinite
 
