@@ -18,7 +18,7 @@ pinned range-and-tree scan.
 | `ruff` | pre-commit | `E`, `F`, `B`, `I`, `UP` (config in `pyproject.toml`); isolated venv | any `.py` |
 | `guidance-integrity` | pre-commit | Doc pointers + anchors resolve, `CLAUDE.md` budget, skill routing, single-home tokens (`dev_tools/check_guidance_integrity.py`) | any `.py` / `.md` |
 | `docs-sync` | **commit-msg** | Code change in a documented area also touches its doc (`dev_tools/check_docs_sync.py --staged`) | every commit |
-| `pytest-fast` | pre-push | `pytest -q -x -m "not db"`: the tests that need no database | every push |
+| `pytest-fast` | pre-push | `pytest -q -x -m "not db"` with `CAVERNS_REQUIRE_DB` unset: the tests that need no database | every push |
 
 Claude Code sessions add guards from `.claude/settings.json` (not git hooks — they act while editing):
 
@@ -66,7 +66,8 @@ One PostgreSQL 18 instance, local to the machine running the tests, holding no d
 - The image tag is stated in `dev_tools/database.py`; `tests/test_database.py` fails when the CI workflow
   or the dev container names a different one, and when the server is not major version 18.
 - The fixtures refuse a connection string that can reach another machine: every `host` and `hostaddr`
-  entry must be local, a host must be named and a service entry is refused (`tests/conftest.py`).
+  entry must be local, a host must be named, and a service entry or a set `PGHOSTADDR`, `PGSERVICE` or
+  `PGSERVICEFILE` is refused (`tests/conftest.py`).
 - There is no fallback to another PostgreSQL version: if the instance cannot start, the database tests
   fail and the work stops there.
 - ⚑ Pointing any of this at another database, or changing the version, is ask-first.

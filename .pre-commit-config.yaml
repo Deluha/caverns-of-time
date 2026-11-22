@@ -77,9 +77,11 @@ repos:
       # Fast pass before a push: the tests that need no database, stopping at the
       # first failure. The full suite, database required, is the verify command
       # (dev_tools/verify.py) and ci-tests.yml.
+      # CAVERNS_REQUIRE_DB is unset for this run: with it, a run without a passed
+      # database test fails by design, and this hook deselects them on purpose.
       - id: pytest-fast
         name: pytest (no database, stop at first failure)
-        entry: python -m pytest -q -x -m "not db"
+        entry: env -u CAVERNS_REQUIRE_DB python -m pytest -q -x -m "not db"
         language: system
         pass_filenames: false
         always_run: true

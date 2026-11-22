@@ -16,10 +16,10 @@ error is left to ruff. Tests: `tests/test_check_conventions.py`.
 | C3 | R3 | package `.py` | plain text formatted into the first argument of `execute` / `executemany`: an f-string, or `%`, `+` or `.format()` on a string literal | the driver's own composition objects (no string-literal operand) |
 | C4 | R4 | all files | a `test_*.py` / `*_test.py` outside `tests/`; a `.md` that is not a permanent doc, a `README.md` or under `.claude/` | — |
 | C5 | style | package `.py` | a module without a docstring | — |
-| C6 | R8 | `tests/*.py` | a call to `connect` (bare or as an attribute); an import of `connect`; a string containing a PostgreSQL connection-string scheme | `tests/conftest.py` |
+| C6 | R8 | `tests/*.py` | a call to `connect` (bare or as an attribute); an import of `connect`; a string containing a PostgreSQL connection-string scheme | `tests/conftest.py`; for the string only, the two tests whose subject is a connection string (`tests/test_database.py`, `tests/test_check_conventions.py`) |
 | C7 | R9 | package `.py` | an import of `argparse`, `click` or `typer` | the package's `chromie` module |
 | C8 | security | all files | a tracked `.env*`, `*.pem`, `*.pfx`, `*.key`, `*.egg-info` or `settings.local.json` | — |
-| C9 | R8 | `tests/*.py` | the names `skip`, `skipif`, `xfail`, `importorskip` or `SkipTest`, as an attribute, a bare name or an import | `tests/conftest.py` |
+| C9 | R8 | `tests/*.py` | the names `skip`, `skipif`, `xfail`, `importorskip`, `SkipTest`, `skipIf`, `skipUnless` or `expectedFailure`, as an attribute, a bare name or an import | `tests/conftest.py` |
 
 R5, R6 and the parts of R1, R3 and R9 a parser cannot see are review-enforced (`references/conventions.md`).
 C3 sees only a formatted string passed directly; a statement formatted on an earlier line, or built

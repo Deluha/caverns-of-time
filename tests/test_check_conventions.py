@@ -5,7 +5,6 @@ from __future__ import annotations
 from dev_tools import check_conventions as cc
 
 PKG = "caverns_of_time/"
-DSN_SCHEME = "postgresql" + "://"
 
 
 def test_c1_consumer_name_in_package_only() -> None:
@@ -56,12 +55,15 @@ def test_c5_module_docstring() -> None:
 
 
 def test_c6_test_connections() -> None:
-    bad = f"import psycopg\nc = psycopg.connect(dsn)\nD = '{DSN_SCHEME}u@h/db'\n"
+    bad = "import psycopg\nc = psycopg.connect(dsn)\nD = 'postgresql://u@h/db'\n"
     out = cc.check_test_connections([("tests/test_a.py", bad), ("tests/conftest.py", bad), (PKG + "a.py", bad)])
     assert [line.split(":")[1] for line in out] == ["2", "3"]
     assert all(line.startswith("tests/test_a.py") for line in out)
     bare = "from psycopg import connect\nc = connect(dsn)\n"
     assert [line.split(":")[1] for line in cc.check_test_connections([("tests/test_b.py", bare)])] == ["1", "2"]
+    # A test about connection strings may spell one, but still may not connect.
+    out = cc.check_test_connections([("tests/test_database.py", bad)])
+    assert [line.split(":")[1] for line in out] == ["2"]
 
 
 def test_c7_cli_entry() -> None:
@@ -87,6 +89,8 @@ def test_c9_test_skips() -> None:
     assert [line.split(":")[1] for line in out] == ["2", "4"]
     bare = "import unittest\nfrom pytest import skip\ndef test_a():\n    skip('x')\n    raise unittest.SkipTest\n"
     assert [line.split(":")[1] for line in cc.check_test_skips([("tests/test_b.py", bare)])] == ["2", "4", "5"]
+    unit = "import unittest\n@unittest.skipUnless(False, 'x')\n@unittest.expectedFailure\ndef test_a(): ...\n"
+    assert [line.split(":")[1] for line in cc.check_test_skips([("tests/test_b.py", unit)])] == ["2", "3"]
 
 
 def test_syntax_errors_are_left_to_ruff() -> None:

@@ -8,8 +8,8 @@ name: ci-tests
 # fails otherwise. The pytest job also records coverage (coverage.xml, a 14-day
 # artifact). Two more gating jobs ride along: mypy (strict; config in
 # pyproject.toml) and actionlint over .github/workflows. The final `gate` job
-# (check name "CI gate") depends on all three: it is the one check branch
-# protection needs to require.
+# (check name "CI gate") depends on all three and stands for this workflow in
+# branch protection, next to the checks of ci-pre-commit and ci-docs-sync.
 on:
   pull_request:
   push:
@@ -102,7 +102,7 @@ jobs:
           SHELLCHECK_OPTS: --severity=warning
         run: actionlint .github/workflows/*.yml
 
-  # One required check for branch protection: it covers the gating jobs above, so
+  # One check to require for this workflow: it covers the gating jobs above, so
   # adding or renaming one of them never touches the repository's required-check list.
   gate:
     name: CI gate

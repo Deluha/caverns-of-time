@@ -10,7 +10,7 @@ database.
 
 | File | Covers | Database |
 |---|---|---|
-| `conftest.py` | The `db_dsn` and `db_conn` fixtures, the local-host guard, the `db` marker | — |
+| `conftest.py` | The `db_dsn` and `db_conn` fixtures, the local-only guard, the `db` marker, the required-run check | — |
 | `test_database.py` | The instance itself: major version 18, rollback of uncommitted work, the image tag and connection string agreeing across CI, the dev container and `dev_tools/database.py`; the fixtures' guards | yes |
 | `test_check_conventions.py` | Convention rules C1–C9 on synthetic input, then the real repository | no |
 | `test_check_docs_sync.py` | The docs-sync classifier, token rules, git parsing | no |
@@ -26,7 +26,7 @@ database.
 - Every test that takes `db_dsn` or `db_conn` is marked `db` automatically.
 - The connection string comes from `CAVERNS_TEST_DSN`. Every `host` and `hostaddr` entry, as libpq reads
   them, must be `localhost`, `127.0.0.1` or `::1`; a host list, a `host=` parameter, a service entry or
-  a missing host fails the test.
+  a missing host fails the test, and so does a set `PGHOSTADDR`, `PGSERVICE` or `PGSERVICEFILE`.
 - With `CAVERNS_REQUIRE_DB=1` a run in which no database test passed fails as a whole, so deselecting
   the database tests cannot produce a green run.
 
@@ -35,14 +35,16 @@ database.
 | `pytest` | database tests skip with a notice | database tests fail |
 | `python dev_tools/verify.py` | falls back to the local default | database tests fail |
 | CI (`CAVERNS_REQUIRE_DB=1`) | database tests fail | database tests fail |
-| pre-push hook (`-m "not db"`) | database tests not selected | database tests not selected |
+| pre-push hook (`-m "not db"`, `CAVERNS_REQUIRE_DB` unset) | database tests not selected | database tests not selected |
 
 ## Interfaces & contracts
 
 - Start the instance: `python dev_tools/database.py start`; its connection string:
   `python dev_tools/database.py dsn`.
 - A test never opens its own connection, never names a connection string and never skips itself
-  (checker rules C6 and C9).
+  (checker rules C6 and C9). The two tests whose subject is a connection string may spell one:
+  `test_database.py` (the guard) and `test_check_conventions.py` (the checker).
+- With `CAVERNS_REQUIRE_DB=1` exported, a targeted run that selects no database test exits 1 by design.
 - A changed behaviour means updating its test deliberately in the same PR, never loosening an assertion.
 
 ## Extending
