@@ -1,4 +1,4 @@
-"""Chromie: connection-string resolution, the parser, the `log`, `status`, `drift` and `as-of` commands, the console."""
+"""Chromie: dsn resolution, the parser, the `log`, `status`, `drift`, `as-of` and `diff` commands, the console."""
 
 from __future__ import annotations
 
@@ -655,3 +655,221 @@ def test_as_of_refuses_a_bad_limit(capsys: pytest.CaptureFixture[str]) -> None:
             chromie.main(["as-of", "e", "s.t", "--limit", limit])
         assert raised.value.code == chromie.EXIT_USAGE
     assert "--limit" in capsys.readouterr().err
+
+
+# --- diff ------------------------------------------------------------------------------------
+
+CODES = "CREATE TABLE nozdormu_test.codes (code text PRIMARY KEY, label text)"
+MIXED_LINES = [
+    "~  column  nozdormu_test.codes.label: text → character varying(5)",
+    '~  row     nozdormu_test.codes (code="x"): label',
+    "-  column  nozdormu_test.users.tags",
+    "+  column  nozdormu_test.users.age",
+    "+  row     nozdormu_test.users (id=3)",
+    "-  row     nozdormu_test.users (id=1)",
+    "~  row     nozdormu_test.users (id=2): nickname",
+]
+
+
+def _two_epochs(conn: Any, *between: str) -> tuple[epochs.Epoch, epochs.Epoch]:
+    """Caverns installed, `users` and `codes` filled and snapshotted as run-1; *between* run, then run-2."""
+    nozdormu.install(conn)
+    with conn.cursor() as cursor:
+        for statement in (
+            "CREATE SCHEMA nozdormu_test",
+            USERS,
+            CODES,
+            "INSERT INTO nozdormu_test.users VALUES (1, 'ann@example.org', NULL, true, NULL),"
+            " (2, 'bob@example.org', 'bobby', true, '[1]')",
+            "INSERT INTO nozdormu_test.codes VALUES ('x', 'old'), ('y', 'same')",
+        ):
+            cursor.execute(statement)
+    conn.commit()
+    epochs.register(conn, "nozdormu_test", "users")
+    epochs.register(conn, "nozdormu_test", "codes")
+    first = epochs.snapshot(conn, "run-1")
+    with conn.cursor() as cursor:
+        for statement in between:
+            cursor.execute(statement)
+    conn.commit()
+    return first, epochs.snapshot(conn, "run-2")
+
+
+MIXED_CHANGES = (
+    "DELETE FROM nozdormu_test.users WHERE id = 1",
+    "INSERT INTO nozdormu_test.users VALUES (3, 'cy@example.org', NULL, false, NULL)",
+    "UPDATE nozdormu_test.users SET nickname = 'bob' WHERE id = 2",
+    "ALTER TABLE nozdormu_test.users DROP COLUMN tags, ADD COLUMN age int",
+    "UPDATE nozdormu_test.codes SET label = 'new' WHERE code = 'x'",
+    "ALTER TABLE nozdormu_test.codes ALTER COLUMN label TYPE varchar(5)",
+)
+
+
+def test_diff_prints_each_difference_and_exits_1(
+    ledger_conn: Any, db_dsn: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    first, second = _two_epochs(ledger_conn, *MIXED_CHANGES)
+    code, out, err = _run(capsys, "diff", "run-1", "run-2", "--dsn", db_dsn)
+    assert code == chromie.EXIT_FINDING
+    assert out.splitlines() == [
+        f"ℹ️ Comparing epoch run-1 (ledger version {first.ledger_version})"
+        f" with run-2 (ledger version {second.ledger_version}).",
+        *MIXED_LINES,
+    ]
+    assert err == "❌ 7 differences in 2 tables.\n"
+
+
+def test_diff_says_difference_and_table_in_the_singular(
+    ledger_conn: Any, db_dsn: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _two_epochs(ledger_conn, "UPDATE nozdormu_test.codes SET label = 'new' WHERE code = 'y'")
+    code, out, err = _run(capsys, "diff", "run-1", "run-2", "--dsn", db_dsn)
+    assert (code, err) == (chromie.EXIT_FINDING, "❌ 1 difference in 1 table.\n")
+    assert out.splitlines()[1:] == ['~  row  nozdormu_test.codes (code="y"): label']
+
+
+def test_diff_quotes_a_string_key_as_json(ledger_conn: Any, db_dsn: str, capsys: pytest.CaptureFixture[str]) -> None:
+    _two_epochs(ledger_conn, "INSERT INTO nozdormu_test.codes VALUES ('é\"q', 'n')")
+    _, out, _ = _run(capsys, "diff", "run-1", "run-2", "--dsn", db_dsn)
+    assert out.splitlines()[1:] == ['+  row  nozdormu_test.codes (code="é\\"q")']
+
+
+def test_diff_prints_a_table_in_one_epoch_only_as_added_or_removed(
+    ledger_conn: Any, db_dsn: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _two_epochs(ledger_conn)
+    with ledger_conn.cursor() as cursor:
+        cursor.execute("CREATE TABLE nozdormu_test.extra (id int PRIMARY KEY)")
+    ledger_conn.commit()
+    epochs.register(ledger_conn, "nozdormu_test", "extra")
+    epochs.snapshot(ledger_conn, "run-3")
+    code, out, err = _run(capsys, "diff", "run-2", "run-3", "--dsn", db_dsn)
+    assert (code, err) == (chromie.EXIT_FINDING, "❌ 1 difference in 1 table.\n")
+    assert out.splitlines()[1:] == ["+  table  nozdormu_test.extra"]
+    _, out, _ = _run(capsys, "diff", "run-3", "run-2", "--dsn", db_dsn)
+    assert out.splitlines()[1:] == ["-  table  nozdormu_test.extra"]
+
+
+def test_diff_of_identical_epochs_succeeds(ledger_conn: Any, db_dsn: str, capsys: pytest.CaptureFixture[str]) -> None:
+    first, second = _two_epochs(ledger_conn)
+    code, out, err = _run(capsys, "diff", "run-1", "run-2", "--dsn", db_dsn)
+    assert (code, err) == (0, "")
+    assert out.splitlines() == [
+        f"ℹ️ Comparing epoch run-1 (ledger version {first.ledger_version})"
+        f" with run-2 (ledger version {second.ledger_version}).",
+        "✅ No differences between epochs run-1 and run-2.",
+    ]
+
+
+def test_diff_narrows_to_the_tables_named(ledger_conn: Any, db_dsn: str, capsys: pytest.CaptureFixture[str]) -> None:
+    _two_epochs(ledger_conn, *MIXED_CHANGES)
+    code, out, err = _run(capsys, "diff", "run-1", "run-2", "--dsn", db_dsn, "--table", "nozdormu_test.codes")
+    assert (code, err) == (chromie.EXIT_FINDING, "❌ 2 differences in 1 table.\n")
+    assert out.splitlines()[1:] == MIXED_LINES[:2]
+    both = ("--table", "nozdormu_test.users", "--table", "nozdormu_test.codes")
+    code, out, err = _run(capsys, "diff", "run-1", "run-2", "--dsn", db_dsn, *both)
+    assert (code, out.splitlines()[1:], err) == (chromie.EXIT_FINDING, MIXED_LINES, "❌ 7 differences in 2 tables.\n")
+
+
+def test_diff_of_a_table_neither_epoch_has_is_a_usage_error(
+    ledger_conn: Any, db_dsn: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _two_epochs(ledger_conn)
+    code, out, err = _run(capsys, "diff", "run-1", "run-2", "--dsn", db_dsn, "--table", "nozdormu_test.nope")
+    assert (code, out) == (chromie.EXIT_USAGE, "")
+    assert err == "❌ neither epoch 'run-1' nor 'run-2' has table nozdormu_test.nope\n"
+
+
+@pytest.mark.parametrize("table", ["public", ".users", "public.", "."])
+def test_diff_refuses_a_table_that_is_not_schema_dot_table(table: str, capsys: pytest.CaptureFixture[str]) -> None:
+    with pytest.raises(SystemExit) as raised:
+        chromie.main(["diff", "a", "b", "--table", table])
+    assert raised.value.code == chromie.EXIT_USAGE
+    assert f"expected SCHEMA.TABLE, got {table!r}" in capsys.readouterr().err
+
+
+def test_diff_parses_the_epochs_and_the_repeatable_table() -> None:
+    parser = chromie.build_parser()
+    assert parser.parse_args(["diff", "a", "b"]).table is None
+    args = parser.parse_args(["diff", "a", "b", "--table", "s.t", "--table", "u.v.w"])
+    assert (args.old, args.new, args.table) == ("a", "b", [("s", "t"), ("u", "v.w")])
+
+
+def test_diff_json_shape(ledger_conn: Any, db_dsn: str, capsys: pytest.CaptureFixture[str]) -> None:
+    first, second = _two_epochs(ledger_conn, *MIXED_CHANGES)
+    code, out, err = _run(capsys, "diff", "run-1", "run-2", "--dsn", db_dsn, "--format", "json")
+    assert (code, err) == (chromie.EXIT_FINDING, "")
+    assert json.loads(out) == {
+        "old": {"epoch": "run-1", "ledger_version": first.ledger_version},
+        "new": {"epoch": "run-2", "ledger_version": second.ledger_version},
+        "tables": [
+            {
+                "schema": "nozdormu_test",
+                "table": "codes",
+                "change": "changed",
+                "key": ["code"],
+                "columns": [
+                    {"name": "label", "change": "changed", "old_type": "text", "new_type": "character varying(5)"}
+                ],
+                "added": [],
+                "removed": [],
+                "changed": [{"key": {"code": "x"}, "old": {"label": "old"}, "new": {"label": "new"}}],
+            },
+            {
+                "schema": "nozdormu_test",
+                "table": "users",
+                "change": "changed",
+                "key": ["id"],
+                "columns": [
+                    {"name": "tags", "change": "removed", "old_type": "jsonb", "new_type": None},
+                    {"name": "age", "change": "added", "old_type": None, "new_type": "integer"},
+                ],
+                "added": [{"id": 3}],
+                "removed": [{"id": 1}],
+                "changed": [{"key": {"id": 2}, "old": {"nickname": "bobby"}, "new": {"nickname": "bob"}}],
+            },
+        ],
+    }
+
+
+def test_diff_json_of_identical_epochs_succeeds(
+    ledger_conn: Any, db_dsn: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    first, second = _two_epochs(ledger_conn)
+    code, out, err = _run(capsys, "diff", "run-1", "run-2", "--dsn", db_dsn, "--format", "json")
+    assert (code, err) == (0, "")
+    assert json.loads(out) == {
+        "old": {"epoch": "run-1", "ledger_version": first.ledger_version},
+        "new": {"epoch": "run-2", "ledger_version": second.ledger_version},
+        "tables": [],
+    }
+
+
+@pytest.mark.parametrize("argv", [("nope", "run-2"), ("run-1", "nope")])
+def test_diff_of_an_unknown_epoch_is_a_usage_error(
+    ledger_conn: Any, db_dsn: str, capsys: pytest.CaptureFixture[str], argv: tuple[str, ...]
+) -> None:
+    _two_epochs(ledger_conn)
+    code, out, err = _run(capsys, "diff", *argv, "--dsn", db_dsn)
+    assert (code, out, err) == (chromie.EXIT_USAGE, "", "❌ no epoch is named 'nope'\n")
+
+
+def test_diff_of_a_key_that_changed_is_a_usage_error(
+    ledger_conn: Any, db_dsn: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _two_epochs(ledger_conn)
+    epochs.register(ledger_conn, "nozdormu_test", "users", key=["email"])
+    epochs.snapshot(ledger_conn, "run-3")
+    code, out, err = _run(capsys, "diff", "run-2", "run-3", "--dsn", db_dsn)
+    assert (code, out) == (chromie.EXIT_USAGE, "")
+    assert err.startswith("❌ the key of nozdormu_test.users differs between epochs 'run-2' (id) and 'run-3' (email)")
+    code, _, _ = _run(capsys, "diff", "run-2", "run-3", "--dsn", db_dsn, "--table", "nozdormu_test.codes")
+    assert code == 0
+
+
+def test_diff_without_an_installed_ledger_is_a_usage_error(
+    ledger_conn: Any, db_dsn: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    code, out, err = _run(capsys, "diff", "run-1", "run-2", "--dsn", db_dsn)
+    assert (code, out) == (chromie.EXIT_USAGE, "")
+    assert "call install()" in err

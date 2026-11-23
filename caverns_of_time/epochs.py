@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import json
 import logging
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
@@ -33,12 +33,17 @@ from caverns_of_time.nozdormu import EPOCHS_EXISTS_SQL
 
 __all__ = [
     "Column",
+    "ColumnChange",
     "Epoch",
+    "EpochDiff",
     "EpochTable",
+    "RowChange",
     "TableAt",
+    "TableDiff",
     "TrackedTable",
     "as_of",
     "catalog",
+    "diff",
     "register",
     "snapshot",
     "tracked",
@@ -136,6 +141,26 @@ WHERE r.epoch = %s AND r.schema_name = %s AND r.table_name = %s
 ORDER BY (SELECT array_agg(r.row -> k ORDER BY o) FROM unnest(%s::text[]) WITH ORDINALITY AS u (k, o))
 LIMIT %s
 """
+# The rows of one table that differ between two epochs, compared on the columns both have: each epoch's rows lose the
+# columns only it has (`jsonb - text[]` removes keys), then the two are joined FULL on the key. A row only in the new
+# epoch has no `o.key`, one only in the old has no `n.key`; the last column lists the common columns whose JSON values
+# differ. Ordered like `_SELECT_AT_SQL` (spelled again: the statement cannot be composed, hard rule 3), over the key.
+_SELECT_DIFF_SQL = """
+WITH o AS (
+    SELECT r.key, r.row - %s::text[] AS row FROM caverns.epoch_row r
+    WHERE r.epoch = %s AND r.schema_name = %s AND r.table_name = %s
+), n AS (
+    SELECT r.key, r.row - %s::text[] AS row FROM caverns.epoch_row r
+    WHERE r.epoch = %s AND r.schema_name = %s AND r.table_name = %s
+)
+SELECT o.key IS NULL, n.key IS NULL, coalesce(n.key, o.key), o.row, n.row,
+       ARRAY(SELECT k FROM jsonb_object_keys(n.row) AS k WHERE o.row -> k IS DISTINCT FROM n.row -> k)
+FROM o FULL JOIN n ON o.key = n.key
+WHERE o.row IS DISTINCT FROM n.row
+ORDER BY (
+    SELECT array_agg(coalesce(n.key, o.key) -> k ORDER BY p) FROM unnest(%s::text[]) WITH ORDINALITY AS u (k, p)
+)
+"""
 _SELECT_SOURCES_SQL = (
     "SELECT epoch, schema_name, table_name, key, columns, row_count FROM caverns.epoch_source"
     " WHERE epoch = ANY(%s::bigint[]) ORDER BY epoch, schema_name, table_name"
@@ -200,6 +225,59 @@ class TableAt:
     epoch: Epoch
     table: EpochTable
     rows: tuple[dict[str, Any], ...]
+
+
+@dataclass(frozen=True)
+class ColumnChange:
+    """One column that differs between two epochs: added, removed or changed (its type), with the types as printed.
+
+    `old_type` is None for an added column, `new_type` None for a removed one.
+    """
+
+    name: str
+    change: str
+    old_type: str | None
+    new_type: str | None
+
+
+@dataclass(frozen=True)
+class RowChange:
+    """One row in both epochs whose values differ: its key and the changed columns' values at each epoch.
+
+    `old` and `new` hold the same columns, in column order, as JSON holds the values.
+    """
+
+    key: dict[str, Any]
+    old: dict[str, Any]
+    new: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class TableDiff:
+    """One table that differs between two epochs.
+
+    `change` is "added" (only in the new epoch), "removed" (only in the old) or "changed" (in both): the first two
+    list no rows. `key` is the table's key columns; `added` and `removed` are the keys of the rows only in the new
+    and only in the old epoch, each a dict in declared key order; `changed` the rows in both whose values differ.
+    """
+
+    schema: str
+    table: str
+    change: str
+    key: tuple[str, ...]
+    columns: tuple[ColumnChange, ...]
+    added: tuple[dict[str, Any], ...]
+    removed: tuple[dict[str, Any], ...]
+    changed: tuple[RowChange, ...]
+
+
+@dataclass(frozen=True)
+class EpochDiff:
+    """The difference between two epochs: both epochs and the tables that differ, ordered by schema and table."""
+
+    old: Epoch
+    new: Epoch
+    tables: tuple[TableDiff, ...]
 
 
 def _tracked_table(row: Sequence[Any]) -> TrackedTable:
@@ -480,3 +558,107 @@ def as_of(connection: Connection, epoch: str, schema: str, table: str, *, limit:
         stored = [_json(row[0]) for row in cursor.fetchall()]
     rows = tuple({c.name: values.get(c.name) for c in entry.columns} for values in stored)
     return TableAt(found, entry, rows)
+
+
+def _validate_tables(tables: Collection[tuple[str, str]] | None) -> list[tuple[str, str]] | None:
+    """The distinct pairs of *tables*, sorted; None stays None; refuses all but a non-empty collection of pairs."""
+    if tables is None:
+        return None
+    if isinstance(tables, str) or not isinstance(tables, Collection):
+        raise ChangesetError(f"tables must be a collection of (schema, table) pairs, not {tables!r}")
+    if not tables:
+        raise ChangesetError("tables is empty")
+    for pair in tables:
+        if not isinstance(pair, tuple) or len(pair) != 2:
+            raise ChangesetError(f"table {pair!r} is not a (schema, table) pair")
+        _validate_table(*pair)
+    return sorted(set(tables))
+
+
+def _column_changes(old: Sequence[Column], new: Sequence[Column]) -> tuple[ColumnChange, ...]:
+    """The columns removed or of another type (old order), then the columns added (new order)."""
+    old_types = {column.name: column.type for column in old}
+    new_types = {column.name: column.type for column in new}
+    changes = [
+        ColumnChange(c.name, "removed" if c.name not in new_types else "changed", c.type, new_types.get(c.name))
+        for c in old
+        if new_types.get(c.name) != c.type
+    ]
+    changes += [ColumnChange(c.name, "added", None, c.type) for c in new if c.name not in old_types]
+    return tuple(changes)
+
+
+def _table_diff(
+    cursor: Cursor, old: Epoch, new: Epoch, old_table: EpochTable | None, new_table: EpochTable | None
+) -> TableDiff | None:
+    """The difference of one table between *old* and *new*, None when there is none; the table is in at least one."""
+    if old_table is None or new_table is None:
+        present = old_table or new_table
+        assert present is not None  # the caller names only tables of one epoch
+        change = "added" if old_table is None else "removed"
+        return TableDiff(present.schema, present.table, change, present.key, (), (), (), ())
+    schema, table, key = new_table.schema, new_table.table, new_table.key
+    if old_table.key != key:
+        raise EpochRefused(
+            f"the key of {schema}.{table} differs between epochs {old.name!r} ({', '.join(old_table.key)})"
+            f" and {new.name!r} ({', '.join(key)}): leave the table out with tables="
+        )
+    old_names = {column.name for column in old_table.columns}
+    new_names = {column.name for column in new_table.columns}
+    old_only = [c.name for c in old_table.columns if c.name not in new_names]
+    new_only = [c.name for c in new_table.columns if c.name not in old_names]
+    cursor.execute(
+        _SELECT_DIFF_SQL,
+        (old_only, old.epoch, schema, table, new_only, new.epoch, schema, table, list(key)),
+    )
+    added: list[dict[str, Any]] = []
+    removed: list[dict[str, Any]] = []
+    changed: list[RowChange] = []
+    for is_added, is_removed, stored_key, old_row, new_row, differing in cursor.fetchall():
+        values = _json(stored_key)
+        row_key = {name: values.get(name) for name in key}
+        if is_added:
+            added.append(row_key)
+        elif is_removed:
+            removed.append(row_key)
+        else:
+            names = [c.name for c in new_table.columns if c.name in differing]
+            old_values, new_values = _json(old_row), _json(new_row)
+            changed.append(
+                RowChange(row_key, {n: old_values.get(n) for n in names}, {n: new_values.get(n) for n in names})
+            )
+    columns = _column_changes(old_table.columns, new_table.columns)
+    if not (columns or added or removed or changed):
+        return None
+    return TableDiff(schema, table, "changed", key, columns, tuple(added), tuple(removed), tuple(changed))
+
+
+def diff(connection: Connection, old: str, new: str, *, tables: Collection[tuple[str, str]] | None = None) -> EpochDiff:
+    """The rows and columns that differ between the epochs named *old* and *new*, for *tables* (None: every table).
+
+    *tables* is a non-empty collection of `(schema, table)` pairs. A table in one epoch only is reported as added or
+    removed, its rows not listed. A table in both is compared on the columns both epochs have, row by row by its
+    key; a column added, removed or of another type is reported as well. Runs in one read-only transaction and
+    writes nothing. Raises `ChangesetError` for a bad argument, `LedgerNotInstalled` before `install()`,
+    `EpochNotFound` for an unknown epoch or a named table that neither epoch has and `EpochRefused` for a deleted
+    epoch or a table whose key differs between the epochs.
+    """
+    check_connection(connection)
+    validate_name("epoch name", old)
+    validate_name("epoch name", new)
+    named = _validate_tables(tables)
+    with read_only(connection) as cursor:
+        _require_installed(cursor)
+        old_epoch = _find_epoch(cursor, old)
+        new_epoch = _find_epoch(cursor, new)
+        old_tables = {(t.schema, t.table): t for t in old_epoch.tables}
+        new_tables = {(t.schema, t.table): t for t in new_epoch.tables}
+        names = sorted(old_tables.keys() | new_tables.keys()) if named is None else named
+        for schema, table in names:
+            if (schema, table) not in old_tables and (schema, table) not in new_tables:
+                raise EpochNotFound(f"neither epoch {old!r} nor {new!r} has table {schema}.{table}")
+        found = (
+            _table_diff(cursor, old_epoch, new_epoch, old_tables.get(name), new_tables.get(name)) for name in names
+        )
+        differing = tuple(d for d in found if d is not None)
+    return EpochDiff(old_epoch, new_epoch, differing)

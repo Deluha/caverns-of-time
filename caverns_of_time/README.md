@@ -5,7 +5,8 @@
 The importable package. It is generic: nothing here names a consumer or assumes a consumer's schema
 (hard rule 1). It holds the version, the shared exceptions, the console helpers and, so far, four
 components: Nozdormu, the migration ledger, Chromie, the command line, Infinite, the schema fingerprint, and
-Epochs, the snapshots of opted-in tables (so far their registry, the snapshot, the catalog and a table as of an epoch).
+Epochs, the snapshots of opted-in tables (so far their registry, the snapshot, the catalog, a table as of an epoch and the
+difference of two epochs).
 
 ## Files & entry points
 
@@ -19,7 +20,7 @@ Epochs, the snapshots of opted-in tables (so far their registry, the snapshot, t
 | `chromie.py` | Chromie: the `chromie` command's parsing, connection configuration and dispatch (command flow only) |
 | `nozdormu.py` | Nozdormu: the `Step` and `Changeset` model, the checksum, the loaders, the ledger, `install`, `preflight`, `history`, `apply` and `baseline`; it re-exports `Connection`, whose contract lives in `_connection.py` |
 | `infinite.py` | Infinite: `fingerprint` and the `Fingerprint` it returns, `drift` and the `Drift` and `Difference` it returns |
-| `epochs.py` | Epochs: the registry of tracked tables (`register`, `unregister`, `tracked`, `TrackedTable`) in `caverns.epoch_table`, `snapshot`, `catalog`, `as_of` and the `Epoch`, `EpochTable`, `Column` and `TableAt` they return |
+| `epochs.py` | Epochs: the registry of tracked tables (`register`, `unregister`, `tracked`, `TrackedTable`) in `caverns.epoch_table`, `snapshot`, `catalog`, `as_of`, `diff` and the `Epoch`, `EpochTable`, `Column`, `TableAt` and `EpochDiff` (with `TableDiff`, `ColumnChange`, `RowChange`) they return |
 
 ## How it works
 
@@ -210,6 +211,19 @@ then, whatever the live table has become; each row is a dict of the values as JS
 the epoch's `Column.type`). It reads in one read-only transaction and writes nothing. A deleted epoch is refused, and so is a table
 the epoch does not hold (one registered after it was taken included).
 
+**Epochs, diff.** `diff(connection, old, new, *, tables=None)` compares two epochs, by default every table either one
+holds, else the `(schema, table)` pairs of `tables`. A table in one epoch only is reported as added (only in the new
+epoch) or removed (only in the old), its rows not listed. A table in both is compared on the columns both epochs
+have: its rows are matched by the declared key and listed as added or removed (their keys) or changed (the key and
+the old and new values of the columns that differ, in column order); values are compared as JSON holds them, so a
+column whose type changed counts as changed in a row only when its JSON value differs (`int` to `bigint` does not,
+`text` `'7'` to `int` 7 does). A column added, removed or of another type (its two types as `format_type` prints
+them) is reported as a column change, and a row that differs only in an added or a removed column is not a changed
+row. A table whose key differs between the epochs is refused (`EpochRefused`, naming the table): leave it out with
+`tables`. A table that does not differ is left out of the result. It reads in one read-only transaction, writes
+nothing and ignores the live tables; a deleted epoch is refused. Rows come back ordered by the key columns in their
+declared order, as in `as_of`.
+
 **The epoch tables.** Created by the own step `epochs`, all in schema `caverns`:
 
 | Table | Holds | Rule |
@@ -222,7 +236,7 @@ the epoch does not hold (one registered after it was taken included).
 
 Truncating `epoch` or `epoch_source` is also refused by the foreign keys unless it cascades, and then by the
 triggers. `snapshot` writes the catalog, the sources and the rows; nothing writes the tombstones yet: the
-comparison and the deletion of an epoch arrive in the next commits of the phase.
+deletion of an epoch arrives in the next commit of the phase.
 
 **Chromie, the command line.** `chromie` is installed with the `cli` extra
 (`pip install 'caverns-of-time[cli]'`), which brings its driver, psycopg 3; the library itself imports
@@ -276,6 +290,33 @@ id  email            nickname
 ```text
 ℹ️ Showing 20 of 25 rows — --limit 0 shows all.
 ```
+
+`chromie diff OLD NEW [--table SCHEMA.TABLE ...]` compares two epochs row by row (`epochs.diff`). `--table` (repeatable,
+split at the first dot like `as-of`) narrows the comparison to those tables; a named table neither epoch holds is an
+error. The text output is an information line naming both epochs and their ledger versions, then one line per
+difference: `+` added, `-` removed, `~` changed, then its kind (`table`, `column` or `row`) and its name, table by table
+(the table, its columns, then its rows added, removed and changed). A row is named by its table and its key as
+compact JSON values, a changed row followed by the columns that differ, a column of another type by both types. A last
+line counts the lines and the tables. Exit 0 when nothing differs, 1 when anything does, 2 on a usage or environment
+error: an unknown or a deleted epoch, a table neither epoch holds, a table whose key differs between the epochs,
+a ledger that is not installed or a malformed `--table`. `--format json` prints `{"old": {"epoch",
+"ledger_version"}, "new": {...}, "tables": [{"schema", "table", "change", "key": [...], "columns": [{"name",
+"change", "old_type", "new_type"}], "added": [{key}], "removed": [{key}], "changed": [{"key", "old", "new"}]}]}`
+with the same exit codes and no status lines:
+
+```text
+ℹ️ Comparing epoch run-41 (ledger version 9) with run-42 (ledger version 9).
+~  column  public.codes.label: text → character varying(5)
+~  row     public.codes (code="x"): label
+-  column  public.users.tags
++  column  public.users.age
++  row     public.users (id=3)
+-  row     public.users (id=1)
+~  row     public.users (id=2): nickname
+❌ 7 differences in 2 tables.
+```
+
+With nothing found: `✅ No differences between epochs run-41 and run-42.`
 
 `chromie drift [DIRECTORY] [--changeset NAME] [--schema NAME ...]` compares the live schema with the last
 recorded fingerprint (`infinite.drift`). `DIRECTORY` is optional: given, its changeset's applied steps whose
@@ -401,6 +442,19 @@ With nothing found: `✅ No drift — the live schema matches the fingerprint at
   `ChangesetError` for a bad argument (a *limit* that is not a positive integer up to 9223372036854775807 included),
   `LedgerNotInstalled`, `EpochNotFound` (no such epoch, or the epoch lacks the table) and `EpochRefused` (a deleted
   epoch).
+- `epochs.diff(connection, old, new, *, tables=None) -> EpochDiff`: the difference between the epochs named *old* and
+  *new* (the same name is allowed: no difference), in one read-only transaction that writes nothing. *tables* is None
+  (every table of either epoch) or a non-empty collection, never a bare string, of `(schema, table)` pairs of
+  non-empty strings; duplicates collapse. Raises `ChangesetError` for a bad argument, `LedgerNotInstalled`,
+  `EpochNotFound` (an unknown epoch, or a named table neither epoch has) and `EpochRefused` (a deleted epoch, or a
+  table whose key differs between the epochs).
+- `EpochDiff(old, new, tables)`: a frozen dataclass of the two `Epoch` values and a tuple of the `TableDiff` values of
+  the tables that differ, ordered by schema and table (empty: no difference). `TableDiff(schema, table, change, key,
+  columns, added, removed, changed)`: `change` is `added` or `removed` (a table in one epoch only: `columns`, `added`,
+  `removed` and `changed` empty) or `changed`; `key` the key columns; `columns` a tuple of `ColumnChange(name, change,
+  old_type, new_type)` (`change` `added`, `removed` or `changed`; the type the column lacks is None); `added` and
+  `removed` tuples of key dicts in declared key order; `changed` a tuple of `RowChange(key, old, new)`, the dicts of the
+  columns that differ in column order, values as JSON holds them. All frozen.
 - `TableAt(epoch, table, rows)`: a frozen dataclass of the `Epoch`, its `EpochTable` and a tuple of row dicts keyed
   by the epoch's column names in column order, values as JSON holds them.
 - `Epoch(epoch, name, ledger_version, taken_at, taken_by, caverns_version, deleted_at, tables)`: a frozen dataclass;
@@ -409,7 +463,7 @@ With nothing found: `✅ No drift — the live schema matches the fingerprint at
   `Column(name, type)` in column order. All frozen.
 - `TrackedTable(schema, table, key, registered_at, registered_by)`: a frozen dataclass; `key` is a tuple of column names.
 - The public names are `Connection`, `LedgerEntry`, `Status`, `StepStatus`, `Step`, `Changeset`, `Fingerprint`,
-  `Difference`, `Drift`, `TrackedTable`, `Epoch`, `EpochTable`, `Column`, `TableAt` and the functions above; the exceptions, all in `caverns_of_time.errors`, are
+  `Difference`, `Drift`, `TrackedTable`, `Epoch`, `EpochTable`, `Column`, `TableAt`, `EpochDiff`, `TableDiff`, `ColumnChange`, `RowChange` and the functions above; the exceptions, all in `caverns_of_time.errors`, are
   `CavernsError` (the base), `ChangesetError`, `LedgerNotInstalled`, `PreflightRefused`, `StepFailed`,
   `BaselineRefused`, `NoFingerprint`, `EpochRefused` and `EpochNotFound`.
 - The own changeset is never edited once released: a change to the ledger, the fingerprint table or the epoch
