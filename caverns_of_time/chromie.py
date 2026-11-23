@@ -8,6 +8,7 @@ work lives in the component modules. Contract: `caverns_of_time/README.md`.
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
 from collections.abc import Mapping, Sequence
@@ -16,7 +17,7 @@ from datetime import UTC
 from pathlib import Path
 from typing import Protocol
 
-from caverns_of_time import console, infinite, nozdormu
+from caverns_of_time import console, epochs, infinite, nozdormu
 from caverns_of_time.errors import CavernsError
 from caverns_of_time.nozdormu import Connection
 
@@ -56,6 +57,14 @@ def _non_negative_int(text: str) -> int:
     return value
 
 
+def _table_name(text: str) -> tuple[str, str]:
+    """An argparse type: SCHEMA.TABLE split at the first dot, both parts not empty."""
+    schema, _, table = text.partition(".")
+    if not schema or not table:
+        raise argparse.ArgumentTypeError(f"expected SCHEMA.TABLE, got {text!r}")
+    return schema, table
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Build the `chromie` parser; each subcommand sets `handler` with `set_defaults`."""
     parser = argparse.ArgumentParser(
@@ -86,6 +95,16 @@ def build_parser() -> argparse.ArgumentParser:
     drift.add_argument("--changeset", help="the changeset name (default: the directory's name)")
     drift.add_argument("--schema", action="append", help="narrow the report to this schema (repeatable)")
     drift.set_defaults(handler=_drift)
+    as_of = commands.add_parser("as-of", parents=[_common], help="show a table as it was at an epoch")
+    as_of.add_argument("epoch", metavar="EPOCH", help="the epoch name")
+    as_of.add_argument("table", metavar="SCHEMA.TABLE", type=_table_name, help="the table, schema-qualified")
+    as_of.add_argument(
+        "--limit",
+        type=_non_negative_int,
+        default=DEFAULT_LOG_LIMIT,
+        help=f"the most rows to show (0: all; default: {DEFAULT_LOG_LIMIT})",
+    )
+    as_of.set_defaults(handler=_as_of)
     return parser
 
 
@@ -197,6 +216,46 @@ def _drift(args: argparse.Namespace, connection: Connection) -> int:
     else:
         console.success(f"No drift — the live schema matches the fingerprint at ledger version {version}.")
     return code
+
+
+def _cell(value: object) -> str | None:
+    """A value of a snapshotted row as a table cell: None stays None, a string as is, else its compact JSON."""
+    if value is None or isinstance(value, str):
+        return value
+    return json.dumps(value, separators=(",", ":"), ensure_ascii=False)
+
+
+def _as_of(args: argparse.Namespace, connection: Connection) -> int:
+    """`chromie as-of`: a table's rows as they were at an epoch."""
+    schema, table = args.table
+    at = epochs.as_of(connection, args.epoch, schema, table, limit=args.limit or None)
+    taken_at, columns, row_count = at.epoch.taken_at, at.table.columns, at.table.row_count
+    if args.format == "json":
+        console.emit_json(
+            {
+                "epoch": at.epoch.name,
+                "ledger_version": at.epoch.ledger_version,
+                "taken_at": taken_at.isoformat(),
+                "schema": schema,
+                "table": table,
+                "key": list(at.table.key),
+                "columns": [asdict(column) for column in columns],
+                "row_count": row_count,
+                "rows": list(at.rows),
+            }
+        )
+        return EXIT_OK
+    taken = taken_at.astimezone(UTC).strftime(_TIME_FORMAT)
+    counted = f"{row_count} row" if row_count == 1 else f"{row_count} rows"
+    console.info(
+        f"{schema}.{table} at epoch {at.epoch.name} (ledger version {at.epoch.ledger_version}, taken {taken} UTC):"
+        f" {counted}, key ({', '.join(at.table.key)})."
+    )
+    if at.rows:
+        console.table([c.name for c in columns], [[_cell(row[c.name]) for c in columns] for row in at.rows])
+    if len(at.rows) < row_count:
+        console.info(f"Showing {len(at.rows)} of {row_count} rows — --limit 0 shows all.")
+    return EXIT_OK
 
 
 def main(argv: Sequence[str] | None = None) -> int:

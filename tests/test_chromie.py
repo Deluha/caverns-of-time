@@ -1,4 +1,4 @@
-"""Chromie: connection-string resolution, the parser, the `log` and `status` commands and the console helpers."""
+"""Chromie: connection-string resolution, the parser, the `log`, `status`, `drift` and `as-of` commands, the console."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ from typing import Any
 
 import pytest
 
-from caverns_of_time import chromie, console, nozdormu
+from caverns_of_time import chromie, console, epochs, nozdormu
 from caverns_of_time.nozdormu import Changeset
 
 # --- resolve_dsn -------------------------------------------------------------------------
@@ -490,3 +490,168 @@ def test_drift_of_an_unwatched_schema_is_a_usage_error(
     _installed_and_applied(ledger_conn, _changeset_directory(tmp_path))
     code, _, err = _run(capsys, "drift", "--dsn", db_dsn, "--schema", "caverns")
     assert code == chromie.EXIT_USAGE and "'caverns' is not watched" in err
+
+
+# --- as-of -----------------------------------------------------------------------------------
+
+USERS = "CREATE TABLE nozdormu_test.users (id int PRIMARY KEY, email text, nickname text, active boolean, tags jsonb)"
+TAKEN = r"taken \d{4}-\d\d-\d\d \d\d:\d\d:\d\d UTC"
+
+
+def _epoch_of(conn: Any, *statements: str, name: str = "run-42") -> epochs.Epoch:
+    """Caverns installed, nozdormu_test.users created, filled by *statements* and snapshotted as epoch *name*."""
+    nozdormu.install(conn)
+    with conn.cursor() as cursor:
+        for statement in ("CREATE SCHEMA nozdormu_test", USERS, *statements):
+            cursor.execute(statement)
+    conn.commit()
+    epochs.register(conn, "nozdormu_test", "users")
+    return epochs.snapshot(conn, name)
+
+
+def test_as_of_prints_the_header_and_the_table(
+    ledger_conn: Any, db_dsn: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    taken = _epoch_of(
+        ledger_conn,
+        "INSERT INTO nozdormu_test.users VALUES (10, 'bob@example.org', NULL, false, '{\"a\": 1}'),"
+        " (2, 'ann@example.org', 'annie', true, '[1, \"x\"]')",
+    )
+    code, out, err = _run(capsys, "as-of", "run-42", "nozdormu_test.users", "--dsn", db_dsn)
+    assert (code, err) == (0, "")
+    header, *lines = out.splitlines()
+    assert re.fullmatch(
+        rf"ℹ️ nozdormu_test\.users at epoch run-42 \(ledger version {taken.ledger_version}, {TAKEN}\):"
+        r" 2 rows, key \(id\)\.",
+        header,
+    )
+    assert [line.split() for line in lines] == [
+        ["id", "email", "nickname", "active", "tags"],
+        ["2", "ann@example.org", "annie", "true", '[1,"x"]'],
+        ["10", "bob@example.org", "-", "false", '{"a":1}'],
+    ]
+
+
+def test_as_of_says_one_row_in_the_singular_and_prints_no_table_for_none(
+    ledger_conn: Any, db_dsn: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _epoch_of(ledger_conn, "INSERT INTO nozdormu_test.users (id) VALUES (1)")
+    _, out, _ = _run(capsys, "as-of", "run-42", "nozdormu_test.users", "--dsn", db_dsn)
+    assert out.splitlines()[0].endswith("): 1 row, key (id).")
+    assert out.splitlines()[2].split() == ["1", "-", "-", "-", "-"]
+    with ledger_conn.cursor() as cursor:
+        cursor.execute("DELETE FROM nozdormu_test.users")
+    ledger_conn.commit()
+    epochs.snapshot(ledger_conn, "empty")
+    code, out, _ = _run(capsys, "as-of", "empty", "nozdormu_test.users", "--dsn", db_dsn)
+    assert code == 0 and len(out.splitlines()) == 1 and out.endswith("): 0 rows, key (id).\n")
+
+
+def test_as_of_limits_to_twenty_rows_by_default_and_says_so(
+    ledger_conn: Any, db_dsn: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _epoch_of(ledger_conn, "INSERT INTO nozdormu_test.users (id) SELECT generate_series(1, 25)")
+    code, out, _ = _run(capsys, "as-of", "run-42", "nozdormu_test.users", "--dsn", db_dsn)
+    lines = out.splitlines()
+    assert code == 0 and lines[0].endswith("): 25 rows, key (id).")
+    assert [line.split()[0] for line in lines[2:-1]] == [str(i) for i in range(1, 21)]
+    assert lines[-1] == "ℹ️ Showing 20 of 25 rows — --limit 0 shows all."
+    _, out, _ = _run(capsys, "as-of", "run-42", "nozdormu_test.users", "--dsn", db_dsn, "--limit", "0")
+    assert len(out.splitlines()) == 2 + 25 and "Showing" not in out
+    _, out, _ = _run(capsys, "as-of", "run-42", "nozdormu_test.users", "--dsn", db_dsn, "--limit", "3")
+    assert out.splitlines()[-1] == "ℹ️ Showing 3 of 25 rows — --limit 0 shows all."
+
+
+def test_as_of_json_shape(ledger_conn: Any, db_dsn: str, capsys: pytest.CaptureFixture[str]) -> None:
+    taken = _epoch_of(
+        ledger_conn,
+        "INSERT INTO nozdormu_test.users VALUES (2, 'ann@example.org', NULL, true, '{\"a\": [1]}'),"
+        " (1, 'x', 'y', NULL, NULL)",
+    )
+    code, out, err = _run(capsys, "as-of", "run-42", "nozdormu_test.users", "--dsn", db_dsn, "--format", "json")
+    assert (code, err) == (0, "")
+    assert json.loads(out) == {
+        "epoch": "run-42",
+        "ledger_version": taken.ledger_version,
+        "taken_at": taken.taken_at.isoformat(),
+        "schema": "nozdormu_test",
+        "table": "users",
+        "key": ["id"],
+        "columns": [
+            {"name": "id", "type": "integer"},
+            {"name": "email", "type": "text"},
+            {"name": "nickname", "type": "text"},
+            {"name": "active", "type": "boolean"},
+            {"name": "tags", "type": "jsonb"},
+        ],
+        "row_count": 2,
+        "rows": [
+            {"id": 1, "email": "x", "nickname": "y", "active": None, "tags": None},
+            {"id": 2, "email": "ann@example.org", "nickname": None, "active": True, "tags": {"a": [1]}},
+        ],
+    }
+    _, out, _ = _run(
+        capsys, "as-of", "run-42", "nozdormu_test.users", "--dsn", db_dsn, "--format", "json", "--limit", "1"
+    )
+    parsed = json.loads(out)
+    assert (parsed["row_count"], len(parsed["rows"])) == (2, 1)
+
+
+@pytest.mark.parametrize(
+    ("argv", "message"),
+    [
+        (("nope", "nozdormu_test.users"), "no epoch is named 'nope'"),
+        (("run-42", "nozdormu_test.other"), "epoch 'run-42' has no table nozdormu_test.other"),
+        (("run-42", "a.b.c"), "epoch 'run-42' has no table a.b.c"),
+    ],
+)
+def test_as_of_of_an_unknown_epoch_or_a_missing_table_is_a_usage_error(
+    ledger_conn: Any, db_dsn: str, capsys: pytest.CaptureFixture[str], argv: tuple[str, ...], message: str
+) -> None:
+    _epoch_of(ledger_conn)
+    code, out, err = _run(capsys, "as-of", *argv, "--dsn", db_dsn)
+    assert (code, out, err) == (chromie.EXIT_USAGE, "", f"❌ {message}\n")
+
+
+def test_as_of_of_a_deleted_epoch_is_a_usage_error(
+    ledger_conn: Any, db_dsn: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    taken = _epoch_of(ledger_conn)
+    with ledger_conn.cursor() as cursor:
+        cursor.execute(
+            "INSERT INTO caverns.epoch_deletion (epoch, caverns_version) VALUES (%s, 'test')", (taken.epoch,)
+        )
+    ledger_conn.commit()
+    code, out, err = _run(capsys, "as-of", "run-42", "nozdormu_test.users", "--dsn", db_dsn)
+    assert (code, out) == (chromie.EXIT_USAGE, "")
+    assert re.fullmatch(r"❌ epoch 'run-42' was deleted at \d{4}-\d\d-\d\d \d\d:\d\d:\d\d UTC\n", err)
+
+
+def test_as_of_without_an_installed_ledger_is_a_usage_error(
+    ledger_conn: Any, db_dsn: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    code, out, err = _run(capsys, "as-of", "run-42", "public.users", "--dsn", db_dsn)
+    assert (code, out) == (chromie.EXIT_USAGE, "")
+    assert "call install()" in err
+
+
+@pytest.mark.parametrize("table", ["public", ".users", "public.", "."])
+def test_as_of_refuses_a_table_that_is_not_schema_dot_table(table: str, capsys: pytest.CaptureFixture[str]) -> None:
+    with pytest.raises(SystemExit) as raised:
+        chromie.main(["as-of", "run-42", table])
+    assert raised.value.code == chromie.EXIT_USAGE
+    assert f"expected SCHEMA.TABLE, got {table!r}" in capsys.readouterr().err
+
+
+def test_as_of_splits_the_table_at_the_first_dot() -> None:
+    args = chromie.build_parser().parse_args(["as-of", "e", "s.a.b"])
+    assert args.table == ("s", "a.b")
+    assert (args.epoch, args.limit) == ("e", chromie.DEFAULT_LOG_LIMIT)
+
+
+def test_as_of_refuses_a_bad_limit(capsys: pytest.CaptureFixture[str]) -> None:
+    for limit in ("-1", "many"):
+        with pytest.raises(SystemExit) as raised:
+            chromie.main(["as-of", "e", "s.t", "--limit", limit])
+        assert raised.value.code == chromie.EXIT_USAGE
+    assert "--limit" in capsys.readouterr().err

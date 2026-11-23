@@ -16,14 +16,16 @@ from caverns_of_time.epochs import (
     Column,
     Epoch,
     EpochTable,
+    TableAt,
     TrackedTable,
+    as_of,
     catalog,
     register,
     snapshot,
     tracked,
     unregister,
 )
-from caverns_of_time.errors import CavernsError, ChangesetError, EpochRefused, LedgerNotInstalled
+from caverns_of_time.errors import CavernsError, ChangesetError, EpochNotFound, EpochRefused, LedgerNotInstalled
 from caverns_of_time.nozdormu import Changeset, install, preflight
 from tests.test_nozdormu_ledger import WAIT_SECONDS, _wait_for_a_waiting_lock
 
@@ -430,6 +432,7 @@ CALLS: dict[str, Callable[[Any], object]] = {
     "tracked": tracked,
     "snapshot": lambda conn: snapshot(conn, "e"),
     "catalog": catalog,
+    "as_of": lambda conn: as_of(conn, "e", SCHEMA, "one"),
 }
 
 
@@ -810,4 +813,166 @@ def test_catalog_refuses_an_invalid_limit(ledger_conn: Any, limit: Any) -> None:
     install(ledger_conn)
     with pytest.raises(ChangesetError, match="limit must be a positive integer up to 9223372036854775807"):
         catalog(ledger_conn, limit=limit)
+    _assert_idle(ledger_conn)
+
+
+# --- as_of ----------------------------------------------------------------------------------
+
+ONE_ROWS = f"INSERT INTO {SCHEMA}.one VALUES (10, 'ten'), (2, 'two'), (1, NULL)"
+
+
+def _taken_one(conn: Any, *statements: str) -> Epoch:
+    """Caverns installed, `one` holding the rows of ONE_ROWS (and *statements*) registered and snapshotted."""
+    _installed_with_tables(conn, ONE, ONE_ROWS, *statements)
+    register(conn, SCHEMA, "one")
+    return snapshot(conn, "first")
+
+
+def test_as_of_returns_the_epoch_the_table_and_the_rows_ordered_by_an_integer_key(ledger_conn: Any) -> None:
+    taken = _taken_one(ledger_conn)
+    at = as_of(ledger_conn, "first", SCHEMA, "one")
+    _assert_idle(ledger_conn)
+    assert isinstance(at, TableAt)
+    assert at.epoch == taken and at.table == taken.tables[0]
+    assert at.rows == (
+        {"id": 1, "name": None},
+        {"id": 2, "name": "two"},
+        {"id": 10, "name": "ten"},
+    )  # numeric order: 2 before 10
+    assert isinstance(at.rows, tuple) and all(list(row) == ["id", "name"] for row in at.rows)
+
+
+def test_as_of_orders_a_composite_key_by_its_declared_order(ledger_conn: Any) -> None:
+    _installed_with_tables(
+        ledger_conn,
+        TWO,
+        f"INSERT INTO {SCHEMA}.two VALUES (1, 'q', 1), (2, 'p', 2), (1, 'p', 3), (10, 'a', 4), (3, 'a', 5)",
+    )
+    register(ledger_conn, SCHEMA, "two")  # the primary key (b, a): b first, then a
+    snapshot(ledger_conn, "first")
+    at = as_of(ledger_conn, "first", SCHEMA, "two")
+    assert [(r["b"], r["a"]) for r in at.rows] == [("a", 3), ("a", 10), ("p", 1), ("p", 2), ("q", 1)]
+    assert list(at.rows[0]) == ["a", "b", "c"]  # the columns' order, not the key's
+
+
+def test_as_of_limit_keeps_the_first_rows_by_key(ledger_conn: Any) -> None:
+    _taken_one(ledger_conn)
+    assert [r["id"] for r in as_of(ledger_conn, "first", SCHEMA, "one", limit=2).rows] == [1, 2]
+    at = as_of(ledger_conn, "first", SCHEMA, "one", limit=5)
+    assert [r["id"] for r in at.rows] == [1, 2, 10]
+    assert at.table.row_count == 3
+    assert len(as_of(ledger_conn, "first", SCHEMA, "one", limit=2**63 - 1).rows) == 3
+
+
+def test_as_of_an_empty_table_has_no_rows(ledger_conn: Any) -> None:
+    _installed_with_tables(ledger_conn, ONE)
+    register(ledger_conn, SCHEMA, "one")
+    snapshot(ledger_conn, "empty")
+    at = as_of(ledger_conn, "empty", SCHEMA, "one")
+    assert at.rows == () and at.table.row_count == 0
+
+
+def test_as_of_shows_the_epochs_columns_not_the_live_ones(ledger_conn: Any) -> None:
+    _taken_one(ledger_conn)
+    _execute(
+        ledger_conn,
+        f"ALTER TABLE {SCHEMA}.one DROP COLUMN name",
+        f"ALTER TABLE {SCHEMA}.one ADD COLUMN extra int DEFAULT 7",
+        f"INSERT INTO {SCHEMA}.one VALUES (99, 5)",
+    )
+    at = as_of(ledger_conn, "first", SCHEMA, "one")
+    assert [c.name for c in at.table.columns] == ["id", "name"]
+    assert at.rows == ({"id": 1, "name": None}, {"id": 2, "name": "two"}, {"id": 10, "name": "ten"})
+
+
+def test_as_of_decodes_every_kind_of_value(ledger_conn: Any) -> None:
+    _installed_with_tables(
+        ledger_conn,
+        f"CREATE TABLE {SCHEMA}.kinds (id int PRIMARY KEY, txt text, n text, b boolean, d numeric(8, 2),"
+        " ts timestamptz, j jsonb, a int[], o jsonb)",
+        f"INSERT INTO {SCHEMA}.kinds VALUES (1, 'it''s', NULL, true, 1.50, '2026-11-22 17:06:45+00',"
+        " '{\"a\": [1, {\"b\": null}]}', '{1,2}', 'null')",
+    )
+    register(ledger_conn, SCHEMA, "kinds")
+    snapshot(ledger_conn, "kinds")
+    (row,) = as_of(ledger_conn, "kinds", SCHEMA, "kinds").rows
+    assert row == {
+        "id": 1,
+        "txt": "it's",
+        "n": None,
+        "b": True,
+        "d": 1.5,
+        "ts": "2026-11-22T17:06:45+00:00",
+        "j": {"a": [1, {"b": None}]},
+        "a": [1, 2],
+        "o": None,
+    }
+    assert [type(row[name]) for name in ("b", "d", "a")] == [bool, float, list]
+
+
+def test_as_of_writes_nothing_and_ends_its_transaction(ledger_conn: Any) -> None:
+    _taken_one(ledger_conn)
+    before = [_query(ledger_conn, f"SELECT count(*) FROM caverns.{t}") for t in EPOCH_TABLES]
+    as_of(ledger_conn, "first", SCHEMA, "one")
+    assert [_query(ledger_conn, f"SELECT count(*) FROM caverns.{t}") for t in EPOCH_TABLES] == before
+    assert _query(ledger_conn, ADVISORY_LOCKS) == [(0,)]
+    _assert_idle(ledger_conn)
+
+
+def test_as_of_refuses_an_unknown_epoch(ledger_conn: Any) -> None:
+    _taken_one(ledger_conn)
+    with pytest.raises(EpochNotFound, match="no epoch is named 'nope'"):
+        as_of(ledger_conn, "nope", SCHEMA, "one")
+    _assert_idle(ledger_conn)
+
+
+def test_as_of_refuses_a_table_the_epoch_lacks(ledger_conn: Any) -> None:
+    _installed_with_tables(ledger_conn, ONE, TWO)
+    register(ledger_conn, SCHEMA, "one")
+    snapshot(ledger_conn, "first")
+    register(ledger_conn, SCHEMA, "two")  # registered after the epoch was taken
+    for schema, table in ((SCHEMA, "two"), (SCHEMA, "missing"), ("other", "one"), (SCHEMA, "ONE")):
+        with pytest.raises(EpochNotFound, match=rf"epoch 'first' has no table {schema}\.{table}"):
+            as_of(ledger_conn, "first", schema, table)
+        _assert_idle(ledger_conn)
+    assert as_of(ledger_conn, "first", SCHEMA, "one").rows == ()
+
+
+def test_as_of_refuses_a_deleted_epoch(ledger_conn: Any) -> None:
+    taken = _taken_one(ledger_conn)
+    _execute(ledger_conn, INSERT_TOMBSTONE.replace(EPOCH_ID, str(taken.epoch)))
+    (deleted_at,) = _query(
+        ledger_conn,
+        "SELECT to_char(deleted_at AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS') FROM caverns.epoch_deletion",
+    )[0]
+    with pytest.raises(EpochRefused, match=rf"epoch 'first' was deleted at {deleted_at} UTC$"):
+        as_of(ledger_conn, "first", SCHEMA, "one")
+    _assert_idle(ledger_conn)
+
+
+@pytest.mark.parametrize(
+    ("arguments", "message"),
+    [
+        (("", SCHEMA, "one"), "epoch name is empty"),
+        ((" x", SCHEMA, "one"), "surrounding whitespace"),
+        ((None, SCHEMA, "one"), "epoch name None is not a string"),
+        (("first", "", "one"), "schema is empty"),
+        (("first", SCHEMA, ""), "table is empty"),
+        (("first", None, "one"), "schema None is not a string"),
+        (("first", SCHEMA, 3), "table 3 is not a string"),
+    ],
+)
+def test_as_of_refuses_bad_names_before_asking_the_database(
+    ledger_conn: Any, arguments: tuple[Any, ...], message: str
+) -> None:
+    with pytest.raises(ChangesetError, match=message):
+        as_of(ledger_conn, *arguments)
+    _assert_idle(ledger_conn)
+
+
+@pytest.mark.parametrize("limit", [0, -1, True, False, "x", 1.5, 2**63])
+def test_as_of_refuses_an_invalid_limit(ledger_conn: Any, limit: Any) -> None:
+    _taken_one(ledger_conn)
+    with pytest.raises(ChangesetError, match="limit must be a positive integer up to 9223372036854775807"):
+        as_of(ledger_conn, "first", SCHEMA, "one", limit=limit)
     _assert_idle(ledger_conn)
