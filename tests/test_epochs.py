@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import threading
 from collections.abc import Callable
+from dataclasses import replace
 from typing import Any
 
 import psycopg
@@ -24,6 +25,7 @@ from caverns_of_time.epochs import (
     TrackedTable,
     as_of,
     catalog,
+    delete,
     diff,
     register,
     snapshot,
@@ -439,6 +441,7 @@ CALLS: dict[str, Callable[[Any], object]] = {
     "catalog": catalog,
     "as_of": lambda conn: as_of(conn, "e", SCHEMA, "one"),
     "diff": lambda conn: diff(conn, "e", "f"),
+    "delete": lambda conn: delete(conn, ["e"]),
 }
 
 
@@ -1329,3 +1332,107 @@ def test_diff_writes_nothing_and_ends_its_transaction(ledger_conn: Any) -> None:
     assert [_query(ledger_conn, f"SELECT count(*) FROM caverns.{t}") for t in EPOCH_TABLES] == before
     assert _query(ledger_conn, ADVISORY_LOCKS) == [(0,)]
     _assert_idle(ledger_conn)
+
+
+# --- delete ---------------------------------------------------------------------------------
+
+ROW_COUNTS = "SELECT epoch, count(*) FROM caverns.epoch_row GROUP BY epoch ORDER BY epoch"
+
+
+def _three_epochs(conn: Any) -> list[Epoch]:
+    """`one` holding three rows, snapshotted as a, b and c (each with its own rows)."""
+    _installed_with_tables(conn, ONE, ONE_ROWS)
+    register(conn, SCHEMA, "one")
+    return [snapshot(conn, name) for name in ("a", "b", "c")]
+
+
+def test_delete_writes_the_tombstone_removes_only_its_rows_and_keeps_the_catalog(ledger_conn: Any) -> None:
+    a, b, c = _three_epochs(ledger_conn)
+    (deleted,) = delete(ledger_conn, ["b"])
+    assert deleted.name == "b"
+    assert deleted.deleted_at is not None
+    assert deleted.tables == b.tables
+    assert replace(deleted, deleted_at=None) == b
+    assert _query(ledger_conn, "SELECT epoch, caverns_version FROM caverns.epoch_deletion") == [(b.epoch, __version__)]
+    assert _query(ledger_conn, ROW_COUNTS) == [(a.epoch, 3), (c.epoch, 3)]
+    assert _query(ledger_conn, "SELECT count(*) FROM caverns.epoch") == [(3,)]
+    assert _query(ledger_conn, "SELECT count(*) FROM caverns.epoch_source") == [(3,)]
+    assert _query(ledger_conn, ADVISORY_LOCKS) == [(0,)]
+    _assert_idle(ledger_conn)
+    assert [(e.name, e.deleted_at is not None) for e in catalog(ledger_conn)] == [
+        ("c", False),
+        ("b", True),
+        ("a", False),
+    ]
+
+
+def test_a_deleted_epoch_is_refused_by_as_of_and_diff_and_its_name_stays_taken(ledger_conn: Any) -> None:
+    _three_epochs(ledger_conn)
+    delete(ledger_conn, ["b"])
+    with pytest.raises(EpochRefused, match="epoch 'b' was deleted at"):
+        as_of(ledger_conn, "b", SCHEMA, "one")
+    with pytest.raises(EpochRefused, match="epoch 'b' was deleted at"):
+        diff(ledger_conn, "a", "b")
+    with pytest.raises(EpochRefused, match="is taken"):
+        snapshot(ledger_conn, "b")
+    assert as_of(ledger_conn, "a", SCHEMA, "one").rows != ()
+
+
+def test_delete_takes_several_names_and_returns_them_newest_first(
+    ledger_conn: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    a, b, c = _three_epochs(ledger_conn)
+    with caplog.at_level(logging.INFO, logger=epochs.__name__):
+        deleted = delete(ledger_conn, ("a", "c", "a"))
+    assert [e.name for e in deleted] == ["c", "a"]
+    assert all(e.deleted_at is not None for e in deleted)
+    assert [r.getMessage() for r in caplog.records] == [
+        "deleted epoch c: 3 rows in 1 tables",
+        "deleted epoch a: 3 rows in 1 tables",
+    ]
+    assert _query(ledger_conn, ROW_COUNTS) == [(b.epoch, 3)]
+    assert a.epoch < b.epoch < c.epoch
+
+
+@pytest.mark.parametrize("bad", ["nope", "c"])
+def test_delete_with_a_bad_name_among_good_ones_deletes_nothing(ledger_conn: Any, bad: str) -> None:
+    _three_epochs(ledger_conn)
+    delete(ledger_conn, ["c"])
+    kept = _query(ledger_conn, ROW_COUNTS)
+    error = EpochNotFound if bad == "nope" else EpochRefused
+    with pytest.raises(error, match=bad):
+        delete(ledger_conn, ["a", bad])
+    assert _query(ledger_conn, ROW_COUNTS) == kept
+    assert _query(ledger_conn, "SELECT count(*) FROM caverns.epoch_deletion") == [(1,)]
+    assert _query(ledger_conn, ADVISORY_LOCKS) == [(0,)]
+    _assert_idle(ledger_conn)
+
+
+@pytest.mark.parametrize(
+    ("names", "message"),
+    [
+        ("a", "not the string 'a'"),
+        (None, "not None"),
+        ([], "names is empty"),
+        (["a", ""], "epoch name is empty"),
+        (["a", " b"], "surrounding whitespace"),
+        (["a", 3], "epoch name 3 is not a string"),
+    ],
+)
+def test_delete_refuses_bad_names_and_deletes_nothing(ledger_conn: Any, names: Any, message: str) -> None:
+    with pytest.raises(ChangesetError, match=message):  # refused before the database is asked
+        delete(ledger_conn, names)
+    _assert_idle(ledger_conn)
+    _three_epochs(ledger_conn)
+    kept = _query(ledger_conn, ROW_COUNTS)
+    with pytest.raises(ChangesetError, match=message):
+        delete(ledger_conn, names)
+    assert _query(ledger_conn, ROW_COUNTS) == kept
+    assert _query(ledger_conn, "SELECT count(*) FROM caverns.epoch_deletion") == [(0,)]
+
+
+def test_delete_refuses_a_direct_delete_of_another_epochs_rows_afterwards(ledger_conn: Any) -> None:
+    a, _, _ = _three_epochs(ledger_conn)
+    delete(ledger_conn, ["b"])
+    _refused(ledger_conn, f"DELETE FROM caverns.epoch_row WHERE epoch = {a.epoch}", "keeps an epoch's rows")
+    assert _query(ledger_conn, f"SELECT count(*) FROM caverns.epoch_row WHERE epoch = {a.epoch}") == [(3,)]

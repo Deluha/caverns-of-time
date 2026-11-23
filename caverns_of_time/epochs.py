@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
-from caverns_of_time import __version__
+from caverns_of_time import __version__, _connection
 from caverns_of_time._connection import (
     Connection,
     Cursor,
@@ -43,6 +43,7 @@ __all__ = [
     "TrackedTable",
     "as_of",
     "catalog",
+    "delete",
     "diff",
     "register",
     "snapshot",
@@ -161,6 +162,9 @@ ORDER BY (
     SELECT array_agg(coalesce(n.key, o.key) -> k ORDER BY p) FROM unnest(%s::text[]) WITH ORDINALITY AS u (k, p)
 )
 """
+# The tombstone first: the trigger of `epoch_row` allows the DELETE only for an epoch that has one.
+_INSERT_TOMBSTONE_SQL = "INSERT INTO caverns.epoch_deletion (epoch, caverns_version) VALUES (%s, %s)"
+_DELETE_ROWS_SQL = "DELETE FROM caverns.epoch_row WHERE epoch = %s"
 _SELECT_SOURCES_SQL = (
     "SELECT epoch, schema_name, table_name, key, columns, row_count FROM caverns.epoch_source"
     " WHERE epoch = ANY(%s::bigint[]) ORDER BY epoch, schema_name, table_name"
@@ -662,3 +666,43 @@ def diff(connection: Connection, old: str, new: str, *, tables: Collection[tuple
         )
         differing = tuple(d for d in found if d is not None)
     return EpochDiff(old_epoch, new_epoch, differing)
+
+
+def delete(connection: Connection, names: Collection[str]) -> list[Epoch]:
+    """Delete the epochs called *names*: a tombstone in `caverns.epoch_deletion`, then their `epoch_row` rows.
+
+    The catalog row and the sources stay, and the name stays taken for good. It is all or nothing: every name is
+    resolved before anything is written, in one transaction under Caverns' advisory lock, so one bad name deletes
+    nothing. Returns the deleted epochs as read back (`deleted_at` set), newest first. Raises `ChangesetError`
+    for *names* that is not a non-empty collection of valid names (a bare string or None included),
+    `LedgerNotInstalled` before `install()`, `EpochNotFound` for an unknown epoch and `EpochRefused` for an epoch
+    that is already deleted.
+    """
+    check_connection(connection)
+    wanted = _connection.names("names", names)
+    if not wanted:
+        raise ChangesetError("names is empty")
+    for name in wanted:
+        validate_name("epoch name", name)
+    with transaction(connection) as cursor:
+        lock(cursor)
+        _require_installed(cursor)
+        found = sorted((_find_epoch(cursor, name) for name in wanted), key=lambda e: e.epoch, reverse=True)
+        for epoch in found:
+            cursor.execute(_INSERT_TOMBSTONE_SQL, (epoch.epoch, __version__))
+            cursor.execute(_DELETE_ROWS_SQL, (epoch.epoch,))
+        rows: list[Sequence[Any]] = []
+        for epoch in found:
+            cursor.execute(_SELECT_EPOCH_SQL, (epoch.name,))
+            row = cursor.fetchone()
+            assert row is not None  # the epoch was found above and a catalog row is never deleted
+            rows.append(row)
+        deleted = _read_epochs(cursor, rows)
+    for epoch in deleted:
+        _log.info(
+            "deleted epoch %s: %s rows in %s tables",
+            epoch.name,
+            sum(table.row_count for table in epoch.tables),
+            len(epoch.tables),
+        )
+    return deleted

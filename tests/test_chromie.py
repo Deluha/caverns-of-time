@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import io
 import json
 import re
 import sys
@@ -86,6 +87,30 @@ def test_emit_json_round_trips(capsys: pytest.CaptureFixture[str]) -> None:
     out = capsys.readouterr().out
     assert out.endswith("\n")
     assert json.loads(out) == value
+
+
+@pytest.mark.parametrize("answer", ["y\n", "YES\n", " Yes \n", "y"])
+def test_confirm_is_true_for_y_and_yes(
+    answer: str, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(sys, "stdin", io.StringIO(answer))
+    assert console.confirm("Go on?") is True
+    assert capsys.readouterr().err == "Go on? [y/N] "
+
+
+@pytest.mark.parametrize("answer", ["n\n", "no\n", "\n", "", "yep\n", "maybe\n"])
+def test_confirm_is_false_for_anything_else_and_for_end_of_input(
+    answer: str, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(sys, "stdin", io.StringIO(answer))
+    assert console.confirm("Go on?") is False
+    captured = capsys.readouterr()
+    assert (captured.out, captured.err) == ("", "Go on? [y/N] ")
+
+
+def test_interactive_follows_stdin_being_a_terminal(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(sys, "stdin", io.StringIO(""))
+    assert console.interactive() is False
 
 
 # --- log and status ------------------------------------------------------------------------
@@ -873,3 +898,228 @@ def test_diff_without_an_installed_ledger_is_a_usage_error(
     code, out, err = _run(capsys, "diff", "run-1", "run-2", "--dsn", db_dsn)
     assert (code, out) == (chromie.EXIT_USAGE, "")
     assert "call install()" in err
+
+
+# --- epochs and delete-epoch -----------------------------------------------------------------
+
+EPOCH_HEADERS = ["EPOCH", "NAME", "LEDGER", "TAKEN_AT", "(UTC)", "BY", "TABLES", "ROWS", "DELETED", "(UTC)"]
+USER_ROWS = (
+    "INSERT INTO nozdormu_test.users VALUES (1, 'ann@example.org', NULL, true, NULL),"
+    " (2, 'bob@example.org', 'bobby', true, '[1]')"
+)
+
+
+def _three_epochs_of_users(conn: Any) -> list[epochs.Epoch]:
+    """`users` with two rows snapshotted as run-1, run-2 and run-3."""
+    first = _epoch_of(conn, USER_ROWS, name="run-1")
+    return [first, *(epochs.snapshot(conn, name) for name in ("run-2", "run-3"))]
+
+
+def _kept_rows(conn: Any) -> list[tuple[str, int]]:
+    """(epoch name, rows kept) for every epoch."""
+    with conn.cursor() as cursor:
+        cursor.execute(
+            "SELECT e.name, count(r.epoch) FROM caverns.epoch e LEFT JOIN caverns.epoch_row r ON r.epoch = e.epoch"
+            " GROUP BY e.name ORDER BY e.name"
+        )
+        rows = [(name, count) for name, count in cursor.fetchall()]
+    conn.commit()
+    return rows
+
+
+def _token_ends(line: str) -> list[int]:
+    return [match.end() for match in re.finditer(r"\S+", line)]
+
+
+def test_epochs_prints_the_epochs_newest_first_with_a_dash_for_a_live_one(
+    ledger_conn: Any, db_dsn: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    run1, run2, run3 = _three_epochs_of_users(ledger_conn)
+    epochs.delete(ledger_conn, ["run-2"])
+    code, out, err = _run(capsys, "epochs", "--dsn", db_dsn)
+    assert (code, err) == (0, "")
+    header, *lines = out.splitlines()
+    assert header.split() == EPOCH_HEADERS
+    rows = [line.split() for line in lines]
+    assert [r[:3] for r in rows] == [[str(e.epoch), e.name, str(e.ledger_version)] for e in (run3, run2, run1)]
+    assert [r[6:8] for r in rows] == [["1", "2"]] * 3  # tables, rows
+    assert [r[8:] for r in (rows[0], rows[2])] == [["-"], ["-"]]
+    assert re.fullmatch(r"\d{4}-\d\d-\d\d \d\d:\d\d:\d\d", " ".join(rows[1][8:]))
+    ends = _token_ends(header)
+    for line in lines:  # EPOCH, LEDGER, TABLES and ROWS are right-aligned under their headers
+        assert [_token_ends(line)[i] for i in (0, 2, 6, 7)] == [ends[i] for i in (0, 2, 6, 7)]
+
+
+def test_epochs_json_shape(ledger_conn: Any, db_dsn: str, capsys: pytest.CaptureFixture[str]) -> None:
+    _epoch_of(ledger_conn, USER_ROWS, name="run-1")
+    run2 = epochs.snapshot(ledger_conn, "run-2")
+    (deleted,) = epochs.delete(ledger_conn, ["run-1"])
+    code, out, err = _run(capsys, "epochs", "--dsn", db_dsn, "--format", "json")
+    assert (code, err) == (0, "")
+    newest, oldest = json.loads(out)
+    assert newest == {
+        "epoch": run2.epoch,
+        "name": "run-2",
+        "ledger_version": run2.ledger_version,
+        "taken_at": run2.taken_at.isoformat(),
+        "taken_by": run2.taken_by,
+        "caverns_version": run2.caverns_version,
+        "deleted_at": None,
+        "tables": [
+            {
+                "schema": "nozdormu_test",
+                "table": "users",
+                "key": ["id"],
+                "columns": [
+                    {"name": "id", "type": "integer"},
+                    {"name": "email", "type": "text"},
+                    {"name": "nickname", "type": "text"},
+                    {"name": "active", "type": "boolean"},
+                    {"name": "tags", "type": "jsonb"},
+                ],
+                "row_count": 2,
+            }
+        ],
+    }
+    assert deleted.deleted_at is not None
+    assert (oldest["name"], oldest["deleted_at"]) == ("run-1", deleted.deleted_at.isoformat())
+
+
+def test_epochs_limit(ledger_conn: Any, db_dsn: str, capsys: pytest.CaptureFixture[str]) -> None:
+    _three_epochs_of_users(ledger_conn)
+    code, out, _ = _run(capsys, "epochs", "--dsn", db_dsn, "--limit", "2", "--format", "json")
+    assert (code, [e["name"] for e in json.loads(out)]) == (0, ["run-3", "run-2"])
+    code, out, _ = _run(capsys, "epochs", "--dsn", db_dsn, "--limit", "0", "--format", "json")
+    assert [e["name"] for e in json.loads(out)] == ["run-3", "run-2", "run-1"]
+
+
+def test_epochs_with_none_says_so_and_json_is_an_empty_list(
+    ledger_conn: Any, db_dsn: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    nozdormu.install(ledger_conn)
+    assert _run(capsys, "epochs", "--dsn", db_dsn) == (0, "ℹ️ Nothing to show — no epoch is recorded.\n", "")
+    assert _run(capsys, "epochs", "--dsn", db_dsn, "--format", "json") == (0, "[]\n", "")
+
+
+def test_epochs_without_an_installed_ledger_is_a_usage_error(
+    ledger_conn: Any, db_dsn: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    code, out, err = _run(capsys, "epochs", "--dsn", db_dsn)
+    assert (code, out) == (chromie.EXIT_USAGE, "")
+    assert "call install()" in err
+
+
+def test_delete_epoch_with_yes_deletes_and_says_so(
+    ledger_conn: Any, db_dsn: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _three_epochs_of_users(ledger_conn)
+    code, out, err = _run(capsys, "delete-epoch", "run-1", "run-3", "--yes", "--dsn", db_dsn)
+    assert (code, err) == (0, "")
+    assert out == "✅ Deleted epoch run-3 (2 rows in 1 table).\n✅ Deleted epoch run-1 (2 rows in 1 table).\n"
+    assert _kept_rows(ledger_conn) == [("run-1", 0), ("run-2", 2), ("run-3", 0)]
+
+
+def test_delete_epoch_json_lists_the_deleted_epochs(
+    ledger_conn: Any, db_dsn: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _three_epochs_of_users(ledger_conn)
+    code, out, err = _run(capsys, "delete-epoch", "run-2", "run-2", "--yes", "--dsn", db_dsn, "--format", "json")
+    assert (code, err) == (0, "")
+    (deleted,) = json.loads(out)
+    assert deleted["name"] == "run-2"
+    assert re.fullmatch(r"\d{4}-\d\d-\d\dT.*[+-]\d\d:\d\d", deleted["deleted_at"])
+    assert deleted["tables"][0]["row_count"] == 2
+    assert _kept_rows(ledger_conn) == [("run-1", 2), ("run-2", 0), ("run-3", 2)]
+
+
+def test_delete_epoch_dry_run_deletes_nothing(
+    ledger_conn: Any, db_dsn: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _three_epochs_of_users(ledger_conn)
+    code, out, err = _run(capsys, "delete-epoch", "run-1", "run-2", "--dry-run", "--dsn", db_dsn)
+    assert (code, err) == (0, "")
+    first, second, last = out.splitlines()
+    assert re.fullmatch(rf"ℹ️ Would delete epoch run-1 \(2 rows in 1 table, {TAKEN}\)\.", first)
+    assert re.fullmatch(rf"ℹ️ Would delete epoch run-2 \(2 rows in 1 table, {TAKEN}\)\.", second)
+    assert last == "ℹ️ Dry run — nothing deleted."
+    code, out, err = _run(capsys, "delete-epoch", "run-1", "--dry-run", "--yes", "--dsn", db_dsn, "--format", "json")
+    assert (code, err) == (0, "")
+    (planned,) = json.loads(out)
+    assert (planned["name"], planned["deleted_at"]) == ("run-1", None)
+    assert _kept_rows(ledger_conn) == [("run-1", 2), ("run-2", 2), ("run-3", 2)]
+    assert _query_count(ledger_conn) == 0
+
+
+def _query_count(conn: Any) -> int:
+    with conn.cursor() as cursor:
+        cursor.execute("SELECT count(*) FROM caverns.epoch_deletion")
+        (count,) = cursor.fetchone()
+    conn.commit()
+    return int(count)
+
+
+def test_delete_epoch_without_yes_needs_a_terminal(
+    ledger_conn: Any, db_dsn: str, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _three_epochs_of_users(ledger_conn)
+    monkeypatch.setattr(console, "interactive", lambda: False)
+    code, out, err = _run(capsys, "delete-epoch", "run-1", "--dsn", db_dsn)
+    assert (code, out, err) == (chromie.EXIT_USAGE, "", "❌ delete-epoch needs --yes when not run interactively\n")
+    assert _query_count(ledger_conn) == 0
+
+
+def test_delete_epoch_interactive_yes_deletes(
+    ledger_conn: Any, db_dsn: str, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _three_epochs_of_users(ledger_conn)
+    monkeypatch.setattr(console, "interactive", lambda: True)
+    monkeypatch.setattr(sys, "stdin", io.StringIO("y\n"))
+    code, out, err = _run(capsys, "delete-epoch", "run-1", "run-2", "--dsn", db_dsn)
+    assert code == 0
+    assert err == "Delete 2 epochs (run-1, run-2) and their 4 rows? [y/N] "
+    assert out.count("✅ Deleted epoch") == 2
+    assert _kept_rows(ledger_conn) == [("run-1", 0), ("run-2", 0), ("run-3", 2)]
+
+
+@pytest.mark.parametrize("answer", ["n\n", "\n", ""])
+def test_delete_epoch_interactive_no_or_end_of_input_deletes_nothing(
+    answer: str,
+    ledger_conn: Any,
+    db_dsn: str,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _three_epochs_of_users(ledger_conn)
+    monkeypatch.setattr(console, "interactive", lambda: True)
+    monkeypatch.setattr(sys, "stdin", io.StringIO(answer))
+    code, out, err = _run(capsys, "delete-epoch", "run-1", "--dsn", db_dsn)
+    assert (code, out) == (0, "ℹ️ Aborted — no changes were made.\n")
+    assert err == "Delete 1 epoch (run-1) and their 2 rows? [y/N] "
+    assert _kept_rows(ledger_conn) == [("run-1", 2), ("run-2", 2), ("run-3", 2)]
+    assert _query_count(ledger_conn) == 0
+
+
+@pytest.mark.parametrize(
+    ("names", "message"),
+    [
+        (("run-1", "nope"), "no epoch is named 'nope'"),
+        (("run-1", "run-2"), "epoch 'run-2' is already deleted"),
+    ],
+)
+def test_delete_epoch_of_an_unknown_or_deleted_epoch_is_a_usage_error_and_deletes_nothing(
+    names: tuple[str, ...], message: str, ledger_conn: Any, db_dsn: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _three_epochs_of_users(ledger_conn)
+    epochs.delete(ledger_conn, ["run-2"])
+    code, out, err = _run(capsys, "delete-epoch", *names, "--yes", "--dsn", db_dsn)
+    assert (code, out, err) == (chromie.EXIT_USAGE, "", f"❌ {message}\n")
+    assert _kept_rows(ledger_conn) == [("run-1", 2), ("run-2", 0), ("run-3", 2)]
+    code, _, err = _run(capsys, "delete-epoch", *names, "--dry-run", "--dsn", db_dsn)
+    assert (code, err) == (chromie.EXIT_USAGE, f"❌ {message}\n")
+
+
+def test_delete_epoch_needs_an_epoch_name(capsys: pytest.CaptureFixture[str]) -> None:
+    with pytest.raises(SystemExit) as raised:
+        chromie.main(["delete-epoch", "--yes", "--dsn", "x"])
+    assert raised.value.code == chromie.EXIT_USAGE
+    assert "EPOCH" in capsys.readouterr().err
