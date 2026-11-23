@@ -47,7 +47,7 @@ changed outside the timeline. Project Blackwing is the first consumer, not the d
 |---|---|---|
 | 0 — Development process | Merged | [#1](https://github.com/Deluha/caverns-of-time/pull/1) |
 | 1 — Nozdormu | Merged | [#2](https://github.com/Deluha/caverns-of-time/pull/2) |
-| 2 — Chromie and Infinite | In review | [#3](https://github.com/Deluha/caverns-of-time/pull/3) |
+| 2 — Chromie and Infinite | Merged | [#3](https://github.com/Deluha/caverns-of-time/pull/3) |
 | 3 — Epochs | Not started | |
 | 4 — Murozond and Timewalking | Not started | |
 | 5 — Blackwing adoption and release | Not started | |
@@ -175,6 +175,18 @@ Sign-off decisions (owner, 2026-11-22: C1–C9 confirmed as recommended; C10 con
 Sign-off: storage layout (one history table per source table, keyed by epoch — *proposed*); behaviour
 when a table's columns changed between two epochs; retention defaults; whether deletion of an epoch is
 itself recorded in the ledger.
+
+Sign-off decisions (owner, 2026-11-23: E1–E7 confirmed as recommended):
+
+| # | Item | Decision |
+|---|---|---|
+| E1 | Storage layout | Not one history table per source table: one shared jsonb history, no DDL at run time. New own step `epochs` (third of `caverns`) creates, in schema `caverns`: `epoch_table` (the opt-in registry, mutable: `schema_name`, `table_name`, `key` text[] non-empty, `registered_at`, `registered_by`; primary key (`schema_name`, `table_name`)); `epoch` (the catalog: `epoch` bigint identity primary key, `name` unique, `ledger_version` referencing `caverns.ledger`, `taken_at`, `taken_by`, `caverns_version`); `epoch_source` (one row per table per epoch: `epoch`, `schema_name`, `table_name`, `key` text[], `columns` jsonb `[{"name", "type"}]` in column order, `row_count`; primary key (`epoch`, `schema_name`, `table_name`)); `epoch_row` (`epoch`, `schema_name`, `table_name`, `key` jsonb, `row` jsonb = `to_jsonb` of the source row; primary key (`epoch`, `schema_name`, `table_name`, `key`); a deferred foreign key to `epoch_source`); `epoch_deletion` (tombstones: `epoch` primary key referencing `epoch`, `deleted_at`, `deleted_by`, `caverns_version`). Triggers: `epoch`, `epoch_source` and `epoch_deletion` reject UPDATE, DELETE and TRUNCATE; `epoch_row` rejects UPDATE and TRUNCATE, and DELETE unless the epoch has a tombstone. |
+| E2 | Columns changed between epochs | `as_of` shows an epoch's own columns. `diff` reports each column added, removed or of another type, and compares rows on the columns both epochs have. A table whose key differs between the two epochs is refused (`EpochRefused`, naming it); a table in one epoch only is reported as added or removed, its rows not listed. |
+| E3 | Retention defaults | Everything is kept: nothing is pruned, a snapshot never deletes. Deletion is explicit, by name. No keep-last-N in v0.1. |
+| E4 | Deletion and the ledger | Not a ledger row (the ledger is the schema timeline that preflight and Timewalking read): a tombstone row in `caverns.epoch_deletion`, written in the transaction that deletes the epoch's `epoch_row` rows. The catalog row stays; listings show the deletion time. |
+| E5 | Library API | Module `epochs`: `register(conn, schema, table, *, key=None) -> TrackedTable` (key defaults to the primary key, refused without either; the same key again is a no-op, another key replaces it with a warning); `unregister(conn, schema, table)` (history kept); `tracked(conn) -> list[TrackedTable]`; `snapshot(conn, name) -> Epoch` (every registered table in one REPEATABLE READ transaction under the ledger's advisory lock, taken before the snapshot; refused without tables, for a missing table or key column, a key with duplicates or nulls, a used name); `catalog(conn, *, limit=None) -> list[Epoch]` (newest first, deleted ones included); `as_of(conn, epoch, schema, table, *, limit=None) -> TableAt`; `diff(conn, old, new, *, tables=None) -> EpochDiff`; `delete(conn, names) -> list[Epoch]`. Epochs are named by `name`, required, following the label rules and unique for good. Exceptions `EpochNotFound`, `EpochRefused`; bad arguments `ChangesetError`. Identifiers are composed by PostgreSQL (`format('%I.%I')`), never in Python. |
+| E6 | CLI | `chromie epochs [--limit N]`; `chromie as-of EPOCH SCHEMA.TABLE [--limit N]` (both `--limit` default 20, 0 all); `chromie diff OLD NEW [--table SCHEMA.TABLE ...]`; `chromie delete-epoch EPOCH ... [--dry-run] [--yes]`, the first command that writes (amends C2): it asks for confirmation (default no) and requires `--yes` unattended. Exit codes: 0 success; `diff` 1 when anything differs; 2 usage or environment (an epoch or table not found, a deleted epoch, a refusal). `--table` joins the flag table. No snapshot command: the consumer's runner calls `snapshot`. |
+| E7 | Commits | As the table above; the own step `epochs` lands in commit 1 with all five tables. |
 
 ### Phase 4 — Murozond and Timewalking
 
