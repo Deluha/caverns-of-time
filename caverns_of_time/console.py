@@ -47,10 +47,15 @@ def interactive() -> bool:
 def confirm(question: str) -> bool:
     """Ask *question* on stderr and read one line from stdin; true only for `y` or `yes` (any case), else false.
 
-    End of input (no line) is a refusal.
+    End of input (no line) and Ctrl-C are refusals.
     """
     print(f"{question} [y/N] ", end="", file=sys.stderr, flush=True)
-    return sys.stdin.readline().strip().lower() in ("y", "yes")
+    try:
+        answer = sys.stdin.readline()
+    except KeyboardInterrupt:
+        print(file=sys.stderr)  # the answer's line was never ended
+        return False
+    return answer.strip().lower() in ("y", "yes")
 
 
 def table(headers: Sequence[str] | None, rows: Sequence[Sequence[object]], *, right: Collection[int] = ()) -> None:

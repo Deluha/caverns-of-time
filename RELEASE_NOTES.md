@@ -11,18 +11,21 @@ Run-level snapshots of opted-in tables:
 - `epochs.register` / `unregister` / `tracked`: the opt-in registry, keyed by the primary key or a declared key.
 - `epochs.snapshot(connection, name)`: copies every registered table into one named epoch, tagged with the
   ledger version, in one consistent REPEATABLE READ snapshot taken under Caverns' advisory lock; a key with
-  duplicates or nulls refuses the whole snapshot. Rows are stored as jsonb with the epoch's own column list.
+  duplicates or nulls refuses the whole snapshot. Rows are stored as jsonb with the epoch's own column list,
+  their values printed under pinned settings (`TimeZone` UTC, `IntervalStyle` `postgres`, `extra_float_digits` 1,
+  `bytea_output` hex), so an epoch does not depend on the session that took it.
 - `epochs.catalog`, `epochs.as_of` (a table as an epoch recorded it) and `epochs.diff` (columns added,
   removed or retyped; rows added, removed or changed by the key, compared on the columns both epochs have).
 - Retention: nothing is pruned automatically; `epochs.delete` writes a tombstone and removes an epoch's rows,
-  keeping its catalog row and its name.
+  keeping its catalog row and its name. `epochs.delete(..., dry_run=True)` returns what would be deleted.
 - `chromie epochs`, `chromie as-of EPOCH SCHEMA.TABLE`, `chromie diff OLD NEW [--table ...]` (exit 1 on a
   difference) and `chromie delete-epoch EPOCH ... [--dry-run] [--yes]`, the first command that writes.
 - Caverns' own changeset gains the step `epochs`: `caverns.epoch_table`, `epoch`, `epoch_source`, `epoch_row`
   and `epoch_deletion`, append-only by trigger except the registry and the rows of a deleted epoch.
 - New errors `EpochNotFound` and `EpochRefused`.
 - **Upgrade:** a database installed by Phase 2 code must run `install()` again, which adds the `epochs` step;
-  until then `preflight`, `apply`, `baseline` and `drift` raise `LedgerNotInstalled`.
+  until then `preflight`, `apply` and `baseline` raise `LedgerNotInstalled`, and so does `drift` given a changeset
+  (its `preflight` runs first); `drift` without one checks only `caverns.fingerprint`.
 
 ### Phase 2 — Chromie and Infinite
 

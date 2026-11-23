@@ -108,6 +108,19 @@ def test_confirm_is_false_for_anything_else_and_for_end_of_input(
     assert (captured.out, captured.err) == ("", "Go on? [y/N] ")
 
 
+def test_confirm_is_false_on_ctrl_c_and_ends_the_prompt_line(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    class Interrupted(io.StringIO):
+        def readline(self, size: int | None = -1, /) -> str:
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(sys, "stdin", Interrupted())
+    assert console.confirm("Go on?") is False
+    captured = capsys.readouterr()
+    assert (captured.out, captured.err) == ("", "Go on? [y/N] \n")
+
+
 def test_interactive_follows_stdin_being_a_terminal(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(sys, "stdin", io.StringIO(""))
     assert console.interactive() is False
@@ -649,7 +662,7 @@ def test_as_of_of_a_deleted_epoch_is_a_usage_error(
     ledger_conn.commit()
     code, out, err = _run(capsys, "as-of", "run-42", "nozdormu_test.users", "--dsn", db_dsn)
     assert (code, out) == (chromie.EXIT_USAGE, "")
-    assert re.fullmatch(r"❌ epoch 'run-42' was deleted at \d{4}-\d\d-\d\d \d\d:\d\d:\d\d UTC\n", err)
+    assert re.fullmatch(r"❌ epoch 'run-42' was deleted at \d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\+00:00\n", err)
 
 
 def test_as_of_without_an_installed_ledger_is_a_usage_error(
@@ -671,7 +684,7 @@ def test_as_of_refuses_a_table_that_is_not_schema_dot_table(table: str, capsys: 
 def test_as_of_splits_the_table_at_the_first_dot() -> None:
     args = chromie.build_parser().parse_args(["as-of", "e", "s.a.b"])
     assert args.table == ("s", "a.b")
-    assert (args.epoch, args.limit) == ("e", chromie.DEFAULT_LOG_LIMIT)
+    assert (args.epoch, args.limit) == ("e", chromie.DEFAULT_LIMIT)
 
 
 def test_as_of_refuses_a_bad_limit(capsys: pytest.CaptureFixture[str]) -> None:
@@ -887,7 +900,9 @@ def test_diff_of_a_key_that_changed_is_a_usage_error(
     epochs.snapshot(ledger_conn, "run-3")
     code, out, err = _run(capsys, "diff", "run-2", "run-3", "--dsn", db_dsn)
     assert (code, out) == (chromie.EXIT_USAGE, "")
-    assert err.startswith("❌ the key of nozdormu_test.users differs between epochs 'run-2' (id) and 'run-3' (email)")
+    assert err.startswith(
+        "❌ the key of nozdormu_test.users differs between epochs 'run-2' (id integer) and 'run-3' (email text)"
+    )
     code, _, _ = _run(capsys, "diff", "run-2", "run-3", "--dsn", db_dsn, "--table", "nozdormu_test.codes")
     assert code == 0
 
@@ -1038,9 +1053,9 @@ def test_delete_epoch_dry_run_deletes_nothing(
     _three_epochs_of_users(ledger_conn)
     code, out, err = _run(capsys, "delete-epoch", "run-1", "run-2", "--dry-run", "--dsn", db_dsn)
     assert (code, err) == (0, "")
-    first, second, last = out.splitlines()
-    assert re.fullmatch(rf"ℹ️ Would delete epoch run-1 \(2 rows in 1 table, {TAKEN}\)\.", first)
-    assert re.fullmatch(rf"ℹ️ Would delete epoch run-2 \(2 rows in 1 table, {TAKEN}\)\.", second)
+    first, second, last = out.splitlines()  # newest first, as delete returns them
+    assert re.fullmatch(rf"ℹ️ Would delete epoch run-2 \(2 rows in 1 table, {TAKEN}\)\.", first)
+    assert re.fullmatch(rf"ℹ️ Would delete epoch run-1 \(2 rows in 1 table, {TAKEN}\)\.", second)
     assert last == "ℹ️ Dry run — nothing deleted."
     code, out, err = _run(capsys, "delete-epoch", "run-1", "--dry-run", "--yes", "--dsn", db_dsn, "--format", "json")
     assert (code, err) == (0, "")
@@ -1076,7 +1091,7 @@ def test_delete_epoch_interactive_yes_deletes(
     monkeypatch.setattr(sys, "stdin", io.StringIO("y\n"))
     code, out, err = _run(capsys, "delete-epoch", "run-1", "run-2", "--dsn", db_dsn)
     assert code == 0
-    assert err == "Delete 2 epochs (run-1, run-2) and their 4 rows? [y/N] "
+    assert err == "Delete 2 epochs (run-2, run-1) and their 4 rows? [y/N] "
     assert out.count("✅ Deleted epoch") == 2
     assert _kept_rows(ledger_conn) == [("run-1", 0), ("run-2", 0), ("run-3", 2)]
 
@@ -1103,7 +1118,7 @@ def test_delete_epoch_interactive_no_or_end_of_input_deletes_nothing(
     ("names", "message"),
     [
         (("run-1", "nope"), "no epoch is named 'nope'"),
-        (("run-1", "run-2"), "epoch 'run-2' is already deleted"),
+        (("run-1", "run-2"), r"epoch 'run-2' was deleted at \d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\+00:00"),
     ],
 )
 def test_delete_epoch_of_an_unknown_or_deleted_epoch_is_a_usage_error_and_deletes_nothing(
@@ -1112,10 +1127,12 @@ def test_delete_epoch_of_an_unknown_or_deleted_epoch_is_a_usage_error_and_delete
     _three_epochs_of_users(ledger_conn)
     epochs.delete(ledger_conn, ["run-2"])
     code, out, err = _run(capsys, "delete-epoch", *names, "--yes", "--dsn", db_dsn)
-    assert (code, out, err) == (chromie.EXIT_USAGE, "", f"❌ {message}\n")
+    assert (code, out) == (chromie.EXIT_USAGE, "")
+    assert re.fullmatch(f"❌ {message}\n", err)
     assert _kept_rows(ledger_conn) == [("run-1", 2), ("run-2", 0), ("run-3", 2)]
     code, _, err = _run(capsys, "delete-epoch", *names, "--dry-run", "--dsn", db_dsn)
-    assert (code, err) == (chromie.EXIT_USAGE, f"❌ {message}\n")
+    assert code == chromie.EXIT_USAGE
+    assert re.fullmatch(f"❌ {message}\n", err)
 
 
 def test_delete_epoch_needs_an_epoch_name(capsys: pytest.CaptureFixture[str]) -> None:

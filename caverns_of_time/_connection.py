@@ -3,11 +3,12 @@
 Not public: the components import it, a consumer imports `Connection` from `nozdormu`. Input: a DB-API 2.0
 connection (autocommit off). Output: cursors in transactions Caverns commits or rolls back itself, the advisory
 lock every Caverns write takes (per transaction, or per session ahead of a REPEATABLE READ transaction), and the
-validation and catalog helpers the components share (names, limits, the pinned search path).
+validation and catalog helpers the components share (names, limits, the pinned search path and output settings).
 """
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Collection, Iterator, Sequence
 from contextlib import contextmanager
 from typing import Any, Protocol
@@ -16,11 +17,13 @@ from caverns_of_time.errors import CavernsError, ChangesetError
 
 __all__ = [
     "ADVISORY_LOCK_KEY",
+    "EPOCHS_EXISTS_SQL",
     "Connection",
     "Cursor",
     "check_connection",
     "lock",
     "names",
+    "pin_output_settings",
     "pin_search_path",
     "read_only",
     "run_check",
@@ -73,7 +76,19 @@ _SESSION_LOCK_SQL = "SELECT pg_advisory_lock(%s::bigint)"
 _SESSION_UNLOCK_SQL = "SELECT pg_advisory_unlock(%s::bigint)"
 # Lets a catalog read name an object by its schema-qualified type regardless of the caller's search_path.
 _PIN_SEARCH_PATH_SQL = "SELECT set_config('search_path', 'pg_catalog', true)"
+# The settings that change how a value prints (`to_jsonb` of a timestamptz, interval, float8 or bytea).
+_PIN_OUTPUT_SETTINGS_SQL = (
+    "SELECT set_config('TimeZone', 'UTC', true), set_config('IntervalStyle', 'postgres', true),"
+    " set_config('extra_float_digits', '1', true), set_config('bytea_output', 'hex', true)"
+)
 _LIMIT_MAX = 2**63 - 1  # a bigint, what `LIMIT` takes
+# True only when all five epoch tables exist; `epochs` (the registry) reads it too, to refuse before the step ran.
+EPOCHS_EXISTS_SQL = (
+    "SELECT to_regclass('caverns.epoch_table') IS NOT NULL AND to_regclass('caverns.epoch') IS NOT NULL"
+    " AND to_regclass('caverns.epoch_source') IS NOT NULL AND to_regclass('caverns.epoch_row') IS NOT NULL"
+    " AND to_regclass('caverns.epoch_deletion') IS NOT NULL"
+)
+_log = logging.getLogger(__name__)
 
 
 def check_connection(connection: Connection) -> None:
@@ -147,25 +162,27 @@ def session_lock(connection: Connection) -> Iterator[None]:
 
     For a block that runs a REPEATABLE READ `transaction`: the transaction-level `lock` statement would take
     that transaction's snapshot before it waits (see `_READ_COMMITTED_SQL`), while this one commits first, so
-    the snapshot comes after the lock is held. The lock is released when the block ends; a release that fails
-    after the block raised is suppressed so the block's error propagates (a lost connection frees the lock).
+    the snapshot comes after the lock is held. The lock is released when the block ends. A session lock survives
+    a rollback, so a failure while taking it (the server may have granted it) and a block that raised release it
+    best-effort and let the error propagate (a lost connection frees the lock); a release that fails after the
+    block succeeded is logged as a warning, never raised: the block's work is committed.
     """
     try:
         with cursor(connection) as cur:
             cur.execute(_SESSION_LOCK_SQL, (ADVISORY_LOCK_KEY,))
         connection.commit()
     except BaseException:
-        connection.rollback()
+        _release_session_lock_quietly(connection)
         raise
     try:
         yield
     except BaseException:
-        try:
-            _release_session_lock(connection)
-        except Exception:
-            pass
+        _release_session_lock_quietly(connection)
         raise
-    _release_session_lock(connection)
+    try:
+        _release_session_lock(connection)
+    except Exception as error:
+        _log.warning("could not release Caverns' advisory lock: %s", error)
 
 
 def _release_session_lock(connection: Connection) -> None:
@@ -175,9 +192,24 @@ def _release_session_lock(connection: Connection) -> None:
     connection.commit()
 
 
+def _release_session_lock_quietly(connection: Connection) -> None:
+    try:
+        _release_session_lock(connection)
+    except Exception:
+        pass  # the caller re-raises the error that matters; a lost connection frees the lock
+
+
 def pin_search_path(cursor: Cursor) -> None:
     """Pin the search path to `pg_catalog` until the transaction ends, so `format_type` qualifies every name."""
     cursor.execute(_PIN_SEARCH_PATH_SQL)
+
+
+def pin_output_settings(cursor: Cursor) -> None:
+    """Pin the settings that shape how values print (time zone, interval style, float digits, bytea output).
+
+    Until the transaction ends, so what a snapshot stores does not depend on the session that took it.
+    """
+    cursor.execute(_PIN_OUTPUT_SETTINGS_SQL)
 
 
 def validate_limit(limit: object) -> None:
