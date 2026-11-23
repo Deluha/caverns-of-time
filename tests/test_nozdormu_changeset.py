@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from caverns_of_time import _connection, _fingerprint, nozdormu
+from caverns_of_time import _connection, _fingerprint, epochs, nozdormu
 from caverns_of_time.errors import ChangesetError
 from caverns_of_time.nozdormu import Changeset, LedgerEntry, Status, Step
 
@@ -224,11 +224,13 @@ def test_the_ledger_column_lists_are_the_ledger_entry_fields() -> None:
     assert returning.group(1).split(", ") == columns
 
 
-@pytest.mark.parametrize("table", ["ledger", "fingerprint"])
+@pytest.mark.parametrize(
+    "table", ["ledger", "fingerprint", "epoch_table", "epoch_source", "epoch_row", "epoch_deletion"]
+)
 def test_every_sql_constant_names_the_own_tables_in_the_own_schema(table: str) -> None:
     constants = {
         f"{module.__name__}.{name}": value
-        for module in (nozdormu, _connection, _fingerprint)
+        for module in (nozdormu, _connection, _fingerprint, epochs)
         for name, value in vars(module).items()
         if name.endswith("_SQL") and isinstance(value, str)
     }
@@ -239,8 +241,8 @@ def test_every_sql_constant_names_the_own_tables_in_the_own_schema(table: str) -
             assert qualifier == nozdormu._OWN_CHANGESET_NAME, name
 
 
-def test_the_own_changeset_is_the_ledger_step_then_the_fingerprint_step() -> None:
-    assert [step.label for step in nozdormu._OWN_CHANGESET.steps] == ["ledger", "fingerprint"]
+def test_the_own_changeset_is_the_ledger_fingerprint_and_epochs_steps() -> None:
+    assert [step.label for step in nozdormu._OWN_CHANGESET.steps] == ["ledger", "fingerprint", "epochs"]
     assert all(step.check for step in nozdormu._OWN_CHANGESET.steps)
 
 

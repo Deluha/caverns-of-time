@@ -12,7 +12,7 @@ import psycopg
 import psycopg2
 import pytest
 
-from caverns_of_time import __version__, nozdormu
+from caverns_of_time import __version__, _connection, nozdormu
 from caverns_of_time.errors import (
     BaselineRefused,
     CavernsError,
@@ -34,7 +34,11 @@ APP = Changeset("app", [SCHEMA, TABLE, INDEX])
 APP_ROWS = "SELECT label, outcome FROM caverns.ledger WHERE changeset = 'app' ORDER BY version"
 LEDGER_ROWS = "SELECT version, changeset, label, outcome FROM caverns.ledger ORDER BY version"
 # What `install` writes: one row for each step of Caverns' own changeset.
-OWN_ROWS = [(1, "caverns", "ledger", "applied"), (2, "caverns", "fingerprint", "applied")]
+OWN_ROWS = [
+    (1, "caverns", "ledger", "applied"),
+    (2, "caverns", "fingerprint", "applied"),
+    (3, "caverns", "epochs", "applied"),
+]
 FINGERPRINT_ROWS = "SELECT version, schemas, hash FROM caverns.fingerprint ORDER BY version"
 FIRST_TWO = Changeset("app", [SCHEMA, TABLE])
 
@@ -122,6 +126,7 @@ def test_install_accepts_its_own_step_when_the_table_exists_without_its_row(ledg
     assert [(e.changeset, e.label, e.outcome) for e in entries] == [
         ("caverns", "ledger", "accepted"),
         ("caverns", "fingerprint", "applied"),
+        ("caverns", "epochs", "applied"),
     ]
     assert entries[0].duration_ms is None
     assert len(preflight(ledger_conn, APP)) == len(APP.steps)
@@ -202,7 +207,10 @@ def test_a_ledger_of_the_previous_release_upgrades_with_install(
     _assert_idle(ledger_conn)
     assert [e.label for e in history(ledger_conn)] == ["ledger"]  # the old rows still read
     entries = install(ledger_conn)
-    assert [(e.version, e.label, e.outcome) for e in entries] == [(2, "fingerprint", "applied")]
+    assert [(e.version, e.label, e.outcome) for e in entries] == [
+        (2, "fingerprint", "applied"),
+        (3, "epochs", "applied"),
+    ]
     assert _query(ledger_conn, LEDGER_ROWS) == OWN_ROWS
     assert _exists(ledger_conn, "caverns.fingerprint")
     assert len(preflight(ledger_conn, APP)) == len(APP.steps)
@@ -450,7 +458,7 @@ def test_apply_runs_a_whole_changeset_on_an_empty_database(ledger_conn: Any) -> 
     install(ledger_conn)
     entries = apply(ledger_conn, APP)
     assert [(e.changeset, e.label, e.outcome) for e in entries] == [("app", s.label, "applied") for s in APP.steps]
-    assert [e.version for e in entries] == [3, 4, 5]
+    assert [e.version for e in entries] == [4, 5, 6]
     assert [e.checksum for e in entries] == [s.checksum for s in APP.steps]
     assert all(e.duration_ms is not None and e.duration_ms >= 0 and e.error is None for e in entries)
     assert _exists(ledger_conn, "nozdormu_test.t") and _exists(ledger_conn, "nozdormu_test.t_id")
@@ -585,11 +593,11 @@ def test_a_failing_step_is_rolled_back_recorded_and_raised(ledger_conn: Any) -> 
     with pytest.raises(StepFailed) as failed:
         apply(ledger_conn, FAILING)
     _assert_idle(ledger_conn)
-    assert (failed.value.label, failed.value.version) == ("bad", 4)
+    assert (failed.value.label, failed.value.version) == ("bad", 5)
     assert isinstance(failed.value.__cause__, DRIVER_ERRORS)
     assert _query(ledger_conn, APP_ROWS) == [("schema", "applied"), ("bad", "failed")]
     row = _query(ledger_conn, "SELECT version, error, duration_ms FROM caverns.ledger WHERE outcome = 'failed'")[0]
-    assert row[0] == 4 and "division by zero" in row[1] and row[2] >= 0
+    assert row[0] == 5 and "division by zero" in row[1] and row[2] >= 0
     assert not _exists(ledger_conn, "nozdormu_test.bad")  # rolled back with its transaction
     assert not _exists(ledger_conn, "nozdormu_test.later")  # later steps did not run
     assert _statuses(ledger_conn, FAILING) == {"schema": Status.APPLIED, "bad": Status.PENDING, "later": Status.PENDING}
@@ -657,8 +665,8 @@ RACE = Changeset("race", [RACE_STEP])
 RACE_ROWS = "SELECT label, outcome FROM caverns.ledger WHERE changeset = 'race' ORDER BY version"
 REPEATABLE_READ_SQL = "SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL REPEATABLE READ"
 # pg_locks shows a bigint advisory key as its high (classid) and low (objid) 32 bits.
-LOCK_KEY_HIGH = nozdormu._ADVISORY_LOCK_KEY >> 32
-LOCK_KEY_LOW = nozdormu._ADVISORY_LOCK_KEY & 0xFFFFFFFF
+LOCK_KEY_HIGH = _connection.ADVISORY_LOCK_KEY >> 32
+LOCK_KEY_LOW = _connection.ADVISORY_LOCK_KEY & 0xFFFFFFFF
 WAITING_LOCKS_SQL = (
     "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND NOT granted AND classid = %s AND objid = %s"
 )
@@ -682,7 +690,7 @@ def test_a_runner_waits_for_the_lock_and_reads_the_ledger_after_it(ledger_conn: 
     _execute(ledger_conn, SCHEMA.sql)
     _execute(ledger_conn, REPEATABLE_READ_SQL)  # a snapshot taken before the wait would miss the other runner
     with second_conn.cursor() as cursor:
-        cursor.execute(nozdormu._LOCK_SQL, (nozdormu._ADVISORY_LOCK_KEY,))
+        _connection.lock(cursor)
     result: dict[str, Any] = {}
 
     def run() -> None:
@@ -886,9 +894,9 @@ def test_the_default_schemas_are_every_one_but_the_system_ones_and_caverns(ledge
 def test_apply_records_one_fingerprint_at_the_last_ledger_row(ledger_conn: Any) -> None:
     install(ledger_conn)
     entries = apply(ledger_conn, FIRST_TWO)
-    assert [e.version for e in entries] == [3, 4]
+    assert [e.version for e in entries] == [4, 5]
     live = take_fingerprint(ledger_conn)
-    assert _query(ledger_conn, FINGERPRINT_ROWS) == [(4, list(live.schemas), live.hash)]
+    assert _query(ledger_conn, FINGERPRINT_ROWS) == [(5, list(live.schemas), live.hash)]
     assert _query(ledger_conn, "SELECT document FROM caverns.fingerprint") == [(live.document,)]
     assert "nozdormu_test" in live.schemas and live.document["nozdormu_test"]["table"] == {"t": {"kind": "r"}}
 
@@ -910,9 +918,9 @@ def test_a_failing_step_records_the_fingerprint_with_its_failed_row(ledger_conn:
     install(ledger_conn)
     with pytest.raises(StepFailed) as failed:
         apply(ledger_conn, FAILING)
-    assert failed.value.version == 4
+    assert failed.value.version == 5
     live = take_fingerprint(ledger_conn)  # the failed step was rolled back: this is what the first step left
-    assert _query(ledger_conn, FINGERPRINT_ROWS) == [(4, list(live.schemas), live.hash)]
+    assert _query(ledger_conn, FINGERPRINT_ROWS) == [(5, list(live.schemas), live.hash)]
     assert "nozdormu_test" in live.schemas and live.document["nozdormu_test"]["table"] == {}
 
 
@@ -968,7 +976,7 @@ def test_apply_warns_of_drift_before_it_runs(ledger_conn: Any, caplog: pytest.Lo
         apply(ledger_conn, APP)
     warnings = [r.getMessage() for r in caplog.records if r.name == "caverns_of_time.nozdormu"]
     assert warnings == ["drift before applying changeset app: added column nozdormu_test.t.note"]
-    assert [row[0] for row in _query(ledger_conn, FINGERPRINT_ROWS)] == [4, 5]  # the run went ahead
+    assert [row[0] for row in _query(ledger_conn, FINGERPRINT_ROWS)] == [5, 6]  # the run went ahead
     caplog.clear()
     with caplog.at_level(logging.WARNING):  # the new fingerprint holds the column: no difference left
         apply(ledger_conn, Changeset("app", [*APP.steps, Step("more", "CREATE TABLE nozdormu_test.more ()")]))
@@ -979,7 +987,7 @@ def test_apply_warns_of_drift_before_it_runs(ledger_conn: Any, caplog: pytest.Lo
 
 
 def _history_ledger(conn: Any) -> None:
-    """The ledger with its own rows (1 and 2), then app's three steps (3 to 5) and one other changeset's row."""
+    """The ledger with its own rows (1 to 3), then app's three steps (4 to 6) and one other changeset's row."""
     install(conn)
     apply(conn, APP)
     _execute(
@@ -993,10 +1001,10 @@ def _history_ledger(conn: Any) -> None:
 def test_history_is_the_whole_ledger_newest_first(ledger_conn: Any) -> None:
     _history_ledger(ledger_conn)
     entries = history(ledger_conn)
-    assert [e.version for e in entries] == [6, 5, 4, 3, 2, 1]
+    assert [e.version for e in entries] == [7, 6, 5, 4, 3, 2, 1]
     assert [(e.changeset, e.label) for e in entries] == [
         ("other", "x"), ("app", "index"), ("app", "table"), ("app", "schema"),
-        ("caverns", "fingerprint"), ("caverns", "ledger"),
+        ("caverns", "epochs"), ("caverns", "fingerprint"), ("caverns", "ledger"),
     ]  # fmt: skip
     _assert_idle(ledger_conn)
 
@@ -1004,15 +1012,15 @@ def test_history_is_the_whole_ledger_newest_first(ledger_conn: Any) -> None:
 def test_history_of_one_changeset(ledger_conn: Any) -> None:
     _history_ledger(ledger_conn)
     assert [e.label for e in history(ledger_conn, changeset="app")] == ["index", "table", "schema"]
-    assert [e.label for e in history(ledger_conn, changeset="caverns")] == ["fingerprint", "ledger"]
+    assert [e.label for e in history(ledger_conn, changeset="caverns")] == ["epochs", "fingerprint", "ledger"]
     assert history(ledger_conn, changeset="nobody") == []
 
 
 def test_history_limit_keeps_the_newest_rows(ledger_conn: Any) -> None:
     _history_ledger(ledger_conn)
-    assert [e.version for e in history(ledger_conn, limit=2)] == [6, 5]
-    assert [e.version for e in history(ledger_conn, changeset="app", limit=1)] == [5]
-    assert len(history(ledger_conn, limit=100)) == 6
+    assert [e.version for e in history(ledger_conn, limit=2)] == [7, 6]
+    assert [e.version for e in history(ledger_conn, changeset="app", limit=1)] == [6]
+    assert len(history(ledger_conn, limit=100)) == 7
 
 
 def test_history_refuses_a_ledger_that_is_not_installed(ledger_conn: Any) -> None:
