@@ -397,6 +397,29 @@ def test_without_a_baseline_a_schema_created_later_is_watched(conn: Any, caplog:
     assert drift(conn).differences == ()
 
 
+def test_without_a_baseline_a_dropped_schema_is_drift_and_is_warned_of(
+    conn: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    _applied(conn)
+    _run(conn, f"DROP SCHEMA {SCHEMA} CASCADE")
+    expected = [
+        ("removed", "table", f"{SCHEMA}.t"),
+        ("removed", "column", f"{SCHEMA}.t.id"),
+        ("removed", "column", f"{SCHEMA}.t.note"),
+    ]
+    result = drift(conn)
+    assert SCHEMA in result.schemas  # no longer watched, still covered by the latest fingerprint
+    assert _changes(conn) == expected
+    narrowed = drift(conn, schemas=[SCHEMA])
+    assert narrowed.schemas == (SCHEMA,)
+    assert [(d.change, d.kind, d.name) for d in narrowed.differences] == expected
+    with caplog.at_level("WARNING"):
+        apply(conn, Changeset("app", [*STEPS, Step("later", "SELECT 1")]))
+    assert f"removed table {SCHEMA}.t" in caplog.text  # the pre-apply warning compares the same schemas
+    assert SCHEMA not in _latest_schemas(conn)  # the recorded fingerprint describes the database as it now is
+    assert drift(conn).differences == ()
+
+
 def test_a_baseline_with_schemas_makes_later_applies_and_drift_cover_only_those(conn: Any) -> None:
     _baselined(conn, TABLE, f"CREATE SCHEMA {EXT_SCHEMA}", f"CREATE TABLE {EXT_SCHEMA}.u ()")
     changeset = Changeset("app", [Step("base", "SELECT 1"), Step("more", f"CREATE TABLE {SCHEMA}.more ()")])

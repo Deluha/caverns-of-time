@@ -17,6 +17,7 @@ from caverns_of_time._fingerprint import (
     Fingerprint,
     capture,
     compare,
+    compared_schemas,
     fingerprint_table_exists,
     latest,
     named_schemas,
@@ -61,11 +62,13 @@ def fingerprint(connection: Connection, *, schemas: Collection[str] | None = Non
 def drift(
     connection: Connection, changeset: Changeset | None = None, *, schemas: Collection[str] | None = None
 ) -> Drift:
-    """Compare the live watched schemas with the latest recorded fingerprint; writes nothing.
+    """Compare the live database with the latest recorded fingerprint; writes nothing.
 
-    With a *changeset*, `preflight` runs first in a read-only transaction of its own; then one read-only
-    transaction reads the fingerprint, runs the checks and reads the catalogs. *schemas* narrows the report to
-    those of the watched schemas; a watched schema the fingerprint lacks shows its objects as added. With a
+    The schemas compared are the watched schemas plus those the fingerprint covers: a watched schema the
+    fingerprint lacks shows its objects as added, a covered schema since dropped shows them as removed, with or
+    without a baseline. With a *changeset*, `preflight` runs first in a read-only transaction of its own; then one
+    read-only transaction reads the fingerprint, runs the checks and reads the catalogs. *schemas* narrows the
+    report to some of the compared schemas (`Drift.schemas` holds the narrowed set). With a
     *changeset*, a step recorded as applied whose check is now false is a disagreement. Raises
     `LedgerNotInstalled` before `install()`, `NoFingerprint` when none is recorded yet, `ChangesetError` for an
     unwatched schema or bad *schemas*, and the errors of `preflight` for a *changeset*.
@@ -82,7 +85,7 @@ def drift(
         if found is None:
             raise NoFingerprint("no fingerprint is recorded yet: apply a changeset or take a baseline first")
         version, recorded = found
-        watched = watched_schemas(cursor)
+        watched = compared_schemas(cursor, recorded)
         unwatched = [name for name in named or () if name not in watched]
         if unwatched:
             raise ChangesetError(f"the schema {unwatched[0]!r} is not watched (watched: {', '.join(watched)})")

@@ -18,7 +18,7 @@ from typing import Protocol
 
 from caverns_of_time import console, infinite, nozdormu
 from caverns_of_time.errors import CavernsError
-from caverns_of_time.nozdormu import HISTORY_LIMIT_MAX, Connection
+from caverns_of_time.nozdormu import Connection
 
 __all__ = ["main"]
 
@@ -45,16 +45,14 @@ class UsageError(Exception):
     """A usage or environment problem; the CLI reports it and exits with code 2."""
 
 
-def _log_limit(text: str) -> int:
-    """An argparse type: an integer from 0 up to the most `history` takes."""
+def _non_negative_int(text: str) -> int:
+    """An argparse type: an integer of 0 or more."""
     try:
         value = int(text)
     except ValueError:
         raise argparse.ArgumentTypeError(f"{text!r} is not an integer") from None
     if value < 0:
         raise argparse.ArgumentTypeError(f"{text!r} is negative")
-    if value > HISTORY_LIMIT_MAX:
-        raise argparse.ArgumentTypeError(f"{text!r} is above {HISTORY_LIMIT_MAX}")
     return value
 
 
@@ -68,7 +66,7 @@ def build_parser() -> argparse.ArgumentParser:
     log.add_argument("--changeset", help="only this changeset's rows")
     log.add_argument(
         "--limit",
-        type=_log_limit,
+        type=_non_negative_int,
         default=DEFAULT_LOG_LIMIT,
         help=f"the most rows to show (0: all; default: {DEFAULT_LOG_LIMIT})",
     )

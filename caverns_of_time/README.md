@@ -80,9 +80,10 @@ failure cannot be recorded, no fingerprint is. A run that writes nothing stores 
 `install`. The fingerprint covers the watched schemas (below). Two kinds of run write rows and still store no
 fingerprint of their own: one interrupted after earlier steps committed (a lost connection, or a mid-run
 `PreflightRefused` because another runner changed a step), and one whose last planned step another runner
-applied first. The next `drift` then shows the committed steps' objects as added until the next fingerprint.
-Before its first step, and only when the run has a step to write, `apply` compares the live watched schemas
-with the latest recorded fingerprint in a read-only transaction and logs one warning per difference through the
+applied first. The next `drift` then shows the committed steps' changes in the watched schemas as drift until the next fingerprint.
+Before its first step, and only when the run has a step to write, `apply` compares the live database with the
+latest recorded fingerprint (the watched schemas plus those the fingerprint covers, as `drift` does) in a
+read-only transaction and logs one warning per difference through the
 `caverns_of_time.nozdormu` logger (`drift before applying changeset <name>: <change> <kind> <name>`); it never
 refuses, and says nothing when no fingerprint is recorded. The warning only reaches logs: in CI run
 `chromie drift` before `apply` to fail the build on drift.
@@ -138,18 +139,21 @@ the watched schemas (below); the result's `schemas` are sorted and unique.
 changeset: the watched set is database-wide, and a later baseline of another changeset replaces it. Without
 a baseline they are every schema except `pg_*`, `information_schema` and `caverns`, read again each time, so a
 schema created later is watched from then on. A `baseline` without `schemas` takes that default, never the
-set before it. `apply`'s signature has no schema argument.
+set before it. `apply`'s signature has no schema argument. The fingerprint `apply` records covers the watched
+schemas, the database as it now is; `drift` and the pre-apply warning compare the watched schemas plus those of
+the latest fingerprint (below), so a schema dropped since shows as removed, with or without a baseline.
 
 **Infinite, drift.** `infinite.drift(connection, changeset=None, *, schemas=None)` compares the live schemas with
 the latest row of `caverns.fingerprint` and writes nothing. It reads in read-only transactions: with a
 `changeset`, `preflight` runs first in its own, then one transaction reads the fingerprint, runs the checks and
 reads the catalogs. The reference is always the latest fingerprint, whatever baseline it came from. The compared
-schemas are the watched schemas, narrowed by `schemas` (one that is not watched is a `ChangesetError`); the
+schemas are the watched schemas plus those of the latest fingerprint, narrowed by `schemas` (one that is in
+neither is a `ChangesetError`; a dropped one is accepted and shows its objects as removed); the
 recorded document is restricted to them and the live document of them is read. Each object only in the live
 one is `added`, only in the recorded one `removed`, and in both with another value `changed`, one
 `Difference(kind, name, change)` each, sorted by schema, kind and key; `name` is `<schema>.<key>`, for example
 `public.users.nickname` or `public.touch_updated()`. A watched schema the fingerprint lacks (created since)
-shows all its objects as added; a dropped one, as removed. With a `changeset`, a step the ledger records as
+shows all its objects as added; a dropped one, as removed, with or without a baseline. With a `changeset`, a step the ledger records as
 `applied` whose check is now false is a disagreement between the ledger and the database, returned as its
 `StepStatus`; a step without a check, or `unknown`, never is. The checks run before the catalogs are read, with
 the session's `search_path`.
