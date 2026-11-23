@@ -45,3 +45,7 @@ class StepFailed(CavernsError):
 
 class BaselineRefused(CavernsError):
     """A baseline was refused: the changeset already has ledger rows, or a named schema does not exist."""
+
+
+class NoFingerprint(CavernsError):
+    """Drift found nothing to compare with: no fingerprint is recorded yet."""

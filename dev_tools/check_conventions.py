@@ -130,7 +130,7 @@ def check_safe_sql(sources: Iterable[Source]) -> list[str]:
             ):
                 out.append(
                     f"{path}:{node.lineno}: C3 string-formatted SQL passed to {node.func.attr}() — "
-                    "compose identifiers with the driver's quoting (R3)"
+                    "bind values and have PostgreSQL quote identifiers (R3)"
                 )
     return out
 
