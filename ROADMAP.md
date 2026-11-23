@@ -24,9 +24,9 @@ changed outside the timeline. The first consumer is not the design target.
 
 ### Scope rules (owner decisions, 2026-11-22)
 
-- **Generic core (D1).** No consumer's name, schema, table or convention enters the package, and no
-  consuming project is named anywhere in the repository. A consumer integrates through an adapter that
-  lives in the consumer's repository.
+- **Generic core (D1).** No consumer's name, schema, table or convention enters the package. A consumer
+  integrates through an adapter that lives in the consumer's repository. Extended by the owner,
+  2026-11-23: no consuming project is named anywhere in the repository.
 - **Run-level snapshots (D2).** History is captured as Epochs: whole-table snapshots taken on demand.
   No row-level triggers in v0.1.
 - **Wrap, not replace (D3).** Caverns defines its own `Step` (label, SQL or file, optional check) and

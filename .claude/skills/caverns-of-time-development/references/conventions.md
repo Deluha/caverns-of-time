@@ -15,7 +15,7 @@ configuration, never as constants.
 No consuming project (its name, repository, schema or other detail) is named anywhere in this repository —
 docs, guidance, tests and tooling included.
 
-Enforced: C1 (known consumer names, every text file), review for the rest.
+Enforced: C1 (known consumer names, all paths and text files), review for the rest.
 
 ## R2 one canonical helper
 
