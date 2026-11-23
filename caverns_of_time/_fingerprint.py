@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Collection, Sequence
+from collections.abc import Callable, Collection, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -25,22 +25,18 @@ __all__ = [
     "compare",
     "default_schemas",
     "fingerprint_table_exists",
-    "hash_document",
     "latest",
-    "missing_schemas",
     "named_schemas",
     "read_document",
     "record",
     "resolve_schemas",
+    "restrict",
     "watched_schemas",
 ]
 
 # The kinds of object a document holds, in the order they are read.
 _KINDS = ("table", "column", "index", "constraint", "view", "function")
 
-# NOTE: hard rule 3 forbids composing a statement, so each kind's query spells its extension filter literally:
-# an object an extension owns (a `pg_depend` row of type `e`) is left out, and the indexes and constraints of
-# an extension's table go with the table.
 _PIN_SEARCH_PATH_SQL = "SELECT set_config('search_path', 'pg_catalog', true)"
 # The schemas a fingerprint covers when the caller names none: every one but the system's and Caverns' own.
 _DEFAULT_SCHEMAS_SQL = (
@@ -56,6 +52,14 @@ _RECORD_FINGERPRINT_SQL = (
     "INSERT INTO caverns.fingerprint (version, schemas, document, hash) VALUES (%s, %s, %s::jsonb, %s)"
 )
 _EXISTING_SCHEMAS_SQL = "SELECT nspname::text FROM pg_namespace WHERE nspname = ANY(%s::text[])"
+# The schemas of the fingerprint recorded with the latest `baseline` ledger row (see `watched_schemas`).
+_BASELINE_SCHEMAS_SQL = (
+    "SELECT f.schemas FROM caverns.fingerprint f JOIN caverns.ledger l ON l.version = f.version"
+    " WHERE l.outcome = 'baseline' ORDER BY f.version DESC LIMIT 1"
+)
+# NOTE: hard rule 3 forbids composing a statement, so each kind's query spells its extension filter literally:
+# an object an extension owns (a `pg_depend` row of type `e`) is left out, and the indexes and constraints of
+# an extension's table go with the table.
 _TABLES_SQL = """
 SELECT n.nspname::text, c.relname::text, c.relkind::text
 FROM pg_class c
@@ -202,15 +206,28 @@ def record(cursor: Cursor, version: int, fingerprint: Fingerprint) -> None:
 
 
 def watched_schemas(cursor: Cursor) -> list[str]:
-    """The schemas of the latest recorded fingerprint, else the default schemas (also before the table exists)."""
-    found = latest(cursor) if fingerprint_table_exists(cursor) else None
-    return list(found[1].schemas) if found else default_schemas(cursor)
+    """The schemas of the fingerprint recorded with the latest `baseline` row, else the default schemas.
+
+    The default is read live each time, so a schema created later is watched; it also serves before
+    `caverns.fingerprint` exists.
+    """
+    if fingerprint_table_exists(cursor):
+        cursor.execute(_BASELINE_SCHEMAS_SQL)
+        row = cursor.fetchone()
+        if row is not None:
+            return sorted(row[0])
+    return default_schemas(cursor)
 
 
-def resolve_schemas(cursor: Cursor, schemas: list[str] | None, refusal: type[CavernsError]) -> list[str]:
-    """The schemas to fingerprint: the named ones, which must exist (else *refusal* is raised), else the watched."""
+def resolve_schemas(
+    cursor: Cursor,
+    schemas: list[str] | None,
+    refusal: type[CavernsError],
+    default: Callable[[Cursor], list[str]],
+) -> list[str]:
+    """The schemas to fingerprint: the named ones, which must exist (else *refusal* is raised), else *default*'s."""
     if schemas is None:
-        return watched_schemas(cursor)
+        return default(cursor)
     missing = missing_schemas(cursor, schemas)
     if missing:
         raise refusal(f"the schema {missing[0]!r} does not exist")
@@ -257,6 +274,11 @@ def hash_document(document: dict[str, Any]) -> str:
     """SHA-256 hex of the document's canonical JSON."""
     canonical = json.dumps(document, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def restrict(document: dict[str, Any], schemas: Collection[str]) -> dict[str, Any]:
+    """The part of *document* that covers *schemas*; a schema it lacks is left out, so it reads as empty."""
+    return {schema: document[schema] for schema in schemas if schema in document}
 
 
 def compare(recorded: dict[str, Any], live: dict[str, Any]) -> list[Difference]:

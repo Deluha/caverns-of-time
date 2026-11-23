@@ -637,7 +637,7 @@ def test_apply_skips_a_step_another_runner_applied_after_preflight(ledger_conn: 
     stale = preflight(ledger_conn, APP)
     _execute(ledger_conn, SCHEMA.sql)  # the other runner's work; running it again would fail
     _record(ledger_conn, SCHEMA)
-    entries = nozdormu._apply_statuses(ledger_conn, APP, stale, frozenset(), frozenset())
+    entries = nozdormu._apply_statuses(ledger_conn, APP, stale, frozenset(), frozenset(), record_fingerprint=False)
     assert [e.label for e in entries] == ["table", "index"]
     assert _query(ledger_conn, APP_ROWS) == [("schema", "applied"), ("table", "applied"), ("index", "applied")]
 
@@ -647,7 +647,7 @@ def test_apply_refuses_a_step_that_changed_after_preflight(ledger_conn: Any) -> 
     stale = preflight(ledger_conn, APP)
     _record(ledger_conn, SCHEMA, checksum="0" * 64)  # another runner applied another version
     with pytest.raises(PreflightRefused, match=r"schema \(conflict\)"):
-        nozdormu._apply_statuses(ledger_conn, APP, stale, frozenset(), frozenset())
+        nozdormu._apply_statuses(ledger_conn, APP, stale, frozenset(), frozenset(), record_fingerprint=False)
     _assert_idle(ledger_conn)
     assert _query(ledger_conn, APP_ROWS) == [("schema", "applied")]
 
@@ -938,7 +938,7 @@ def test_a_baseline_records_its_fingerprint_at_its_version(ledger_conn: Any) -> 
     assert entry.fingerprint == live.hash
 
 
-def test_a_fingerprint_inherits_the_schemas_of_the_one_before(ledger_conn: Any) -> None:
+def test_apply_after_a_baseline_with_schemas_records_only_those_schemas(ledger_conn: Any) -> None:
     install(ledger_conn)
     _existing_database(ledger_conn)
     first = baseline(ledger_conn, APP, through="table", schemas=["nozdormu_test"])
@@ -949,6 +949,14 @@ def test_a_fingerprint_inherits_the_schemas_of_the_one_before(ledger_conn: Any) 
         (second.version, ["nozdormu_test"]),  # not the default schemas: the baseline's choice stands
     ]
     assert rows[1][2] == take_fingerprint(ledger_conn, schemas=["nozdormu_test"]).hash
+
+
+def test_history_refuses_a_limit_above_the_bigint_maximum(ledger_conn: Any) -> None:
+    install(ledger_conn)
+    assert history(ledger_conn, limit=2**63 - 1) == history(ledger_conn)
+    with pytest.raises(ChangesetError, match="positive integer up to 9223372036854775807, not 9223372036854775808"):
+        history(ledger_conn, limit=2**63)
+    _assert_idle(ledger_conn)
 
 
 def test_apply_warns_of_drift_before_it_runs(ledger_conn: Any, caplog: pytest.LogCaptureFixture) -> None:

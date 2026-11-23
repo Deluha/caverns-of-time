@@ -20,6 +20,8 @@ The command line and the drift detector:
 - Caverns' own changeset gains the step `fingerprint`, creating the append-only `caverns.fingerprint`.
   One fingerprint is stored per apply run that writes ledger rows and per baseline. `apply` logs a
   warning per difference before its first step when the live schema drifted from the last fingerprint.
+  The watched schemas are those of the latest baseline's fingerprint, else every schema but the system's
+  and Caverns' own, read again each time; a baseline without `schemas` takes the default.
 - The baseline's fingerprint is redefined: the hash of Infinite's wider fingerprint.
 - **Upgrade:** a database installed by Phase 1 code must run `install()` again, which adds the
   `fingerprint` step; until then `preflight`, `apply`, `baseline` and `drift` raise `LedgerNotInstalled`.

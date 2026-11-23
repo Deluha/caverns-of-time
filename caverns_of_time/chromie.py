@@ -18,7 +18,9 @@ from typing import Protocol
 
 from caverns_of_time import console, infinite, nozdormu
 from caverns_of_time.errors import CavernsError
-from caverns_of_time.nozdormu import Connection
+from caverns_of_time.nozdormu import HISTORY_LIMIT_MAX, Connection
+
+__all__ = ["main"]
 
 ENV_DSN = "CAVERNS_DSN"
 EXIT_OK = 0
@@ -43,14 +45,16 @@ class UsageError(Exception):
     """A usage or environment problem; the CLI reports it and exits with code 2."""
 
 
-def _non_negative_int(text: str) -> int:
-    """An argparse type: an integer of 0 or more."""
+def _log_limit(text: str) -> int:
+    """An argparse type: an integer from 0 up to the most `history` takes."""
     try:
         value = int(text)
     except ValueError:
         raise argparse.ArgumentTypeError(f"{text!r} is not an integer") from None
     if value < 0:
         raise argparse.ArgumentTypeError(f"{text!r} is negative")
+    if value > HISTORY_LIMIT_MAX:
+        raise argparse.ArgumentTypeError(f"{text!r} is above {HISTORY_LIMIT_MAX}")
     return value
 
 
@@ -64,7 +68,7 @@ def build_parser() -> argparse.ArgumentParser:
     log.add_argument("--changeset", help="only this changeset's rows")
     log.add_argument(
         "--limit",
-        type=_non_negative_int,
+        type=_log_limit,
         default=DEFAULT_LOG_LIMIT,
         help=f"the most rows to show (0: all; default: {DEFAULT_LOG_LIMIT})",
     )
@@ -170,7 +174,8 @@ def _drift(args: argparse.Namespace, connection: Connection) -> int:
     changeset = _directory_changeset(args.directory, args.changeset) if args.directory else None
     result = infinite.drift(connection, changeset, schemas=args.schema)
     disagreements = [(s.entry.changeset, s.step.label, s.entry.version) for s in result.disagreements if s.entry]
-    code = EXIT_FINDING if result.found else EXIT_OK
+    found = bool(result.differences or result.disagreements)
+    code = EXIT_FINDING if found else EXIT_OK
     if args.format == "json":
         console.emit_json(
             {
@@ -188,7 +193,7 @@ def _drift(args: argparse.Namespace, connection: Connection) -> int:
     rows = [(_CHANGE_SYMBOLS[d.change], d.kind, d.name) for d in result.differences]
     rows += [("~", "step", f"{name}/{label}: recorded applied, check now false") for name, label, _ in disagreements]
     console.table(None, rows)
-    if result.found:
+    if found:
         count = len(rows)
         console.error(f"Drift: {count} difference{'s' if count != 1 else ''}.")
     else:
@@ -210,6 +215,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         return int(args.handler(args, connection))
     except (UsageError, CavernsError) as exc:
         console.error(str(exc))
+        return EXIT_USAGE
+    except Exception as exc:  # a driver, OS or unexpected error is an environment error, never a finding (exit 1)
+        console.error(f"{type(exc).__name__}: {exc}")
         return EXIT_USAGE
     finally:
         if connection is not None:
