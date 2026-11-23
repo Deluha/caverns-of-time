@@ -12,7 +12,7 @@ import json
 import logging
 from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
 from caverns_of_time import __version__
@@ -28,10 +28,22 @@ from caverns_of_time._connection import (
     validate_limit,
     validate_name,
 )
-from caverns_of_time.errors import ChangesetError, EpochRefused, LedgerNotInstalled
+from caverns_of_time.errors import ChangesetError, EpochNotFound, EpochRefused, LedgerNotInstalled
 from caverns_of_time.nozdormu import EPOCHS_EXISTS_SQL
 
-__all__ = ["Column", "Epoch", "EpochTable", "TrackedTable", "catalog", "register", "snapshot", "tracked", "unregister"]
+__all__ = [
+    "Column",
+    "Epoch",
+    "EpochTable",
+    "TableAt",
+    "TrackedTable",
+    "as_of",
+    "catalog",
+    "register",
+    "snapshot",
+    "tracked",
+    "unregister",
+]
 
 _log = logging.getLogger(__name__)
 
@@ -109,6 +121,20 @@ LEFT JOIN caverns.epoch_deletion d ON d.epoch = e.epoch
 ORDER BY e.epoch DESC
 LIMIT %s
 """
+_SELECT_EPOCH_SQL = """
+SELECT e.epoch, e.name, e.ledger_version, e.taken_at, e.taken_by, e.caverns_version, d.deleted_at
+FROM caverns.epoch e
+LEFT JOIN caverns.epoch_deletion d ON d.epoch = e.epoch
+WHERE e.name = %s
+"""
+# The rows of one table of an epoch, ordered by its key columns in declared order: the key's values are collected
+# into a jsonb[] per row, which compares element by element (a number as a number, a string as a string).
+_SELECT_AT_SQL = """
+SELECT r.row FROM caverns.epoch_row r
+WHERE r.epoch = %s AND r.schema_name = %s AND r.table_name = %s
+ORDER BY (SELECT array_agg(r.row -> k ORDER BY o) FROM unnest(%s::text[]) WITH ORDINALITY AS u (k, o))
+LIMIT %s
+"""
 _SELECT_SOURCES_SQL = (
     "SELECT epoch, schema_name, table_name, key, columns, row_count FROM caverns.epoch_source"
     " WHERE epoch = ANY(%s::bigint[]) ORDER BY epoch, schema_name, table_name"
@@ -160,6 +186,19 @@ class Epoch:
     caverns_version: str
     deleted_at: datetime | None
     tables: tuple[EpochTable, ...]
+
+
+@dataclass(frozen=True)
+class TableAt:
+    """One table as it was at an epoch: the epoch, the table's entry in it and the rows read, ordered by key.
+
+    Each row is a dict keyed by the epoch's column names in column order; a value is as JSON holds it (a number,
+    a string, a boolean, None, a list or a dict), its SQL type being the matching `Column.type` of the table.
+    """
+
+    epoch: Epoch
+    table: EpochTable
+    rows: tuple[dict[str, Any], ...]
 
 
 def _tracked_table(row: Sequence[Any]) -> TrackedTable:
@@ -403,3 +442,40 @@ def catalog(connection: Connection, *, limit: int | None = None) -> list[Epoch]:
         _require_installed(cursor)
         cursor.execute(_SELECT_EPOCHS_SQL, (limit,))
         return _read_epochs(cursor, cursor.fetchall())
+
+
+def _find_epoch(cursor: Cursor, name: str) -> Epoch:
+    """The epoch called *name* with its tables; `EpochNotFound` if unknown, `EpochRefused` if deleted."""
+    cursor.execute(_SELECT_EPOCH_SQL, (name,))
+    row = cursor.fetchone()
+    if row is None:
+        raise EpochNotFound(f"no epoch is named {name!r}")
+    (found,) = _read_epochs(cursor, [row])
+    if found.deleted_at is not None:
+        deleted = found.deleted_at.astimezone(UTC).strftime("%Y-%m-%d %H:%M:%S")
+        raise EpochRefused(f"epoch {name!r} was deleted at {deleted} UTC")
+    return found
+
+
+def as_of(connection: Connection, epoch: str, schema: str, table: str, *, limit: int | None = None) -> TableAt:
+    """The table *schema*.*table* as it was at the epoch named *epoch*, rows ordered by key, at most *limit*.
+
+    The columns are the epoch's own, not the live table's. Runs in one read-only transaction and writes nothing.
+    Raises `ChangesetError` for a bad argument (a *limit* that is not a positive integer up to
+    9223372036854775807 included), `LedgerNotInstalled` before `install()`, `EpochNotFound` for an unknown epoch or
+    an epoch that lacks the table and `EpochRefused` for a deleted epoch.
+    """
+    check_connection(connection)
+    validate_name("epoch name", epoch)
+    _validate_table(schema, table)
+    validate_limit(limit)
+    with read_only(connection) as cursor:
+        _require_installed(cursor)
+        found = _find_epoch(cursor, epoch)
+        entry = next((t for t in found.tables if (t.schema, t.table) == (schema, table)), None)
+        if entry is None:
+            raise EpochNotFound(f"epoch {epoch!r} has no table {schema}.{table}")
+        cursor.execute(_SELECT_AT_SQL, (found.epoch, schema, table, list(entry.key), limit))
+        stored = [_json(row[0]) for row in cursor.fetchall()]
+    rows = tuple({c.name: values.get(c.name) for c in entry.columns} for values in stored)
+    return TableAt(found, entry, rows)
