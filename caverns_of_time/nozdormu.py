@@ -20,6 +20,7 @@ from pathlib import Path
 
 from caverns_of_time import __version__
 from caverns_of_time._connection import (
+    EPOCHS_EXISTS_SQL,
     Connection,
     Cursor,
     check_connection,
@@ -339,12 +340,6 @@ CREATE OR REPLACE TRIGGER epoch_row_guard_update_delete BEFORE UPDATE OR DELETE 
 CREATE OR REPLACE TRIGGER epoch_row_no_truncate BEFORE TRUNCATE ON caverns.epoch_row
     FOR EACH STATEMENT EXECUTE FUNCTION caverns.epoch_append_only();
 """
-# True only when all five epoch tables exist; `epochs` (the registry) reads it too, to refuse before the step ran.
-EPOCHS_EXISTS_SQL = (
-    "SELECT to_regclass('caverns.epoch_table') IS NOT NULL AND to_regclass('caverns.epoch') IS NOT NULL"
-    " AND to_regclass('caverns.epoch_source') IS NOT NULL AND to_regclass('caverns.epoch_row') IS NOT NULL"
-    " AND to_regclass('caverns.epoch_deletion') IS NOT NULL"
-)
 _OWN_CHANGESET = Changeset(
     _OWN_CHANGESET_NAME,
     [

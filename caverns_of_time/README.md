@@ -5,8 +5,8 @@
 The importable package. It is generic: nothing here names a consumer or assumes a consumer's schema
 (hard rule 1). It holds the version, the shared exceptions, the console helpers and, so far, four
 components: Nozdormu, the migration ledger, Chromie, the command line, Infinite, the schema fingerprint, and
-Epochs, the snapshots of opted-in tables (so far their registry, the snapshot, the catalog, a table as of an epoch and the
-difference of two epochs, their deletion).
+Epochs, the snapshots of opted-in tables (their registry, the snapshot, the catalog, a table as of an epoch, the
+difference of two epochs and their deletion).
 
 ## Files & entry points
 
@@ -40,8 +40,10 @@ the table of recorded fingerprints, then `epochs`, the epoch tables) and records
 Installing again writes nothing and returns `[]`. Until the ledger exists, reading it behaves as an empty
 ledger; that is how the own changeset bootstraps. A database installed before the `fingerprint` or the `epochs`
 step existed lacks its row: call `install()` again after upgrading, which applies each missing step as a pending
-step; until then `preflight`, `apply`, `baseline` and `drift` raise `LedgerNotInstalled` (`history` needs only
-the ledger table and keeps working), and so do the epoch functions until `epochs` is applied. `install` records no fingerprint.
+step; until then `preflight`, `apply` and `baseline` raise `LedgerNotInstalled` (`history` needs only
+the ledger table and keeps working), and so do the epoch functions until `epochs` is applied. `drift` raises it before
+the `fingerprint` step; before the `epochs` step it does so only given a changeset (its `preflight` runs first):
+without one it checks only `caverns.fingerprint`. `install` records no fingerprint.
 
 **Nozdormu, preflight.** `preflight(connection, changeset)` reports one `StepStatus` (step, status and the
 ledger row that decided it, if any) per step in changeset order and writes nothing: it runs in one
@@ -176,11 +178,12 @@ It is append-only like the ledger: triggers reject UPDATE, DELETE and TRUNCATE. 
 refused, by the foreign key, unless it cascades, and then by the ledger's trigger.
 
 **Epochs, the registry.** Epochs are snapshots of opted-in tables, taken under a name and tagged with the ledger
-version; this release holds the opt-in registry, `caverns.epoch_table`. `register(connection, schema, table, *,
+version; the opt-in registry is `caverns.epoch_table`. `register(connection, schema, table, *,
 key=None)` opts a table in, `unregister(connection, schema, table)` opts it out and `tracked(connection)` lists the
 registry. A table is named by its exact PostgreSQL schema and table name: case-sensitive, never quoted or
 folded by Caverns (PostgreSQL does the quoting), so `Odd Table` is that name and `odd table` another. The key is
-the column list that identifies a row: by default the table's primary key in index order, else the columns
+the column list that identifies a row: by default the table's primary key in index order (its key columns only:
+the `INCLUDE` columns of `PRIMARY KEY (a) INCLUDE (b)` are not part of the key, so it is `(a)`), else the columns
 passed, in the order passed. `register` runs in one transaction under the advisory lock and refuses a table
 that does not exist or is not a table (a view is not one), a key column the table lacks (a dropped column
 included) and, without a `key`, a table with no primary key. Registering the same key again writes nothing and
@@ -197,11 +200,17 @@ the snapshot is taken after the lock is held (a transaction-level lock statement
 waits) and all tables are read in one consistent view; the lock is released when the call ends. The epoch name
 follows the label rules and is unique for good: a deleted epoch keeps its name. A refusal rolls everything back,
 so nothing is written: no registered table, a name taken, a registered table or key column that no longer exists,
-a key with duplicates or with nulls. The copy of a table is one statement PostgreSQL composes (hard rule 3):
+a key with duplicates or with nulls (nulls are checked first, so two rows with a null key report nulls, not duplicates;
+only a key column's own null counts: an array key holding a null element is a valid key). The copy of a table is one statement PostgreSQL composes (hard rule 3):
 `format` quotes the schema and table names and the key as literals from a template bound as a value, never built in
 Python. A value's type is not in the row: JSON holds numbers, strings, booleans, nulls, arrays and objects, so
 read a value's type from the epoch's `columns` (`Column.type`, printed by `format_type` with the search path
-pinned to `pg_catalog`, so a user type is schema-qualified). `catalog(connection, *, limit=None)` lists the epochs
+pinned to `pg_catalog`, so a user type is schema-qualified). The values are printed under settings the snapshot
+pins for its transaction, so an epoch does not depend on the session that took it: `TimeZone` `UTC` (a timestamptz
+ends `+00:00`), `IntervalStyle` `postgres`, `extra_float_digits` 1 and `bytea_output` `hex`; the caller's own settings
+are untouched afterwards. If releasing the advisory lock fails after the epoch is committed, the snapshot still
+returns, with a warning (`could not release Caverns' advisory lock: <error>`) through the
+`caverns_of_time._connection` logger. `catalog(connection, *, limit=None)` lists the epochs
 newest first, deleted ones included, each with its tables.
 
 **Epochs, as of.** `as_of(connection, epoch, schema, table, *, limit=None)` reads one table of an epoch back: the
@@ -219,7 +228,8 @@ the old and new values of the columns that differ, in column order); values are 
 column whose type changed counts as changed in a row only when its JSON value differs (`int` to `bigint` does not,
 `text` `'7'` to `int` 7 does). A column added, removed or of another type (its two types as `format_type` prints
 them) is reported as a column change, and a row that differs only in an added or a removed column is not a changed
-row. A table whose key differs between the epochs is refused (`EpochRefused`, naming the table): leave it out with
+row. A table whose key differs between the epochs, in a column name or in a key column's type, is refused
+(`EpochRefused`, naming the table and both keys with their types, `(id integer)` and `(id text)`): leave it out with
 `tables`. A table that does not differ is left out of the result. It reads in one read-only transaction, writes
 nothing and ignores the live tables; a deleted epoch is refused. Rows come back ordered by the key columns in their
 declared order, as in `as_of`.
@@ -230,8 +240,10 @@ in `caverns.epoch_deletion` (the time, the user, the Caverns version), then dele
 which the table's trigger allows only after the tombstone. The catalog row and the `epoch_source` rows stay, so
 `catalog` and `chromie epochs` still list the epoch with its deletion time and its table sizes, and the name stays
 taken for good (`snapshot` refuses it; `as_of` and `diff` refuse the epoch). It is all or nothing: one transaction
-under the advisory lock resolves every name first, so an unknown or an already deleted name deletes nothing. A
-deletion is a tombstone, not a ledger row: the ledger is the schema timeline that `preflight` and Timewalking read.
+under the advisory lock resolves every name first, so an unknown or an already deleted name deletes nothing.
+`delete(connection, names, dry_run=True)` validates and resolves the names the same way (same errors) in one
+read-only transaction without the lock and returns the epochs that would be deleted, newest first, with `deleted_at`
+None: nothing is written. A deletion is a tombstone, not a ledger row: the ledger is the schema timeline that `preflight` and Timewalking read.
 
 **The epoch tables.** Created by the own step `epochs`, all in schema `caverns`:
 
@@ -308,7 +320,7 @@ difference: `+` added, `-` removed, `~` changed, then its kind (`table`, `column
 (the table, its columns, then its rows added, removed and changed). A row is named by its table and its key as
 compact JSON values, a changed row followed by the columns that differ, a column of another type by both types. A last
 line counts the lines and the tables. Exit 0 when nothing differs, 1 when anything does, 2 on a usage or environment
-error: an unknown or a deleted epoch, a table neither epoch holds, a table whose key differs between the epochs,
+error: an unknown or a deleted epoch, a table neither epoch holds, a table whose key (a name or a type) differs between the epochs,
 a ledger that is not installed or a malformed `--table`. `--format json` prints `{"old": {"epoch",
 "ledger_version"}, "new": {...}, "tables": [{"schema", "table", "change", "key": [...], "columns": [{"name",
 "change", "old_type", "new_type"}], "added": [{key}], "removed": [{key}], "changed": [{"key", "old", "new"}]}]}`
@@ -345,10 +357,11 @@ EPOCH  NAME    LEDGER  TAKEN_AT (UTC)       BY        TABLES  ROWS  DELETED (UTC
 
 `chromie delete-epoch EPOCH [EPOCH ...] [--dry-run] [--yes]` deletes the named epochs and their rows (`epochs.delete`;
 the catalog rows and the names stay). An epoch that is unknown or already deleted is a usage error and nothing is
-deleted. Without `--yes` it asks on stderr, `Delete 2 epochs (run-40, run-41) and their 1216 rows? [y/N]`, and
-only `y` or `yes` goes on: any other answer or the end of input prints `ℹ️ Aborted — no changes were made.` and exits 0; when stdin is
+deleted: the plan, for `--dry-run` and the confirmation alike, comes from `epochs.delete(..., dry_run=True)`, so the
+error is the library's. Without `--yes` it asks on stderr, `Delete 2 epochs (run-40, run-41) and their 1216 rows? [y/N]`, and
+only `y` or `yes` goes on: any other answer, the end of input or Ctrl-C prints `ℹ️ Aborted — no changes were made.` and exits 0; when stdin is
 not a terminal it refuses without `--yes` (exit 2), so an unattended run must pass `--yes`. `--dry-run` deletes
-nothing and asks nothing: it prints one line per epoch and `ℹ️ Dry run — nothing deleted.`. A deletion prints one
+nothing and asks nothing: it prints one line per epoch, newest first, and `ℹ️ Dry run — nothing deleted.`. A deletion prints one
 `✅ Deleted epoch NAME (N rows in M tables).` line per epoch, newest first. `--format json` prints the list of epochs
 in the shape of `chromie epochs` (those that would be deleted with `--dry-run`, with `deleted_at` null; those deleted
 otherwise, with `deleted_at` set) and no status lines. Exit 0; 2 for an unknown or an already deleted epoch, no
@@ -459,7 +472,8 @@ With nothing found: `✅ No drift — the live schema matches the fingerprint at
   schemas compared (a tuple), the `Difference(kind, name, change)` values (`kind` one of the six kinds, `change`
   `added`, `removed` or `changed`) and the `StepStatus` values of the disagreements, each a tuple. Read-only
   transactions, nothing written. Raises `LedgerNotInstalled` before
-  `install()` (the fingerprint table does not exist), `NoFingerprint` when none is recorded, `ChangesetError`
+  `install()` (the fingerprint table does not exist; given a *changeset*, also before the `epochs` step, by its
+  `preflight`), `NoFingerprint` when none is recorded, `ChangesetError`
   for a bad `schemas` or one that is not watched, and the errors of `preflight` for a `changeset`.
 - `epochs.register(connection, schema, table, *, key=None) -> TrackedTable`: opts the table in and returns its
   registry row as stored. *schema* and *table* are non-empty strings, exact names; *key* is None (the primary key) or a
@@ -478,10 +492,12 @@ With nothing found: `✅ No drift — the live schema matches the fingerprint at
 - `epochs.catalog(connection, *, limit=None) -> list[Epoch]`: the epochs newest first, deleted ones included, at
   most *limit* (None: all) in one read-only transaction that writes nothing. Raises `ChangesetError` for a *limit*
   that is not a positive integer up to 9223372036854775807 and `LedgerNotInstalled`.
-- `epochs.delete(connection, names) -> list[Epoch]`: deletes the epochs called *names* (a non-empty collection of valid
+- `epochs.delete(connection, names, *, dry_run=False) -> list[Epoch]`: deletes the epochs called *names* (a non-empty collection of valid
   names, never a bare string; duplicates collapse): a tombstone, then the epoch's `epoch_row` rows. The catalog and
   source rows stay and the name stays taken. One transaction under the advisory lock, every name resolved before
-  anything is written: all or nothing. Returns the deleted epochs re-read (`deleted_at` set), newest first. Raises
+  anything is written: all or nothing. Returns the deleted epochs re-read in one query (`deleted_at` set), newest
+  first. With *dry_run* the same validation and errors run in a read-only transaction without the lock, and the epochs
+  that would be deleted are returned (`deleted_at` None) with nothing written. Raises
   `ChangesetError` for a bad *names*, `LedgerNotInstalled`, `EpochNotFound` (an unknown epoch) and `EpochRefused` (an
   already deleted epoch). Logs `deleted epoch NAME: N rows in M tables` per epoch.
 - `epochs.as_of(connection, epoch, schema, table, *, limit=None) -> TableAt`: the table as it was at the epoch named
@@ -494,7 +510,7 @@ With nothing found: `✅ No drift — the live schema matches the fingerprint at
   (every table of either epoch) or a non-empty collection, never a bare string, of `(schema, table)` pairs of
   non-empty strings; duplicates collapse. Raises `ChangesetError` for a bad argument, `LedgerNotInstalled`,
   `EpochNotFound` (an unknown epoch, or a named table neither epoch has) and `EpochRefused` (a deleted epoch, or a
-  table whose key differs between the epochs).
+  table whose key, a column name or a key column's type, differs between the epochs).
 - `EpochDiff(old, new, tables)`: a frozen dataclass of the two `Epoch` values and a tuple of the `TableDiff` values of
   the tables that differ, ordered by schema and table (empty: no difference). `TableDiff(schema, table, change, key,
   columns, added, removed, changed)`: `change` is `added` or `removed` (a table in one epoch only: `columns`, `added`,

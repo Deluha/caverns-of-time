@@ -96,7 +96,7 @@ def test_install_creates_the_five_epoch_tables_and_records_the_step(ledger_conn:
     assert [(e.version, e.label, e.outcome) for e in entries] == OWN_ROWS
     assert entries[2].checksum == nozdormu._OWN_CHANGESET.steps[2].checksum
     assert _tables_exist(ledger_conn) == EPOCH_TABLES
-    assert _query(ledger_conn, nozdormu.EPOCHS_EXISTS_SQL) == [(True,)]
+    assert _query(ledger_conn, _connection.EPOCHS_EXISTS_SQL) == [(True,)]
     assert _query(ledger_conn, LEDGER_ROWS) == OWN_ROWS
     for table in EPOCH_TABLES:  # installing records no epoch and registers no table
         assert _query(ledger_conn, f"SELECT count(*) FROM caverns.{table}") == [(0,)]
@@ -285,6 +285,11 @@ def test_register_takes_a_partitioned_table(ledger_conn: Any) -> None:
     assert register(ledger_conn, SCHEMA, "parts").key == ("id",)
 
 
+def test_register_takes_only_the_key_columns_of_a_primary_key_with_include(ledger_conn: Any) -> None:
+    _installed_with_tables(ledger_conn, f"CREATE TABLE {SCHEMA}.inc (a int, b int, PRIMARY KEY (a) INCLUDE (b))")
+    assert register(ledger_conn, SCHEMA, "inc").key == ("a",)
+
+
 def test_register_keeps_the_order_of_an_explicit_key(ledger_conn: Any) -> None:
     _installed_with_tables(ledger_conn, f"CREATE TABLE {SCHEMA}.pair (a int, b int, c int)")
     row = register(ledger_conn, SCHEMA, "pair", key=("c", "a", "b"))
@@ -442,6 +447,7 @@ CALLS: dict[str, Callable[[Any], object]] = {
     "as_of": lambda conn: as_of(conn, "e", SCHEMA, "one"),
     "diff": lambda conn: diff(conn, "e", "f"),
     "delete": lambda conn: delete(conn, ["e"]),
+    "delete_dry_run": lambda conn: delete(conn, ["e"], dry_run=True),
 }
 
 
@@ -751,6 +757,84 @@ def test_snapshot_refuses_a_key_with_nulls(ledger_conn: Any) -> None:
     _nothing_written(ledger_conn)
 
 
+def test_snapshot_accepts_an_array_key_holding_a_null_element(ledger_conn: Any) -> None:
+    _installed_with_tables(
+        ledger_conn,
+        f"CREATE TABLE {SCHEMA}.arr (k int[], v int)",
+        f"INSERT INTO {SCHEMA}.arr VALUES ('{{1,NULL}}', 1), ('{{2,3}}', 2)",
+    )
+    register(ledger_conn, SCHEMA, "arr", key=["k"])
+    assert [t.row_count for t in snapshot(ledger_conn, "arr").tables] == [2]
+
+
+def test_snapshot_reports_two_rows_with_a_null_key_as_nulls_not_duplicates(ledger_conn: Any) -> None:
+    _installed_with_tables(
+        ledger_conn,
+        f"CREATE TABLE {SCHEMA}.nul (a int, b int)",
+        f"INSERT INTO {SCHEMA}.nul VALUES (NULL, 1), (NULL, 2)",
+    )
+    register(ledger_conn, SCHEMA, "nul", key=["a"])
+    with pytest.raises(EpochRefused, match=rf"the key \(a\) of {SCHEMA}\.nul has nulls"):
+        snapshot(ledger_conn, "nul")
+    _nothing_written(ledger_conn)
+
+
+def test_snapshot_copies_the_rows_of_a_partitioned_table(ledger_conn: Any) -> None:
+    _installed_with_tables(
+        ledger_conn,
+        f"CREATE TABLE {SCHEMA}.parts (id int PRIMARY KEY, n int) PARTITION BY RANGE (id)",
+        f"CREATE TABLE {SCHEMA}.parts_low PARTITION OF {SCHEMA}.parts FOR VALUES FROM (0) TO (10)",
+        f"CREATE TABLE {SCHEMA}.parts_high PARTITION OF {SCHEMA}.parts FOR VALUES FROM (10) TO (20)",
+        f"INSERT INTO {SCHEMA}.parts VALUES (1, 10), (12, 20), (3, 30)",
+    )
+    register(ledger_conn, SCHEMA, "parts")
+    taken = snapshot(ledger_conn, "parts")
+    assert [t.row_count for t in taken.tables] == [3]
+    rows = as_of(ledger_conn, "parts", SCHEMA, "parts").rows
+    assert [(row["id"], row["n"]) for row in rows] == [(1, 10), (3, 30), (12, 20)]
+
+
+VALUES = (
+    f"CREATE TABLE {SCHEMA}.vals (ts timestamptz PRIMARY KEY, iv interval, f float8, bt bytea)",
+    f"INSERT INTO {SCHEMA}.vals VALUES ('2026-11-22 17:06:45+01', '1 day 02:03:04', 0.1::float8 + 0.2::float8,"
+    " '\\xdeadbeef')",
+)
+SETTINGS = (
+    "SELECT current_setting('TimeZone'), current_setting('IntervalStyle'),"
+    " current_setting('extra_float_digits'), current_setting('bytea_output')"
+)
+
+
+def test_snapshot_stores_the_same_values_whatever_the_sessions_output_settings(ledger_conn: Any) -> None:
+    _installed_with_tables(ledger_conn, *VALUES)
+    register(ledger_conn, SCHEMA, "vals")
+    _execute(
+        ledger_conn,
+        "SET TimeZone = 'UTC'",
+        "SET IntervalStyle = 'iso_8601'",
+        "SET extra_float_digits = 0",
+        "SET bytea_output = 'escape'",
+    )
+    a = snapshot(ledger_conn, "a")
+    assert _query(ledger_conn, SETTINGS) == [("UTC", "iso_8601", "0", "escape")]
+    _execute(
+        ledger_conn,
+        "SET TimeZone = 'Europe/Paris'",
+        "SET IntervalStyle = 'sql_standard'",
+        "SET extra_float_digits = 3",
+        "SET bytea_output = 'hex'",
+    )
+    b = snapshot(ledger_conn, "b")
+    assert _query(ledger_conn, SETTINGS) == [("Europe/Paris", "sql_standard", "3", "hex")]  # the caller's, untouched
+    assert diff(ledger_conn, "a", "b").tables == ()
+    assert _stored(ledger_conn, a.epoch, "vals") == _stored(ledger_conn, b.epoch, "vals")
+    (row,) = as_of(ledger_conn, "b", SCHEMA, "vals").rows
+    assert row["ts"] == "2026-11-22T16:06:45+00:00"
+    assert row["bt"] == "\\xdeadbeef"
+    assert row["f"] == 0.1 + 0.2
+    assert as_of(ledger_conn, "a", SCHEMA, "vals").rows == (row,)
+
+
 def test_snapshot_releases_the_session_lock(ledger_conn: Any) -> None:
     _installed_with_tables(ledger_conn, ONE)
     register(ledger_conn, SCHEMA, "one")
@@ -784,6 +868,33 @@ def test_snapshot_waits_for_the_lock_and_sees_what_the_holder_committed(ledger_c
     assert not runner.is_alive()
     assert "error" not in result, result
     assert [t.row_count for t in result["epoch"].tables] == [2]
+
+
+def test_session_lock_is_held_in_the_block_and_released_after_it(ledger_conn: Any) -> None:
+    with _connection.session_lock(ledger_conn):
+        assert _query(ledger_conn, ADVISORY_LOCKS) == [(1,)]
+    assert _query(ledger_conn, ADVISORY_LOCKS) == [(0,)]
+
+
+def test_session_lock_is_released_when_the_block_raises(ledger_conn: Any) -> None:
+    with pytest.raises(ZeroDivisionError), _connection.session_lock(ledger_conn):
+        raise ZeroDivisionError
+    assert _query(ledger_conn, ADVISORY_LOCKS) == [(0,)]
+
+
+def test_session_lock_that_cannot_be_taken_raises_the_drivers_error(second_conn: Any) -> None:
+    second_conn.close()  # the lock statement fails; the best-effort release fails too, and is not what is raised
+    with pytest.raises(DRIVER_ERRORS), _connection.session_lock(second_conn):
+        pytest.fail("the block must not run")
+
+
+def test_session_lock_that_cannot_be_released_after_the_block_warns_and_returns(
+    ledger_conn: Any, second_conn: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    with caplog.at_level(logging.WARNING, logger=_connection.__name__), _connection.session_lock(second_conn):
+        second_conn.close()  # the block's work is done; releasing the lock now fails (the server frees it)
+    assert [r.getMessage().split(":")[0] for r in caplog.records] == ["could not release Caverns' advisory lock"]
+    assert _query(ledger_conn, ADVISORY_LOCKS) == [(0,)]
 
 
 # --- catalog --------------------------------------------------------------------------------
@@ -963,9 +1074,9 @@ def test_as_of_refuses_a_deleted_epoch(ledger_conn: Any) -> None:
     _execute(ledger_conn, INSERT_TOMBSTONE.replace(EPOCH_ID, str(taken.epoch)))
     (deleted_at,) = _query(
         ledger_conn,
-        "SELECT to_char(deleted_at AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS') FROM caverns.epoch_deletion",
+        "SELECT to_char(deleted_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS') FROM caverns.epoch_deletion",
     )[0]
-    with pytest.raises(EpochRefused, match=rf"epoch 'first' was deleted at {deleted_at} UTC$"):
+    with pytest.raises(EpochRefused, match=rf"epoch 'first' was deleted at {deleted_at}\+00:00$"):
         as_of(ledger_conn, "first", SCHEMA, "one")
     _assert_idle(ledger_conn)
 
@@ -1216,12 +1327,29 @@ def _key_changed(conn: Any) -> None:
 
 def test_diff_refuses_a_table_whose_key_differs_and_names_it(ledger_conn: Any) -> None:
     _key_changed(ledger_conn)
-    message = rf"the key of {SCHEMA}\.one differs between epochs 'a' \(id\) and 'b' \(name\)"
+    message = rf"the key of {SCHEMA}\.one differs between epochs 'a' \(id integer\) and 'b' \(name text\)"
     with pytest.raises(EpochRefused, match=rf"^{message}: leave the table out with tables=$"):
         diff(ledger_conn, "a", "b")
     _assert_idle(ledger_conn)
     with pytest.raises(EpochRefused, match="differs"):
         diff(ledger_conn, "a", "b", tables=[(SCHEMA, "one"), (SCHEMA, "two")])
+
+
+def test_diff_refuses_a_table_whose_key_column_changed_type_and_names_it(ledger_conn: Any) -> None:
+    _installed_with_tables(
+        ledger_conn,
+        f"CREATE TABLE {SCHEMA}.kt (id int PRIMARY KEY, v text)",
+        f"INSERT INTO {SCHEMA}.kt VALUES (1, 'x')",
+    )
+    register(ledger_conn, SCHEMA, "kt")
+    snapshot(ledger_conn, "a")
+    _execute(ledger_conn, f"ALTER TABLE {SCHEMA}.kt ALTER id TYPE text")
+    snapshot(ledger_conn, "b")
+    message = rf"the key of {SCHEMA}\.kt differs between epochs 'a' \(id integer\) and 'b' \(id text\)"
+    with pytest.raises(EpochRefused, match=rf"^{message}: leave the table out with tables=$"):
+        diff(ledger_conn, "a", "b")
+    _assert_idle(ledger_conn)
+    assert diff(ledger_conn, "a", "a").tables == ()
 
 
 def test_diff_with_tables_leaves_out_the_table_whose_key_differs(ledger_conn: Any) -> None:
@@ -1279,7 +1407,7 @@ def test_diff_refuses_a_deleted_epoch(ledger_conn: Any) -> None:
     (epoch_a,) = _query(ledger_conn, "SELECT epoch FROM caverns.epoch WHERE name = 'a'")[0]
     _execute(ledger_conn, INSERT_TOMBSTONE.replace(EPOCH_ID, str(epoch_a)))
     for old, new in (("a", "b"), ("b", "a")):
-        with pytest.raises(EpochRefused, match=r"epoch 'a' was deleted at \d{4}-\d\d-\d\d \d\d:\d\d:\d\d UTC$"):
+        with pytest.raises(EpochRefused, match=r"epoch 'a' was deleted at \d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\+00:00$"):
             diff(ledger_conn, old, new)
         _assert_idle(ledger_conn)
 
@@ -1436,3 +1564,89 @@ def test_delete_refuses_a_direct_delete_of_another_epochs_rows_afterwards(ledger
     delete(ledger_conn, ["b"])
     _refused(ledger_conn, f"DELETE FROM caverns.epoch_row WHERE epoch = {a.epoch}", "keeps an epoch's rows")
     assert _query(ledger_conn, f"SELECT count(*) FROM caverns.epoch_row WHERE epoch = {a.epoch}") == [(3,)]
+
+
+def test_delete_dry_run_returns_the_epochs_newest_first_and_writes_nothing(ledger_conn: Any) -> None:
+    a, b, c = _three_epochs(ledger_conn)
+    before = _query(ledger_conn, ROW_COUNTS)
+    assert delete(ledger_conn, ("a", "c", "a"), dry_run=True) == [c, a]
+    assert _query(ledger_conn, ROW_COUNTS) == before == [(a.epoch, 3), (b.epoch, 3), (c.epoch, 3)]
+    assert _query(ledger_conn, "SELECT count(*) FROM caverns.epoch_deletion") == [(0,)]
+    assert _query(ledger_conn, ADVISORY_LOCKS) == [(0,)]
+    _assert_idle(ledger_conn)
+    assert [e.deleted_at for e in catalog(ledger_conn)] == [None, None, None]
+
+
+def test_delete_dry_run_logs_nothing(ledger_conn: Any, caplog: pytest.LogCaptureFixture) -> None:
+    _three_epochs(ledger_conn)
+    with caplog.at_level(logging.INFO, logger=epochs.__name__):
+        delete(ledger_conn, ["a"], dry_run=True)
+    assert caplog.records == []
+
+
+def test_delete_dry_run_refuses_what_delete_refuses(ledger_conn: Any) -> None:
+    _three_epochs(ledger_conn)
+    delete(ledger_conn, ["c"])
+    cases: list[tuple[Any, type[Exception], str]] = [
+        (["a", "nope"], EpochNotFound, "no epoch is named 'nope'"),
+        (["a", "c"], EpochRefused, "epoch 'c' was deleted at"),
+        ("a", ChangesetError, "not the string 'a'"),
+        (None, ChangesetError, "not None"),
+        ([], ChangesetError, "names is empty"),
+        (["a", " b"], ChangesetError, "surrounding whitespace"),
+    ]
+    for names, error, message in cases:
+        with pytest.raises(error, match=message):
+            delete(ledger_conn, names, dry_run=True)
+        _assert_idle(ledger_conn)
+    assert [e.deleted_at is not None for e in catalog(ledger_conn)] == [True, False, False]
+
+
+def test_delete_dry_run_does_not_wait_for_the_lock(ledger_conn: Any, second_conn: Any) -> None:
+    _three_epochs(ledger_conn)
+    with second_conn.cursor() as cursor:
+        _connection.lock(cursor)
+    result: dict[str, Any] = {}
+
+    def run() -> None:
+        try:
+            result["plan"] = delete(ledger_conn, ["a"], dry_run=True)
+        except BaseException as error:  # reported by the assertions below
+            result["error"] = error
+
+    runner = threading.Thread(target=run, daemon=True)
+    runner.start()
+    try:
+        runner.join(WAIT_SECONDS)
+    finally:
+        second_conn.rollback()
+    assert not runner.is_alive()
+    assert "error" not in result, result
+    assert [e.name for e in result["plan"]] == ["a"]
+
+
+def test_delete_waits_for_the_lock_and_deletes_after_the_holder_commits(ledger_conn: Any, second_conn: Any) -> None:
+    _three_epochs(ledger_conn)
+    with second_conn.cursor() as cursor:
+        _connection.lock(cursor)
+    result: dict[str, Any] = {}
+
+    def run() -> None:
+        try:
+            result["deleted"] = delete(ledger_conn, ["a"])
+        except BaseException as error:  # reported by the assertions below
+            result["error"] = error
+
+    runner = threading.Thread(target=run, daemon=True)
+    runner.start()
+    try:
+        _wait_for_a_waiting_lock(second_conn)
+        with second_conn.cursor() as cursor:  # nothing is deleted while the other runner holds the lock
+            cursor.execute("SELECT count(*) FROM caverns.epoch_deletion")
+            assert cursor.fetchone() == (0,)
+    finally:
+        second_conn.rollback()  # releases the lock
+        runner.join(WAIT_SECONDS)
+    assert not runner.is_alive()
+    assert "error" not in result, result
+    assert [e.name for e in result["deleted"]] == ["a"]

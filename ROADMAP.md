@@ -166,7 +166,7 @@ Sign-off decisions (owner, 2026-11-22: C1–C9 confirmed as recommended; C10 con
 | Commit | Content |
 |---|---|
 | 1 | Opt-in registry of snapshotted tables and the epoch catalog (name, time, ledger version). |
-| 2 | Snapshot: copy the opted-in tables into the history schema under one epoch. |
+| 2 | Snapshot: copy the opted-in tables into the epoch tables under one epoch. |
 | 3 | `chromie as-of <epoch> <table>` and the query API. |
 | 4 | `chromie diff <epoch> <epoch>`: rows added, removed and changed, by a declared key. |
 | 5 | Retention: list and delete epochs. |
@@ -176,7 +176,7 @@ Sign-off: storage layout (one history table per source table, keyed by epoch —
 when a table's columns changed between two epochs; retention defaults; whether deletion of an epoch is
 itself recorded in the ledger.
 
-Sign-off decisions (owner, 2026-11-23: E1–E7 confirmed as recommended):
+Sign-off decisions (owner, 2026-11-23: E1–E7 confirmed as recommended; E8 confirmed after the phase review):
 
 | # | Item | Decision |
 |---|---|---|
@@ -187,6 +187,7 @@ Sign-off decisions (owner, 2026-11-23: E1–E7 confirmed as recommended):
 | E5 | Library API | Module `epochs`: `register(conn, schema, table, *, key=None) -> TrackedTable` (key defaults to the primary key, refused without either; the same key again is a no-op, another key replaces it with a warning); `unregister(conn, schema, table)` (history kept); `tracked(conn) -> list[TrackedTable]`; `snapshot(conn, name) -> Epoch` (every registered table in one REPEATABLE READ transaction under the ledger's advisory lock, taken before the snapshot; refused without tables, for a missing table or key column, a key with duplicates or nulls, a used name); `catalog(conn, *, limit=None) -> list[Epoch]` (newest first, deleted ones included); `as_of(conn, epoch, schema, table, *, limit=None) -> TableAt`; `diff(conn, old, new, *, tables=None) -> EpochDiff`; `delete(conn, names) -> list[Epoch]`. Epochs are named by `name`, required, following the label rules and unique for good. Exceptions `EpochNotFound`, `EpochRefused`; bad arguments `ChangesetError`. Identifiers are composed by PostgreSQL (`format('%I.%I')`), never in Python. |
 | E6 | CLI | `chromie epochs [--limit N]`; `chromie as-of EPOCH SCHEMA.TABLE [--limit N]` (both `--limit` default 20, 0 all); `chromie diff OLD NEW [--table SCHEMA.TABLE ...]`; `chromie delete-epoch EPOCH ... [--dry-run] [--yes]`, the first command that writes (amends C2): it asks for confirmation (default no) and requires `--yes` unattended. Exit codes: 0 success; `diff` 1 when anything differs; 2 usage or environment (an epoch or table not found, a deleted epoch, a refusal). `--table` joins the flag table. No snapshot command: the consumer's runner calls `snapshot`. |
 | E7 | Commits | As the table above; the own step `epochs` lands in commit 1 with all five tables. |
+| E8 | Review amendment | A snapshot prints its values under pinned settings, transaction-local: `TimeZone` `UTC`, `IntervalStyle` `postgres`, `extra_float_digits` `1`, `bytea_output` `hex`, so what `epoch_row.row` stores does not depend on the caller's session. `delete(conn, names, *, dry_run=False)`: with `dry_run` the same checks and errors, returns the epochs it would delete and writes nothing; `chromie delete-epoch` uses it for `--dry-run` and its confirmation. A key column whose type differs between two epochs is a key that differs (`diff` refuses the table). A primary key's `INCLUDE` columns are not key columns. A declined confirmation exits 0. The guidance's "history tables" wording becomes "the epoch tables". |
 
 ### Phase 4 — Murozond and Timewalking
 
