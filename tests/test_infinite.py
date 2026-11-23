@@ -365,15 +365,67 @@ def test_reading_writes_nothing_and_leaves_no_open_transaction(conn: Any) -> Non
     assert _query(conn, "SELECT pg_current_xact_id_if_assigned() IS NULL") == [(True,)]
 
 
-# --- the fingerprint's default schemas follow the last recorded one -------------------------
+# --- the watched schemas ---------------------------------------------------------------------
 
 
-def test_the_default_schemas_are_those_of_the_latest_recorded_fingerprint(conn: Any) -> None:
+def _latest_schemas(conn: Any) -> list[str]:
+    """The schemas of the latest recorded fingerprint."""
+    schemas: list[str] = _query(conn, "SELECT schemas FROM caverns.fingerprint ORDER BY version DESC LIMIT 1")[0][0]
+    return schemas
+
+
+def test_a_baseline_with_schemas_sets_the_default_of_the_fingerprint(conn: Any) -> None:
     _created(conn, TABLE)
     install(conn)
     baseline(conn, Changeset("app", [Step("base", "SELECT 1")]), schemas=[SCHEMA])
     assert fingerprint(conn).schemas == (SCHEMA,)
     assert fingerprint(conn, schemas=["public"]).schemas == ("public",)
+
+
+def test_without_a_baseline_a_schema_created_later_is_watched(conn: Any, caplog: pytest.LogCaptureFixture) -> None:
+    install(conn)
+    apply(conn, APP)
+    assert EXT_SCHEMA not in _latest_schemas(conn)
+    _run(conn, f"CREATE SCHEMA {EXT_SCHEMA}", f"CREATE TABLE {EXT_SCHEMA}.u ()")
+    result = drift(conn)
+    assert EXT_SCHEMA in result.schemas  # read live: the new schema is watched at once
+    assert [(d.change, d.kind, d.name) for d in result.differences] == [("added", "table", f"{EXT_SCHEMA}.u")]
+    with caplog.at_level("WARNING"):
+        apply(conn, Changeset("app", [*STEPS, Step("later", "SELECT 1")]))
+    assert f"added table {EXT_SCHEMA}.u" in caplog.text  # the warning compares the watched schemas too
+    assert EXT_SCHEMA in _latest_schemas(conn)
+    assert drift(conn).differences == ()
+
+
+def test_a_baseline_with_schemas_makes_later_applies_and_drift_cover_only_those(conn: Any) -> None:
+    _baselined(conn, TABLE, f"CREATE SCHEMA {EXT_SCHEMA}", f"CREATE TABLE {EXT_SCHEMA}.u ()")
+    changeset = Changeset("app", [Step("base", "SELECT 1"), Step("more", f"CREATE TABLE {SCHEMA}.more ()")])
+    apply(conn, changeset)
+    assert _latest_schemas(conn) == [SCHEMA]
+    _run(conn, f"CREATE TABLE {EXT_SCHEMA}.v ()", f"CREATE TABLE {SCHEMA}.later ()")
+    result = drift(conn)
+    assert result.schemas == (SCHEMA,)
+    assert [d.name for d in result.differences] == [f"{SCHEMA}.later"]
+    with pytest.raises(ChangesetError, match=f"the schema '{EXT_SCHEMA}' is not watched"):
+        drift(conn, schemas=[EXT_SCHEMA])
+    _assert_idle(conn)
+
+
+def test_a_baseline_without_schemas_takes_the_default_not_the_inherited_set(conn: Any) -> None:
+    _baselined(conn, TABLE)
+    assert _latest_schemas(conn) == [SCHEMA]
+    baseline(conn, Changeset("other", [Step("base", "SELECT 1")]))
+    assert _latest_schemas(conn) == list(fingerprint(conn).schemas)
+    assert SCHEMA in _latest_schemas(conn) and "public" in _latest_schemas(conn)
+    assert "caverns" not in _latest_schemas(conn)
+
+
+def test_a_later_baseline_of_another_changeset_changes_the_watched_set(conn: Any) -> None:
+    _baselined(conn, TABLE)
+    assert drift(conn).schemas == (SCHEMA,)
+    baseline(conn, Changeset("other", [Step("base", "SELECT 1")]), schemas=["public"])  # database-wide
+    assert fingerprint(conn).schemas == ("public",)
+    assert drift(conn).schemas == ("public",)
 
 
 # --- compare ---------------------------------------------------------------------------------
@@ -463,7 +515,7 @@ def test_drift_before_install_is_refused(conn: Any) -> None:
 def test_drift_of_an_unchanged_database_finds_nothing(conn: Any) -> None:
     _applied(conn)
     result = drift(conn, APP)
-    assert isinstance(result, Drift) and not result.found
+    assert isinstance(result, Drift)
     assert (result.differences, result.disagreements) == ((), ())
     assert result.fingerprint_version == history(conn, changeset="app", limit=1)[0].version
     assert SCHEMA in result.schemas and "public" in result.schemas
@@ -478,7 +530,7 @@ def test_drift_finds_what_was_added(conn: Any) -> None:
         ("added", "index", f"{SCHEMA}.t_id_idx"),
         ("added", "function", f"{SCHEMA}.f(a integer)"),
     ]
-    assert drift(conn).found
+    assert len(drift(conn).differences) == 3
 
 
 def test_drift_finds_what_was_removed(conn: Any) -> None:
@@ -522,10 +574,10 @@ def test_drift_finds_a_changed_index(conn: Any) -> None:
 def test_drift_compares_with_the_latest_fingerprint_only(conn: Any) -> None:
     _applied(conn)
     _run(conn, f"ALTER TABLE {SCHEMA}.t ADD COLUMN extra text")
-    assert drift(conn).found
+    assert drift(conn).differences
     apply(conn, Changeset("app", [*STEPS, Step("later", f"CREATE TABLE {SCHEMA}.later ()")]))
     result = drift(conn)  # the new run's fingerprint holds the column
-    assert not result.found and result.fingerprint_version == history(conn, limit=1)[0].version
+    assert not result.differences and result.fingerprint_version == history(conn, limit=1)[0].version
 
 
 def test_drift_schemas_narrow_the_report(conn: Any) -> None:
@@ -568,7 +620,6 @@ def test_drift_reports_a_step_recorded_as_applied_whose_check_is_now_false(conn:
         ("removed", "column"),
         ("removed", "column"),
     ]
-    assert result.found
     assert drift(conn).disagreements == ()  # without a changeset there is nothing to run
 
 
@@ -597,7 +648,7 @@ def test_drift_writes_nothing_and_leaves_no_open_transaction(conn: Any) -> None:
     _applied(conn)
     _run(conn, f"ALTER TABLE {SCHEMA}.t ADD COLUMN extra text")
     before = _query(conn, LEDGER_AND_FINGERPRINTS)
-    assert drift(conn, APP).found
+    assert drift(conn, APP).differences
     _assert_idle(conn)
     assert _query(conn, LEDGER_AND_FINGERPRINTS) == before
     assert _query(conn, "SELECT pg_current_xact_id_if_assigned() IS NULL") == [(True,)]

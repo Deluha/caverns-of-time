@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -123,6 +124,41 @@ def test_log_refuses_a_negative_limit(capsys: pytest.CaptureFixture[str]) -> Non
         chromie.main(["log", "--limit", "-1"])
     assert raised.value.code == chromie.EXIT_USAGE
     assert "--limit" in capsys.readouterr().err
+
+
+def test_log_refuses_a_limit_above_the_bigint_maximum(capsys: pytest.CaptureFixture[str]) -> None:
+    with pytest.raises(SystemExit) as raised:
+        chromie.main(["log", "--limit", "9223372036854775808"])
+    assert raised.value.code == chromie.EXIT_USAGE
+    assert "--limit" in capsys.readouterr().err
+
+
+def test_a_refused_connection_is_a_usage_error(capsys: pytest.CaptureFixture[str]) -> None:
+    refused = "host=127.0.0.1 port=1 dbname=x connect_timeout=2"
+    code, out, err = _run(capsys, "log", "--dsn", refused)
+    assert (code, out) == (chromie.EXIT_USAGE, "")
+    assert "cannot connect" in err
+
+
+def test_a_missing_driver_is_a_usage_error_naming_the_extra(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setitem(sys.modules, "psycopg", None)  # `import psycopg` now raises ImportError
+    code, out, err = _run(capsys, "log", "--dsn", "host=127.0.0.1 dbname=x")
+    assert (code, out) == (chromie.EXIT_USAGE, "")
+    assert "caverns-of-time[cli]" in err
+
+
+def test_an_unexpected_error_is_a_usage_error_never_a_finding(
+    monkeypatch: pytest.MonkeyPatch, db_dsn: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def broken(args: object, connection: object) -> int:
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(chromie, "_log", broken)
+    code, out, err = _run(capsys, "log", "--dsn", db_dsn)
+    assert (code, out) == (chromie.EXIT_USAGE, "")
+    assert err == "❌ RuntimeError: boom\n"
 
 
 def test_log_refuses_a_limit_that_is_not_a_number() -> None:

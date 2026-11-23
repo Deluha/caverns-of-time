@@ -16,8 +16,6 @@ __all__ = [
     "Connection",
     "Cursor",
     "check_connection",
-    "cursor",
-    "has_more_results",
     "names",
     "read_only",
     "run_check",

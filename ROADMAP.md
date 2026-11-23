@@ -145,7 +145,7 @@ Sign-off decisions (owner, 2026-11-22: N1–N8 confirmed as recommended; N9 conf
 Sign-off: command names and output layout; which object kinds the fingerprint covers; which schemas are
 watched by default; exit codes for use in CI.
 
-Sign-off decisions (owner, 2026-11-22: C1–C9 confirmed as recommended; C10 confirmed during implementation):
+Sign-off decisions (owner, 2026-11-22: C1–C9 confirmed as recommended; C10 confirmed during implementation; C11 confirmed after the phase review):
 
 | # | Item | Decision |
 |---|---|---|
@@ -159,6 +159,7 @@ Sign-off decisions (owner, 2026-11-22: C1–C9 confirmed as recommended; C10 con
 | C8 | Disagreements | A step whose ledger status is `applied` but whose check is now false; `unknown` stays with `status`. Only with a changeset. |
 | C9 | Commits | As the table above; the own step `fingerprint` lands in commit 4. The guidance evals run before the pull request opens. |
 | C10 | Implementation amendment | `infinite.drift(conn, changeset=None, *, schemas=None)`: `schemas` narrows the report to watched schemas (an unwatched one is a `ChangesetError`); `Drift` also carries `schemas`. The fingerprint's constraints are check, foreign-key, primary-key, unique and exclusion (`contype` `c`, `f`, `p`, `u`, `x`): PostgreSQL 18's NOT NULL constraints (the column's `not_null`) and constraint triggers are left out. Shared private modules `_connection` (connection plumbing) and `_fingerprint` (the fingerprint machinery) keep Nozdormu and Infinite free of a mutual import; `infinite` is the public facade. |
+| C11 | Review amendment | Watched schemas (C5, made exact): the schemas of the latest `baseline` row's fingerprint; without a baseline, the default, read again at every fingerprint, so a schema created later is watched. A baseline without `schemas` takes the default. Drift compares the live watched schemas (narrowed by `schemas`) with the latest fingerprint: a watched schema the fingerprint lacks shows its objects as added. The connection string is required, but libpq fills what it omits from the standard `PG*` variables, as every libpq client does (documented, not refused). `chromie` exits 2 on any error that is not a finding, a driver or OS error included. |
 
 ### Phase 3 — Epochs
 

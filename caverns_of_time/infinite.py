@@ -22,6 +22,8 @@ from caverns_of_time._fingerprint import (
     named_schemas,
     read_document,
     resolve_schemas,
+    restrict,
+    watched_schemas,
 )
 from caverns_of_time.errors import ChangesetError, LedgerNotInstalled, NoFingerprint
 from caverns_of_time.nozdormu import Changeset, Status, StepStatus
@@ -41,15 +43,10 @@ class Drift:
     differences: tuple[Difference, ...]
     disagreements: tuple[StepStatus, ...]
 
-    @property
-    def found(self) -> bool:
-        """Whether there is any difference or disagreement."""
-        return bool(self.differences or self.disagreements)
-
 
 def fingerprint(connection: Connection, *, schemas: Collection[str] | None = None) -> Fingerprint:
-    """The fingerprint of *schemas* (default: the schemas of the latest recorded fingerprint, else every schema
-    but `pg_*`, `information_schema` and `caverns`).
+    """The fingerprint of *schemas* (default: the watched schemas: those of the latest baseline's fingerprint, else
+    every schema but `pg_*`, `information_schema` and `caverns`, read now).
 
     Reads the tables, columns, indexes, constraints, views and functions in one read-only transaction and
     writes nothing. Raises `ChangesetError` for a bare string, a non-string name or an empty collection for
@@ -58,18 +55,20 @@ def fingerprint(connection: Connection, *, schemas: Collection[str] | None = Non
     check_connection(connection)
     named = named_schemas(schemas)
     with read_only(connection) as cursor:
-        return capture(cursor, resolve_schemas(cursor, named, ChangesetError))
+        return capture(cursor, resolve_schemas(cursor, named, ChangesetError, watched_schemas))
 
 
 def drift(
     connection: Connection, changeset: Changeset | None = None, *, schemas: Collection[str] | None = None
 ) -> Drift:
-    """Compare the live schemas with the latest recorded fingerprint, in one read-only transaction; writes nothing.
+    """Compare the live watched schemas with the latest recorded fingerprint; writes nothing.
 
-    *schemas* narrows the report to those of the watched schemas. With a *changeset*, a step recorded as
-    applied whose check is now false is a disagreement. Raises `LedgerNotInstalled` before `install()`,
-    `NoFingerprint` when none is recorded yet, `ChangesetError` for an unwatched schema or bad *schemas*,
-    and the errors of `preflight` for a *changeset*.
+    With a *changeset*, `preflight` runs first in a read-only transaction of its own; then one read-only
+    transaction reads the fingerprint, runs the checks and reads the catalogs. *schemas* narrows the report to
+    those of the watched schemas; a watched schema the fingerprint lacks shows its objects as added. With a
+    *changeset*, a step recorded as applied whose check is now false is a disagreement. Raises
+    `LedgerNotInstalled` before `install()`, `NoFingerprint` when none is recorded yet, `ChangesetError` for an
+    unwatched schema or bad *schemas*, and the errors of `preflight` for a *changeset*.
     """
     check_connection(connection)
     named = named_schemas(schemas)
@@ -83,10 +82,11 @@ def drift(
         if found is None:
             raise NoFingerprint("no fingerprint is recorded yet: apply a changeset or take a baseline first")
         version, recorded = found
-        unwatched = [name for name in named or () if name not in recorded.schemas]
+        watched = watched_schemas(cursor)
+        unwatched = [name for name in named or () if name not in watched]
         if unwatched:
-            raise ChangesetError(f"the schema {unwatched[0]!r} is not watched (watched: {', '.join(recorded.schemas)})")
-        narrowed = tuple(named) if named is not None else recorded.schemas
+            raise ChangesetError(f"the schema {unwatched[0]!r} is not watched (watched: {', '.join(watched)})")
+        compared = tuple(named if named is not None else watched)
         # The checks run before the document is read: reading pins `search_path` to `pg_catalog` for the transaction.
         disagreements = tuple(
             status
@@ -95,6 +95,6 @@ def drift(
             and status.step.check is not None
             and not run_check(cursor, status.step.label, status.step.check)
         )
-        live = read_document(cursor, narrowed)
-    differences = compare({schema: recorded.document[schema] for schema in narrowed}, live)
-    return Drift(version, narrowed, tuple(differences), disagreements)
+        live = read_document(cursor, compared)
+    differences = compare(restrict(recorded.document, compared), live)
+    return Drift(version, compared, tuple(differences), disagreements)

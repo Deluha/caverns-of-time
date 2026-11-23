@@ -24,10 +24,12 @@ from caverns_of_time._fingerprint import (
     FINGERPRINT_EXISTS_SQL,
     capture,
     compare,
+    default_schemas,
     named_schemas,
     read_document,
     record,
     resolve_schemas,
+    restrict,
     watched_schemas,
 )
 from caverns_of_time._fingerprint import latest as latest_fingerprint
@@ -60,6 +62,8 @@ _ASCII_WHITESPACE = " \t\n\r\f\v"
 _SQL_SUFFIX = ".sql"
 _CHECK_SUFFIX = ".check.sql"
 _MILLISECONDS = 1000
+# The largest `LIMIT` PostgreSQL takes (a bigint); `chromie log --limit` shares the bound.
+HISTORY_LIMIT_MAX = 2**63 - 1
 
 # Caverns' own changeset; its name is also the schema that holds the ledger.
 _OWN_CHANGESET_NAME = "caverns"
@@ -417,13 +421,14 @@ def history(connection: Connection, *, changeset: str | None = None, limit: int 
     """The ledger rows, newest first: only *changeset*'s when given, at most *limit* (None: all); writes nothing.
 
     Raises `LedgerNotInstalled` before `install()` and `ChangesetError` for an invalid *changeset* or a
-    *limit* that is not a positive integer.
+    *limit* that is not a positive integer up to 9223372036854775807.
     """
     check_connection(connection)
     if changeset is not None:
         _validate_name("changeset name", changeset)
-    if limit is not None and (isinstance(limit, bool) or not isinstance(limit, int) or limit < 1):
-        raise ChangesetError(f"limit must be a positive integer, not {limit!r}")
+    valid = isinstance(limit, int) and not isinstance(limit, bool) and 1 <= limit <= HISTORY_LIMIT_MAX
+    if limit is not None and not valid:
+        raise ChangesetError(f"limit must be a positive integer up to {HISTORY_LIMIT_MAX}, not {limit!r}")
     with read_only(connection) as cursor:
         if not _ledger_exists(cursor):
             raise LedgerNotInstalled("the ledger is not installed (caverns.ledger does not exist): call install()")
@@ -513,8 +518,8 @@ def _warn_of_drift(connection: Connection, changeset: Changeset) -> None:
         found = latest_fingerprint(cursor)
         if found is None:
             return
-        recorded = found[1]
-        differences = compare(recorded.document, read_document(cursor, recorded.schemas))
+        watched = watched_schemas(cursor)
+        differences = compare(restrict(found[1].document, watched), read_document(cursor, watched))
     for difference in differences:
         _log.warning(
             "drift before applying changeset %s: %s %s %s",
@@ -584,7 +589,7 @@ def _apply_statuses(
     reapply: frozenset[str],
     accept: frozenset[str],
     *,
-    record_fingerprint: bool = False,
+    record_fingerprint: bool,
 ) -> list[LedgerEntry]:
     """Walk the planned steps in order, each in its own transaction; the rows written.
 
@@ -639,9 +644,9 @@ def apply(
     running). A step that fails is rolled back, recorded as `failed` and raised as `StepFailed`;
     later steps do not run. Returns the rows written, in order.
 
-    A run that writes ledger rows stores one fingerprint, in the transaction of its last row (a failed
-    step's `failed` row included); before its first step it logs a warning per difference between the
-    live schemas and the latest recorded fingerprint.
+    A run that writes ledger rows stores one fingerprint of the watched schemas, in the transaction of its
+    last row (a failed step's `failed` row included); before its first step it logs a warning per difference
+    between the live watched schemas and the latest recorded fingerprint.
     """
     reapply_names, accept_names = names("reapply", reapply), names("accept", accept)
     statuses = preflight(connection, changeset)
@@ -668,10 +673,11 @@ def baseline(
     """Record an existing database as the starting point of *changeset*; nothing is executed.
 
     One `baseline` row for the step *through* (default the last) carries that step's checksum and a
-    fingerprint (`infinite.fingerprint`'s hash) of *schemas* (default: the schemas of the latest recorded
-    fingerprint, else every schema but `pg_*`, `information_schema` and `caverns`), which is also stored in
-    `caverns.fingerprint` in the same transaction. Afterwards every step up to *through* is `applied`. Refused
-    (`BaselineRefused`) when the changeset already has ledger rows or a named schema does not exist.
+    fingerprint (`infinite.fingerprint`'s hash) of *schemas* (default: every schema but `pg_*`,
+    `information_schema` and `caverns`), which is also stored in `caverns.fingerprint` in the same transaction.
+    The schemas of the latest baseline are the watched schemas of later runs. Afterwards every step up to
+    *through* is `applied`. Refused (`BaselineRefused`) when the changeset already has ledger rows or a named
+    schema does not exist.
     """
     check_connection(connection)
     _reject_reserved(changeset)
@@ -683,7 +689,7 @@ def baseline(
         _lock(cursor)
         if _read_entries(cursor, changeset.name):
             raise BaselineRefused(f"changeset {changeset.name!r} already has ledger rows")
-        fingerprint = capture(cursor, resolve_schemas(cursor, named, BaselineRefused))
+        fingerprint = capture(cursor, resolve_schemas(cursor, named, BaselineRefused, default_schemas))
         entry = _insert(cursor, changeset.name, step, _OUTCOME_BASELINE, fingerprint=fingerprint.hash)
         record(cursor, entry.version, fingerprint)
     _log.info("baseline of changeset %s at step %s: ledger version %d", entry.changeset, entry.label, entry.version)
