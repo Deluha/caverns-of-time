@@ -59,7 +59,7 @@ Enforced: review, plus the ledger's triggers, tested by `test_the_ledger_is_appe
 
 ## R6 own changes go through the ledger
 
-Caverns' own objects (the ledger, the epoch catalog, history tables) are created and changed by steps
+Caverns' own objects (the ledger, the fingerprint table, the epoch tables) are created and changed by steps
 recorded in its own ledger, the same way a consumer's changes are. No ad-hoc DDL in application code,
 no schema created as a side effect of an unrelated call. Workflow:
 `references/workflows/changing-own-schema.md`.

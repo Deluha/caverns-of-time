@@ -1,13 +1,13 @@
 # Workflow: Changing Caverns' Own Schema
 
-For a change to an object Caverns itself owns inside a consumer's database: the ledger, the epoch
-catalog, a history table. Rules: R5 and R6 (`references/conventions.md#r5`, `references/conventions.md#r6`).
+For a change to an object Caverns itself owns inside a consumer's database: the ledger, the
+fingerprint table, the epoch tables. Rules: R5 and R6 (`references/conventions.md#r5`, `references/conventions.md#r6`).
 Caverns' own changeset is `_OWN_CHANGESET` in `caverns_of_time/nozdormu.py` (its first step, `ledger`,
 creates `caverns.ledger`); its database tests are in `tests/test_nozdormu_ledger.py`.
 
 ## Preconditions
 
-- ⚑ The ledger schema, the checksum definition and the on-disk layout of epochs and history tables are
+- ⚑ The ledger schema, the checksum definition and the on-disk layout of the epoch tables are
   ask-first: the owner confirms the exact DDL before code is written.
 - The change is additive wherever possible. A consumer's existing ledger must stay readable after the
   upgrade; a change that cannot keep that promise stops here and goes to the owner.
