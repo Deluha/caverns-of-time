@@ -36,7 +36,7 @@ and no doc describes behaviour that is not built.
   consumer's repository. The package never learns them (R1).
 - Caverns' own objects live in their own schema inside the consumer's database; everything else in
   that database belongs to the consumer and is changed only by the consumer's own steps.
-- The first consumer is Project Acme; its adoption is a pull request in its own repository under
+- The first consumer adopts Caverns through a pull request in its own repository under
   its own rules.
 
 ## Packaging

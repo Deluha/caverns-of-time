@@ -2,14 +2,26 @@
 
 from __future__ import annotations
 
+import hashlib
+
 from dev_tools import check_conventions as cc
 
 PKG = "caverns_of_time/"
 
 
-def test_c1_consumer_name_in_package_only() -> None:
-    out = cc.check_generic_core([(PKG + "a.py", '"""Doc."""\nX = "Project Acme"\n'), ("tests/t.py", "acme")])
-    assert out == [f"{PKG}a.py:2: C1 consumer name `acme` inside the package (R1)"]
+def test_c1_consumer_name_anywhere_in_the_repository() -> None:
+    banned = frozenset({hashlib.sha256(b"acme").hexdigest()})
+    sources = [
+        (PKG + "a.py", '"""Doc."""\nX = "Acme"\n'),
+        ("docs/notes.md", "clean\nsee Project_Acme here\n"),
+        ("tests/t.py", "ACME"),
+        ("README.md", "nothing to see\nacmeless is fine\n"),
+    ]
+    assert cc.check_generic_core(sources, banned) == [
+        f"{PKG}a.py:2: C1 consumer name `acme` in the repository (R1)",
+        "docs/notes.md:2: C1 consumer name `acme` in the repository (R1)",
+        "tests/t.py:1: C1 consumer name `acme` in the repository (R1)",
+    ]
 
 
 def test_c2_print_outside_console_module() -> None:

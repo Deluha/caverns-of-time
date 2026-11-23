@@ -10,7 +10,7 @@ library only, so each script runs on a bare Python. Not part of the distribution
 | File | Command | Does |
 |---|---|---|
 | `verify.py` | `python dev_tools/verify.py [--base <ref>]` | Runs every QA step and prints one pass/fail table; requires the test database |
-| `check_conventions.py` | `python dev_tools/check_conventions.py` | Convention rules C1–C9 |
+| `check_conventions.py` | `python dev_tools/check_conventions.py` | Convention rules C1–C9; C1 scans every text file for hashed consumer names |
 | `check_guidance_integrity.py` | `python dev_tools/check_guidance_integrity.py` | Guidance pointers, anchors, `CLAUDE.md` budget, skill routing, rule files, command skills |
 | `check_docs_sync.py` | `python dev_tools/check_docs_sync.py --base <ref>` or `--staged <commit-msg-file>` | Fails a code change in a documented area without its doc |
 | `database.py` | `python dev_tools/database.py start \| stop \| status \| dsn` | The local PostgreSQL 18 test instance (a Docker container on 127.0.0.1) |

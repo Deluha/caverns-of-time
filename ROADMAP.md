@@ -9,7 +9,7 @@ Approved by the owner on 2026-11-22.
 
 Goal: a generic Python library and CLI that gives a PostgreSQL database a recorded past — which schema
 changes were applied and when, what opted-in tables looked like at a past run, and whether anything
-changed outside the timeline. Project Acme is the first consumer, not the design target.
+changed outside the timeline. The first consumer is not the design target.
 
 ### Components
 
@@ -24,8 +24,9 @@ changed outside the timeline. Project Acme is the first consumer, not the design
 
 ### Scope rules (owner decisions, 2026-11-22)
 
-- **Generic core (D1).** No Acme name, schema, table or convention enters the package. A consumer
-  integrates through an adapter that lives in the consumer's repository.
+- **Generic core (D1).** No consumer's name, schema, table or convention enters the package, and no
+  consuming project is named anywhere in the repository. A consumer integrates through an adapter that
+  lives in the consumer's repository.
 - **Run-level snapshots (D2).** History is captured as Epochs: whole-table snapshots taken on demand.
   No row-level triggers in v0.1.
 - **Wrap, not replace (D3).** Caverns defines its own `Step` (label, SQL or file, optional check) and
@@ -34,8 +35,8 @@ changed outside the timeline. Project Acme is the first consumer, not the design
 - **Real database in tests (D4).** Database behaviour is tested against a real PostgreSQL, never a mock:
   a throwaway service container in CI, a local instance in development. The done gate requires the
   database tests to have run; a skipped database test fails the gate.
-- **PostgreSQL 18.** CI tests against PostgreSQL 18. No version matrix until a
-  second project adopts the tool.
+- **PostgreSQL 18.** CI tests against PostgreSQL 18. No version matrix until a second project adopts the
+  tool.
 - **Never a production database.** No test, workflow or development session connects to a consumer's
   live database. Applying to a live database is always the consumer owner's own run.
 - **Delivery.** One pull request per phase, several commits each. Each phase lists what the owner
@@ -50,7 +51,7 @@ changed outside the timeline. Project Acme is the first consumer, not the design
 | 2 — Chromie and Infinite | Merged | [#3](https://github.com/Deluha/caverns-of-time/pull/3) |
 | 3 — Epochs | In review | [#4](https://github.com/Deluha/caverns-of-time/pull/4) |
 | 4 — Murozond and Timewalking | Not started | |
-| 5 — Acme adoption and release | Not started | |
+| 5 — First consumer adoption and release | Not started | |
 
 ### Running a phase
 
@@ -73,7 +74,7 @@ is merged. Kick-off prompt: "Implement Phase N of `ROADMAP.md` following its Run
 
 ### Phase 0 — Development process
 
-Ports the Project Acme guidance machinery. No product code.
+Ports the guidance machinery of an existing project. No product code.
 
 | Commit | Content |
 |---|---|
@@ -85,10 +86,10 @@ Ports the Project Acme guidance machinery. No product code.
 | 6 | Local test database: session-start hook and devcontainer start a PostgreSQL instance and export the test connection string. |
 | 7 | `README.md`, `CONTRIBUTING.md`, `SECURITY.md`, `RELEASE_NOTES.md`. |
 
-Not ported: Acme's domain rules, domain
-references, domain workflows, and the hard rules that only make sense there (R1, R5, R8, R9).
+Not ported: the source project's domain rules, domain references and domain workflows, and the hard rules
+that only make sense there (R1, R5, R8, R9).
 
-Sign-off: the hard rules and ask-first list of the new `CLAUDE.md`; which Acme script conventions
+Sign-off: the hard rules and ask-first list of the new `CLAUDE.md`; which source-project script conventions
 carry over (the `#%%` markers, the icon logging helpers); the package name; the licence; how development
 sessions get PostgreSQL 18.
 
@@ -97,8 +98,8 @@ Sign-off decisions (owner, 2026-11-22: S1–S5 confirmed as proposed):
 | # | Item | Decision |
 |---|---|---|
 | S1 | Package and layout | Distribution `caverns-of-time`, import package `caverns_of_time`, flat at the repository root; one module per component (`nozdormu`, `epochs`, `infinite`, `murozond`, `timewalking`); `chromie` the only CLI entry; dev tooling in `dev_tools/`, not shipped; verify command `python dev_tools/verify.py`; Python 3.11 or newer. |
-| S2 | Hard rules and ask-first list | Nine hard rules: generic core, one canonical helper, safe SQL, no unasked files, append-only ledger, own changes through the ledger, docs move with the code, real database tests, one module per component. The four Acme operating principles unchanged. Ask-first: ledger schema and checksum, public API, destructive behaviour on a consumer database, Murozond's list and guard relaxations, runtime dependencies and PostgreSQL versions, the guidance machinery and CI. Text: `CLAUDE.md`. |
-| S3 | Acme conventions | Dropped: `#%%` markers and the no-module-docstring rule. Kept: icon status helpers for CLI output only (library code uses `logging`), codenames, actions pinned by commit SHA, the single `CI gate` check, gitleaks, pre-commit, the path-rule and eval mechanisms, the `settings.json` shape and agent tiers. Changed: mypy is strict and gating. |
+| S2 | Hard rules and ask-first list | Nine hard rules: generic core, one canonical helper, safe SQL, no unasked files, append-only ledger, own changes through the ledger, docs move with the code, real database tests, one module per component. The four operating principles of the source project unchanged. Ask-first: ledger schema and checksum, public API, destructive behaviour on a consumer database, Murozond's list and guard relaxations, runtime dependencies and PostgreSQL versions, the guidance machinery and CI. Text: `CLAUDE.md`. |
+| S3 | Source-project conventions | Dropped: `#%%` markers and the no-module-docstring rule. Kept: icon status helpers for CLI output only (library code uses `logging`), codenames, actions pinned by commit SHA, the single `CI gate` check, gitleaks, pre-commit, the path-rule and eval mechanisms, the `settings.json` shape and agent tiers. Changed: mypy is strict and gating. |
 | S4 | Licence | MIT, unchanged. |
 | S5 | PostgreSQL 18 in development | The official `postgres:18` Docker image, started by the cloud session-start hook and by `python dev_tools/database.py start`; the same image in the dev container and CI. No fallback to another version: if the instance cannot start, the database tests fail. |
 
@@ -202,7 +203,7 @@ Sign-off decisions (owner, 2026-11-23: E1–E7 confirmed as recommended; E8 conf
 Sign-off: the list of statements treated as destructive; how SQL inside function bodies is classified;
 what the baseline must store for a replay to be possible (a schema dump — *proposed*).
 
-### Phase 5 — Acme adoption and release
+### Phase 5 — First consumer adoption and release
 
 | Commit | Content |
 |---|---|
@@ -210,12 +211,11 @@ what the baseline must store for a replay to be possible (a schema dump — *pro
 | 2 | End-to-end test: a sample consumer project with a tuple-style changeset list, run through an adapter. |
 | 3 | v0.1.0 release: version, release notes, this section removed. |
 
-The Acme side is a separate pull request in the consumer's own repository, under that repository's own
-rules: its changeset runner and its hard rule 6 are ask-first items there.
+The consumer side is a separate pull request in the consumer's own repository, under that repository's own
+rules.
 
-Sign-off: how Acme installs the package (git dependency or a package index); who takes the baseline
-on the live database and when; whether Acme uses Epochs at all — it already has
-a per-run snapshot table of its own, so Epochs would be for other tables or not used.
+Sign-off: how the first consumer installs the package (git dependency or a package index); who takes the
+baseline on the live database and when; whether the first consumer uses Epochs at all.
 
 ### Later (not in v0.1)
 

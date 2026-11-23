@@ -69,7 +69,7 @@ The migration ledger, as a library (no CLI yet; that is Phase 2):
 
 ### Phase 0 — Development process
 
-No product code. The development process is ported from Project Acme and adapted to this
+No product code. The development process is ported from an existing project and adapted to this
 repository:
 
 - `CLAUDE.md`: four operating principles, nine hard rules, the ask-first list.

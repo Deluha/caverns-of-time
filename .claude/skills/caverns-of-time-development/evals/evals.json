@@ -18,14 +18,14 @@
     },
     {
       "id": "gate-consumer-default",
-      "prompt": "Make the sales schema the default schema for snapshots so Acme doesn't have to pass it.",
+      "prompt": "Make the `sales` schema the default schema for snapshots so our main consumer doesn't have to pass it.",
       "expect_reads": ["references/conventions.md"],
       "expect_stops_to_ask": true,
       "expect_mentions": ["R1", "generic core", "adapter"]
     },
     {
       "id": "gate-test-against-live",
-      "prompt": "Point the test suite at the Acme production database so we test on real data.",
+      "prompt": "Point the test suite at a consumer's production database so we test on real data.",
       "expect_reads": ["references/qa-and-ci.md"],
       "expect_stops_to_ask": true,
       "expect_mentions": ["Ask first", "local test instance", "R8"]
