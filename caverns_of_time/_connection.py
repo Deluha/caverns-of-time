@@ -2,7 +2,8 @@
 
 Not public: the components import it, a consumer imports `Connection` from `nozdormu`. Input: a DB-API 2.0
 connection (autocommit off). Output: cursors in transactions Caverns commits or rolls back itself, the advisory
-lock every Caverns write takes, and the name validation the components share.
+lock every Caverns write takes (per transaction, or per session ahead of a REPEATABLE READ transaction), and the
+validation and catalog helpers the components share (names, limits, the pinned search path).
 """
 
 from __future__ import annotations
@@ -20,9 +21,12 @@ __all__ = [
     "check_connection",
     "lock",
     "names",
+    "pin_search_path",
     "read_only",
     "run_check",
+    "session_lock",
     "transaction",
+    "validate_limit",
     "validate_name",
 ]
 
@@ -60,10 +64,16 @@ class Connection(Protocol):
 _CLEAN_TRANSACTION_SQL = "SELECT pg_current_xact_id_if_assigned() IS NULL"
 # Under REPEATABLE READ or SERIALIZABLE the lock statement would take the snapshot before it waits.
 _READ_COMMITTED_SQL = "SET TRANSACTION ISOLATION LEVEL READ COMMITTED"
+_REPEATABLE_READ_SQL = "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"
 _READ_ONLY_SQL = "SET TRANSACTION READ ONLY"
 # One key for every Caverns write, whatever the component: Caverns' writers take turns.
 ADVISORY_LOCK_KEY = 0x43617665726E73  # "Caverns"
 _LOCK_SQL = "SELECT pg_advisory_xact_lock(%s::bigint)"
+_SESSION_LOCK_SQL = "SELECT pg_advisory_lock(%s::bigint)"
+_SESSION_UNLOCK_SQL = "SELECT pg_advisory_unlock(%s::bigint)"
+# Lets a catalog read name an object by its schema-qualified type regardless of the caller's search_path.
+_PIN_SEARCH_PATH_SQL = "SELECT set_config('search_path', 'pg_catalog', true)"
+_LIMIT_MAX = 2**63 - 1  # a bigint, what `LIMIT` takes
 
 
 def check_connection(connection: Connection) -> None:
@@ -99,12 +109,15 @@ def cursor(connection: Connection) -> Iterator[Cursor]:
 
 
 @contextmanager
-def transaction(connection: Connection) -> Iterator[Cursor]:
-    """One transaction: committed when the block ends, rolled back when it raises."""
+def transaction(connection: Connection, *, repeatable_read: bool = False) -> Iterator[Cursor]:
+    """One transaction: committed when the block ends, rolled back when it raises.
+
+    READ COMMITTED unless *repeatable_read*: the caller then holds the lock already (`session_lock`).
+    """
     try:
         with cursor(connection) as cur:
             # The ledger is re-read after the lock: that read needs a snapshot taken after the wait.
-            cur.execute(_READ_COMMITTED_SQL)
+            cur.execute(_REPEATABLE_READ_SQL if repeatable_read else _READ_COMMITTED_SQL)
             yield cur
     except BaseException:
         connection.rollback()
@@ -126,6 +139,53 @@ def read_only(connection: Connection) -> Iterator[Cursor]:
 def lock(cursor: Cursor) -> None:
     """Take Caverns' advisory lock until the transaction ends."""
     cursor.execute(_LOCK_SQL, (ADVISORY_LOCK_KEY,))
+
+
+@contextmanager
+def session_lock(connection: Connection) -> Iterator[None]:
+    """Hold Caverns' advisory lock for the session, taken and committed before the block begins.
+
+    For a block that runs a REPEATABLE READ `transaction`: the transaction-level `lock` statement would take
+    that transaction's snapshot before it waits (see `_READ_COMMITTED_SQL`), while this one commits first, so
+    the snapshot comes after the lock is held. The lock is released when the block ends; a release that fails
+    after the block raised is suppressed so the block's error propagates (a lost connection frees the lock).
+    """
+    try:
+        with cursor(connection) as cur:
+            cur.execute(_SESSION_LOCK_SQL, (ADVISORY_LOCK_KEY,))
+        connection.commit()
+    except BaseException:
+        connection.rollback()
+        raise
+    try:
+        yield
+    except BaseException:
+        try:
+            _release_session_lock(connection)
+        except Exception:
+            pass
+        raise
+    _release_session_lock(connection)
+
+
+def _release_session_lock(connection: Connection) -> None:
+    connection.rollback()
+    with cursor(connection) as cur:
+        cur.execute(_SESSION_UNLOCK_SQL, (ADVISORY_LOCK_KEY,))
+    connection.commit()
+
+
+def pin_search_path(cursor: Cursor) -> None:
+    """Pin the search path to `pg_catalog` until the transaction ends, so `format_type` qualifies every name."""
+    cursor.execute(_PIN_SEARCH_PATH_SQL)
+
+
+def validate_limit(limit: object) -> None:
+    """A row limit: None (all) or a positive integer up to the bigint maximum, never a bool."""
+    if limit is None:
+        return
+    if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= _LIMIT_MAX:
+        raise ChangesetError(f"limit must be a positive integer up to {_LIMIT_MAX}, not {limit!r}")
 
 
 def validate_name(kind: str, value: object) -> None:

@@ -1,24 +1,37 @@
-"""Epochs, run-level snapshots of opted-in tables; this module holds the registry of the tables to snapshot.
+"""Epochs, run-level snapshots of opted-in tables: the registry of the tables, the snapshot and the catalog.
 
-Input: a DB-API 2.0 connection (autocommit off) and the names of a schema, a table and optionally its key
-columns. Output: `TrackedTable` values read from and written to `caverns.epoch_table`, the registry created by
-Caverns' own step `epochs`. The module imports no database driver. Contract and behaviour:
-`caverns_of_time/README.md`.
+Input: a DB-API 2.0 connection (autocommit off), the names of a schema, a table and optionally its key columns,
+and the name of an epoch. Output: `TrackedTable` values read from and written to `caverns.epoch_table`, the
+registry created by Caverns' own step `epochs`; `Epoch` values, written to and read from the other epoch tables.
+The module imports no database driver. Contract and behaviour: `caverns_of_time/README.md`.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
-from caverns_of_time._connection import Connection, Cursor, check_connection, lock, read_only, transaction
+from caverns_of_time import __version__
+from caverns_of_time._connection import (
+    Connection,
+    Cursor,
+    check_connection,
+    lock,
+    pin_search_path,
+    read_only,
+    session_lock,
+    transaction,
+    validate_limit,
+    validate_name,
+)
 from caverns_of_time.errors import ChangesetError, EpochRefused, LedgerNotInstalled
 from caverns_of_time.nozdormu import EPOCHS_EXISTS_SQL
 
-__all__ = ["TrackedTable", "register", "tracked", "unregister"]
+__all__ = ["Column", "Epoch", "EpochTable", "TrackedTable", "catalog", "register", "snapshot", "tracked", "unregister"]
 
 _log = logging.getLogger(__name__)
 
@@ -39,12 +52,15 @@ JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum = k.attnum
 WHERE n.nspname = %s AND c.relname = %s AND c.relkind IN ('r', 'p')
 ORDER BY k.position
 """
+# The live columns in column order with their types; `format_type` prints names relative to the search path,
+# so a snapshot pins it first (`pin_search_path`).
 _LIVE_COLUMNS_SQL = """
-SELECT a.attname::text
+SELECT a.attname::text, format_type(a.atttypid, a.atttypmod)
 FROM pg_class c
 JOIN pg_namespace n ON n.oid = c.relnamespace
 JOIN pg_attribute a ON a.attrelid = c.oid
 WHERE n.nspname = %s AND c.relname = %s AND c.relkind IN ('r', 'p') AND a.attnum > 0 AND NOT a.attisdropped
+ORDER BY a.attnum
 """
 _SELECT_REGISTERED_SQL = (
     "SELECT schema_name, table_name, key, registered_at, registered_by FROM caverns.epoch_table"
@@ -61,6 +77,42 @@ _UPSERT_SQL = (
     " RETURNING schema_name, table_name, key, registered_at, registered_by"
 )
 _DELETE_REGISTERED_SQL = "DELETE FROM caverns.epoch_table WHERE schema_name = %s AND table_name = %s"
+_EPOCH_NAME_SQL = "SELECT epoch FROM caverns.epoch WHERE name = %s"
+_INSERT_EPOCH_SQL = (
+    "INSERT INTO caverns.epoch (name, ledger_version, caverns_version) SELECT %s, max(version), %s FROM caverns.ledger"
+    " RETURNING epoch, name, ledger_version, taken_at, taken_by, caverns_version"
+)
+# NOTE: hard rule 3 forbids composing a statement in Python, so PostgreSQL composes the copy: this template is
+# bound as a value to `format`, which quotes the identifiers (%I) and the literals (%L). The source rows are read
+# once (MATERIALIZED) for both the copy and the counts; `ON CONFLICT DO NOTHING` drops a repeated key, which the
+# counts then reveal. The key is a jsonb object of the key columns' values; a JSON null among them is counted.
+_COPY_TEMPLATE = """
+WITH source AS MATERIALIZED (SELECT to_jsonb(t) AS row FROM %I.%I t),
+inserted AS (
+    INSERT INTO caverns.epoch_row (epoch, schema_name, table_name, key, row)
+    SELECT %s, %L, %L, (SELECT jsonb_object_agg(k, s.row -> k) FROM unnest(%L::text[]) AS k), s.row FROM source s
+    ON CONFLICT DO NOTHING
+    RETURNING key
+)
+SELECT (SELECT count(*) FROM source), (SELECT count(*) FROM inserted),
+       (SELECT count(*) FROM inserted WHERE jsonb_path_exists(key, '$.* ? (@ == null)'))
+"""
+_COMPOSE_COPY_SQL = "SELECT format(%s::text, %s::text, %s::text, %s::bigint, %s::text, %s::text, %s::text[])"
+_INSERT_SOURCE_SQL = (
+    "INSERT INTO caverns.epoch_source (epoch, schema_name, table_name, key, columns, row_count)"
+    " VALUES (%s, %s, %s, %s::text[], %s::jsonb, %s)"
+)
+_SELECT_EPOCHS_SQL = """
+SELECT e.epoch, e.name, e.ledger_version, e.taken_at, e.taken_by, e.caverns_version, d.deleted_at
+FROM caverns.epoch e
+LEFT JOIN caverns.epoch_deletion d ON d.epoch = e.epoch
+ORDER BY e.epoch DESC
+LIMIT %s
+"""
+_SELECT_SOURCES_SQL = (
+    "SELECT epoch, schema_name, table_name, key, columns, row_count FROM caverns.epoch_source"
+    " WHERE epoch = ANY(%s::bigint[]) ORDER BY epoch, schema_name, table_name"
+)
 
 
 @dataclass(frozen=True)
@@ -72,6 +124,42 @@ class TrackedTable:
     key: tuple[str, ...]
     registered_at: datetime
     registered_by: str
+
+
+@dataclass(frozen=True)
+class Column:
+    """One column of a snapshotted table: its name and its type as `format_type` prints it, schema-qualified."""
+
+    name: str
+    type: str
+
+
+@dataclass(frozen=True)
+class EpochTable:
+    """One table of an epoch: its names, the key columns, its columns in column order and the rows copied."""
+
+    schema: str
+    table: str
+    key: tuple[str, ...]
+    columns: tuple[Column, ...]
+    row_count: int
+
+
+@dataclass(frozen=True)
+class Epoch:
+    """One epoch: its number and name, the ledger version it was taken at, who took it and when, its tables.
+
+    `deleted_at` is the time of the epoch's deletion, None while its rows are kept.
+    """
+
+    epoch: int
+    name: str
+    ledger_version: int
+    taken_at: datetime
+    taken_by: str
+    caverns_version: str
+    deleted_at: datetime | None
+    tables: tuple[EpochTable, ...]
 
 
 def _tracked_table(row: Sequence[Any]) -> TrackedTable:
@@ -122,6 +210,19 @@ def _column_names(cursor: Cursor, sql: str, schema: str, table: str) -> list[str
     return [row[0] for row in cursor.fetchall()]
 
 
+def _live_columns(cursor: Cursor, schema: str, table: str) -> list[Column]:
+    """The table's live columns in column order; empty when the table does not exist or is not a table."""
+    cursor.execute(_LIVE_COLUMNS_SQL, (schema, table))
+    return [Column(name, type_) for name, type_ in cursor.fetchall()]
+
+
+def _check_key(schema: str, table: str, key: Sequence[str], live: Sequence[Column]) -> None:
+    names = {column.name for column in live}
+    missing = next((column for column in key if column not in names), None)
+    if missing is not None:
+        raise EpochRefused(f"{schema}.{table} has no column {missing!r} for the key")
+
+
 def _key_columns(cursor: Cursor, schema: str, table: str, key: list[str] | None) -> list[str]:
     """The columns the registry stores for the table: *key* checked against its live columns, else its primary key.
 
@@ -137,10 +238,7 @@ def _key_columns(cursor: Cursor, schema: str, table: str, key: list[str] | None)
         if not primary:
             raise EpochRefused(f"{schema}.{table} has no primary key: pass key=")
         return primary
-    live = set(_column_names(cursor, _LIVE_COLUMNS_SQL, schema, table))
-    missing = next((column for column in key if column not in live), None)
-    if missing is not None:
-        raise EpochRefused(f"{schema}.{table} has no column {missing!r} for the key")
+    _check_key(schema, table, key, _live_columns(cursor, schema, table))
     return key
 
 
@@ -202,3 +300,106 @@ def tracked(connection: Connection) -> list[TrackedTable]:
         _require_installed(cursor)
         cursor.execute(_SELECT_TRACKED_SQL)
         return [_tracked_table(row) for row in cursor.fetchall()]
+
+
+def _json(value: Any) -> Any:
+    return json.loads(value) if isinstance(value, str) else value  # a driver that leaves jsonb as text
+
+
+def _epoch_table(row: Sequence[Any]) -> EpochTable:
+    _, schema, table, key, columns, row_count = row
+    return EpochTable(schema, table, tuple(key), tuple(Column(c["name"], c["type"]) for c in _json(columns)), row_count)
+
+
+def _read_epochs(cursor: Cursor, rows: Sequence[Sequence[Any]]) -> list[Epoch]:
+    """The `Epoch` of each catalog row (epoch, name, ledger_version, taken_at, taken_by, caverns_version, deleted_at).
+
+    Loads the tables of all the epochs in one query; the order of *rows* is kept.
+    """
+    if not rows:
+        return []
+    cursor.execute(_SELECT_SOURCES_SQL, ([row[0] for row in rows],))
+    tables: dict[int, list[EpochTable]] = {}
+    for source in cursor.fetchall():
+        tables.setdefault(source[0], []).append(_epoch_table(source))
+    return [
+        Epoch(epoch, name, version, taken_at, taken_by, caverns_version, deleted_at, tuple(tables.get(epoch, ())))
+        for epoch, name, version, taken_at, taken_by, caverns_version, deleted_at in rows
+    ]
+
+
+def _copy_rows(cursor: Cursor, epoch: int, tracked_table: TrackedTable) -> int:
+    """Copy the table's rows into `caverns.epoch_row` under *epoch*; the number of rows, or `EpochRefused`."""
+    schema, table, key = tracked_table.schema, tracked_table.table, list(tracked_table.key)
+    cursor.execute(_COMPOSE_COPY_SQL, (_COPY_TEMPLATE, schema, table, epoch, schema, table, key))
+    composed = cursor.fetchone()
+    assert composed is not None  # a SELECT without FROM returns its row
+    cursor.execute(composed[0])
+    counts = cursor.fetchone()
+    assert counts is not None  # an aggregate returns its row
+    read, inserted, nulls = counts
+    columns = ", ".join(key)
+    if inserted < read:
+        raise EpochRefused(f"the key ({columns}) of {schema}.{table} is not unique")
+    if nulls:
+        raise EpochRefused(f"the key ({columns}) of {schema}.{table} has nulls")
+    return int(read)
+
+
+def snapshot(connection: Connection, name: str) -> Epoch:
+    """Copy every registered table into a new epoch called *name*, tagged with the latest ledger version.
+
+    The tables are read in one REPEATABLE READ transaction that starts after Caverns' advisory lock is held, so
+    the copy is one consistent view; a refusal writes nothing. Raises `ChangesetError` for a bad *name*,
+    `LedgerNotInstalled` before `install()` and `EpochRefused` for a name that is taken (a deleted epoch's too),
+    no registered table, a registered table or key column that no longer exists, and a key with duplicates or nulls.
+    """
+    check_connection(connection)
+    validate_name("epoch name", name)
+    with session_lock(connection), transaction(connection, repeatable_read=True) as cursor:
+        _require_installed(cursor)
+        cursor.execute(_EPOCH_NAME_SQL, (name,))
+        taken = cursor.fetchone()
+        if taken is not None:
+            raise EpochRefused(f"the epoch name {name!r} is taken (epoch {taken[0]})")
+        cursor.execute(_SELECT_TRACKED_SQL)
+        registered = [_tracked_table(row) for row in cursor.fetchall()]
+        if not registered:
+            raise EpochRefused("no table is registered: call register() first")
+        pin_search_path(cursor)
+        cursor.execute(_INSERT_EPOCH_SQL, (name, __version__))
+        created = cursor.fetchone()
+        assert created is not None  # an INSERT ... RETURNING always returns its row
+        for tracked_table in registered:
+            schema, table, key = tracked_table.schema, tracked_table.table, tracked_table.key
+            live = _live_columns(cursor, schema, table)
+            if not live:
+                raise EpochRefused(f"{schema}.{table} is registered but does not exist")
+            _check_key(schema, table, key, live)
+            row_count = _copy_rows(cursor, created[0], tracked_table)
+            columns = json.dumps([{"name": c.name, "type": c.type} for c in live])
+            cursor.execute(_INSERT_SOURCE_SQL, (created[0], schema, table, list(key), columns, row_count))
+        (taken_epoch,) = _read_epochs(cursor, [(*created, None)])
+    rows = sum(table.row_count for table in taken_epoch.tables)
+    _log.info(
+        "took epoch %s at ledger version %s: %s rows in %s tables",
+        name,
+        taken_epoch.ledger_version,
+        rows,
+        len(taken_epoch.tables),
+    )
+    return taken_epoch
+
+
+def catalog(connection: Connection, *, limit: int | None = None) -> list[Epoch]:
+    """The epochs, newest first, deleted ones included, at most *limit* (None: all); writes nothing.
+
+    Raises `ChangesetError` for a *limit* that is not a positive integer up to 9223372036854775807 and
+    `LedgerNotInstalled` before `install()`.
+    """
+    check_connection(connection)
+    validate_limit(limit)
+    with read_only(connection) as cursor:
+        _require_installed(cursor)
+        cursor.execute(_SELECT_EPOCHS_SQL, (limit,))
+        return _read_epochs(cursor, cursor.fetchall())

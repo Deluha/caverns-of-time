@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 from collections.abc import Callable
 from typing import Any
 
@@ -10,10 +11,21 @@ import psycopg
 import psycopg2
 import pytest
 
-from caverns_of_time import epochs, nozdormu
-from caverns_of_time.epochs import TrackedTable, register, tracked, unregister
+from caverns_of_time import __version__, _connection, epochs, nozdormu
+from caverns_of_time.epochs import (
+    Column,
+    Epoch,
+    EpochTable,
+    TrackedTable,
+    catalog,
+    register,
+    snapshot,
+    tracked,
+    unregister,
+)
 from caverns_of_time.errors import CavernsError, ChangesetError, EpochRefused, LedgerNotInstalled
 from caverns_of_time.nozdormu import Changeset, install, preflight
+from tests.test_nozdormu_ledger import WAIT_SECONDS, _wait_for_a_waiting_lock
 
 DRIVER_ERRORS = (psycopg.Error, psycopg2.Error)
 SCHEMA = "nozdormu_test"
@@ -416,6 +428,8 @@ CALLS: dict[str, Callable[[Any], object]] = {
     "register": lambda conn: register(conn, SCHEMA, "one"),
     "unregister": lambda conn: unregister(conn, SCHEMA, "one"),
     "tracked": tracked,
+    "snapshot": lambda conn: snapshot(conn, "e"),
+    "catalog": catalog,
 }
 
 
@@ -482,3 +496,318 @@ def test_a_key_that_is_not_a_list_of_distinct_names_is_refused(ledger_conn: Any,
     with pytest.raises(ChangesetError, match=message):
         register(ledger_conn, SCHEMA, "one", key=key)
     assert tracked(ledger_conn) == []
+
+
+# --- snapshot -------------------------------------------------------------------------------
+
+TWO = f"CREATE TABLE {SCHEMA}.two (a int, b text, c numeric(8, 2), PRIMARY KEY (b, a))"
+STORED_ROWS = "SELECT key, row FROM caverns.epoch_row WHERE epoch = %s AND schema_name = %s AND table_name = %s"
+ADVISORY_LOCKS = "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND pid = pg_backend_pid()"
+
+
+def _by_row(rows: list[Any]) -> list[Any]:
+    return sorted(rows, key=str)
+
+
+def _stored(conn: Any, epoch: int, table: str, schema: str = SCHEMA) -> list[tuple[Any, Any]]:
+    """The (key, row) pairs stored for the table in the epoch, in a fixed order."""
+    return _by_row(_query(conn, STORED_ROWS, (epoch, schema, table)))
+
+
+def _nothing_written(conn: Any) -> None:
+    for table in ("epoch", "epoch_source", "epoch_row", "epoch_deletion"):
+        assert _query(conn, f"SELECT count(*) FROM caverns.{table}") == [(0,)], table
+    assert _query(conn, ADVISORY_LOCKS) == [(0,)]
+    _assert_idle(conn)
+
+
+def test_snapshot_copies_every_registered_table_under_one_epoch(ledger_conn: Any) -> None:
+    _installed_with_tables(
+        ledger_conn,
+        ONE,
+        TWO,
+        f"CREATE TABLE {SCHEMA}.untracked (id int PRIMARY KEY)",
+        f"INSERT INTO {SCHEMA}.one VALUES (1, 'x'), (2, NULL)",
+        f"INSERT INTO {SCHEMA}.two VALUES (1, 'p', 1.50), (2, 'p', NULL), (1, 'q', 3)",
+        f"INSERT INTO {SCHEMA}.untracked VALUES (9)",
+    )
+    register(ledger_conn, SCHEMA, "two")
+    register(ledger_conn, SCHEMA, "one")
+    top = max(e.version for e in nozdormu.history(ledger_conn))
+    taken = snapshot(ledger_conn, "first")
+    _assert_idle(ledger_conn)
+    assert isinstance(taken, Epoch)
+    assert (taken.name, taken.ledger_version, taken.caverns_version, taken.deleted_at) == (
+        "first",
+        top,
+        __version__,
+        None,
+    )
+    assert taken.taken_at is not None and taken.taken_by
+    assert taken.tables == (
+        EpochTable(SCHEMA, "one", ("id",), (Column("id", "integer"), Column("name", "text")), 2),
+        EpochTable(
+            SCHEMA,
+            "two",
+            ("b", "a"),
+            (Column("a", "integer"), Column("b", "text"), Column("c", "numeric(8,2)")),
+            3,
+        ),
+    )
+    assert catalog(ledger_conn) == [taken]
+    one = _by_row(_query(ledger_conn, f"SELECT to_jsonb(t) FROM {SCHEMA}.one t"))
+    two = _by_row(_query(ledger_conn, f"SELECT to_jsonb(t) FROM {SCHEMA}.two t"))
+    assert [row for _, row in _stored(ledger_conn, taken.epoch, "one")] == [r[0] for r in one]
+    assert [row for _, row in _stored(ledger_conn, taken.epoch, "two")] == [r[0] for r in two]
+    assert [key for key, _ in _stored(ledger_conn, taken.epoch, "one")] == [{"id": 1}, {"id": 2}]
+    assert [key for key, _ in _stored(ledger_conn, taken.epoch, "two")] == [
+        {"a": 1, "b": "p"},
+        {"a": 1, "b": "q"},
+        {"a": 2, "b": "p"},
+    ]
+    assert _query(ledger_conn, "SELECT count(*) FROM caverns.epoch_row WHERE table_name = 'untracked'") == [(0,)]
+    sources = _query(ledger_conn, "SELECT table_name, key, row_count FROM caverns.epoch_source ORDER BY table_name")
+    assert sources == [("one", ["id"], 2), ("two", ["b", "a"], 3)]
+    assert _query(ledger_conn, ADVISORY_LOCKS) == [(0,)]
+
+
+def test_snapshot_logs_what_it_took(ledger_conn: Any, caplog: pytest.LogCaptureFixture) -> None:
+    _installed_with_tables(ledger_conn, ONE, f"INSERT INTO {SCHEMA}.one VALUES (1, 'x')")
+    register(ledger_conn, SCHEMA, "one")
+    top = max(e.version for e in nozdormu.history(ledger_conn))
+    with caplog.at_level(logging.INFO, logger=epochs.__name__):
+        snapshot(ledger_conn, "logged")
+    assert [r.getMessage() for r in caplog.records] == [
+        f"took epoch logged at ledger version {top}: 1 rows in 1 tables"
+    ]
+
+
+def test_snapshot_of_an_empty_table_records_it_with_no_rows(ledger_conn: Any) -> None:
+    _installed_with_tables(ledger_conn, ONE)
+    register(ledger_conn, SCHEMA, "one")
+    taken = snapshot(ledger_conn, "empty")
+    assert [(t.table, t.row_count) for t in taken.tables] == [("one", 0)]
+    assert _stored(ledger_conn, taken.epoch, "one") == []
+
+
+def test_a_second_snapshot_is_a_second_epoch_of_the_changed_table(ledger_conn: Any) -> None:
+    _installed_with_tables(ledger_conn, ONE, f"INSERT INTO {SCHEMA}.one VALUES (1, 'x')")
+    register(ledger_conn, SCHEMA, "one")
+    first = snapshot(ledger_conn, "first")
+    _execute(ledger_conn, f"UPDATE {SCHEMA}.one SET name = 'y'", f"INSERT INTO {SCHEMA}.one VALUES (2, 'z')")
+    second = snapshot(ledger_conn, "second")
+    assert second.epoch > first.epoch
+    assert [t.row_count for t in first.tables] == [1] and [t.row_count for t in second.tables] == [2]
+    assert [row["name"] for _, row in _stored(ledger_conn, first.epoch, "one")] == ["x"]
+    assert [row["name"] for _, row in _stored(ledger_conn, second.epoch, "one")] == ["y", "z"]
+
+
+def test_snapshot_prints_a_user_type_qualified_whatever_the_search_path(ledger_conn: Any) -> None:
+    _installed_with_tables(
+        ledger_conn,
+        f"CREATE TYPE {SCHEMA}.mood AS ENUM ('ok', 'sad')",
+        f"CREATE TABLE {SCHEMA}.felt (id int PRIMARY KEY, mood {SCHEMA}.mood, moods {SCHEMA}.mood[])",
+        f"INSERT INTO {SCHEMA}.felt VALUES (1, 'sad', '{{ok,sad}}')",
+        f"SET search_path TO {SCHEMA}, public",
+    )
+    register(ledger_conn, SCHEMA, "felt")
+    taken = snapshot(ledger_conn, "mood")
+    assert [(c.name, c.type) for c in taken.tables[0].columns] == [
+        ("id", "integer"),
+        ("mood", f"{SCHEMA}.mood"),
+        ("moods", f"{SCHEMA}.mood[]"),
+    ]
+    assert _stored(ledger_conn, taken.epoch, "felt")[0][1] == {"id": 1, "mood": "sad", "moods": ["ok", "sad"]}
+
+
+def test_snapshot_takes_hostile_names_as_names(ledger_conn: Any) -> None:
+    table = 'x"; DROP TABLE nozdormu_test.y; --'
+    quoted = '"My Schema"."x""; DROP TABLE nozdormu_test.y; --"'
+    _installed_with_tables(
+        ledger_conn,
+        f"CREATE TABLE {SCHEMA}.y (id int)",
+        'CREATE SCHEMA "My Schema"',
+        f'CREATE TABLE {quoted} ("50%" int PRIMARY KEY, "a b" text)',
+        f"INSERT INTO {quoted} VALUES (1, 'it''s'), (2, 'back\\slash')",
+    )
+    try:
+        register(ledger_conn, "My Schema", table)
+        taken = snapshot(ledger_conn, "hostile; DROP SCHEMA caverns CASCADE")
+        assert [(t.schema, t.table, t.key, t.row_count) for t in taken.tables] == [("My Schema", table, ("50%",), 2)]
+        assert [c.name for c in taken.tables[0].columns] == ["50%", "a b"]
+        stored = _stored(ledger_conn, taken.epoch, table, "My Schema")
+        assert stored == [({"50%": 1}, {"50%": 1, "a b": "it's"}), ({"50%": 2}, {"50%": 2, "a b": "back\\slash"})]
+        assert _tables_exist(ledger_conn) == EPOCH_TABLES
+        assert _query(ledger_conn, f"SELECT count(*) FROM {SCHEMA}.y") == [(0,)]
+    finally:
+        ledger_conn.rollback()
+        _execute(ledger_conn, 'DROP SCHEMA IF EXISTS "My Schema" CASCADE')
+
+
+def test_snapshot_refuses_without_a_registered_table(ledger_conn: Any) -> None:
+    install(ledger_conn)
+    with pytest.raises(EpochRefused, match=r"no table is registered: call register\(\) first"):
+        snapshot(ledger_conn, "none")
+    _nothing_written(ledger_conn)
+
+
+def test_snapshot_refuses_a_name_that_is_taken(ledger_conn: Any) -> None:
+    _installed_with_tables(ledger_conn, ONE)
+    register(ledger_conn, SCHEMA, "one")
+    taken = snapshot(ledger_conn, "once")
+    with pytest.raises(EpochRefused, match=rf"the epoch name 'once' is taken \(epoch {taken.epoch}\)"):
+        snapshot(ledger_conn, "once")
+    _assert_idle(ledger_conn)
+    assert _query(ledger_conn, "SELECT count(*) FROM caverns.epoch") == [(1,)]
+    assert _query(ledger_conn, ADVISORY_LOCKS) == [(0,)]
+    _execute(ledger_conn, INSERT_TOMBSTONE.replace(EPOCH_ID, str(taken.epoch)))  # a deleted epoch keeps its name
+    with pytest.raises(EpochRefused, match="is taken"):
+        snapshot(ledger_conn, "once")
+
+
+@pytest.mark.parametrize("name", ["", " lead", "trail ", "two\nlines", None, 3])
+def test_snapshot_refuses_a_bad_name(ledger_conn: Any, name: Any) -> None:
+    _installed_with_tables(ledger_conn, ONE)
+    register(ledger_conn, SCHEMA, "one")
+    with pytest.raises(ChangesetError, match="epoch name"):
+        snapshot(ledger_conn, name)
+    _nothing_written(ledger_conn)
+
+
+def test_snapshot_refuses_before_install_and_releases_the_lock(ledger_conn: Any) -> None:
+    with pytest.raises(LedgerNotInstalled, match="call install"):
+        snapshot(ledger_conn, "early")
+    assert _query(ledger_conn, ADVISORY_LOCKS) == [(0,)]
+
+
+def test_snapshot_refuses_a_registered_table_that_is_gone(ledger_conn: Any) -> None:
+    _installed_with_tables(ledger_conn, ONE, f"CREATE TABLE {SCHEMA}.zz (id int PRIMARY KEY)")
+    register(ledger_conn, SCHEMA, "one")
+    register(ledger_conn, SCHEMA, "zz")
+    _execute(ledger_conn, f"DROP TABLE {SCHEMA}.zz")
+    with pytest.raises(EpochRefused, match=rf"{SCHEMA}\.zz is registered but does not exist"):
+        snapshot(ledger_conn, "gone")  # nothing of `one`, which came first, is kept either
+    _nothing_written(ledger_conn)
+
+
+def test_snapshot_refuses_a_key_column_that_is_gone(ledger_conn: Any) -> None:
+    _installed_with_tables(ledger_conn, ONE)
+    register(ledger_conn, SCHEMA, "one", key=["name"])
+    _execute(ledger_conn, f"ALTER TABLE {SCHEMA}.one DROP COLUMN name")
+    with pytest.raises(EpochRefused, match=rf"{SCHEMA}\.one has no column 'name' for the key"):
+        snapshot(ledger_conn, "nokey")
+    _nothing_written(ledger_conn)
+
+
+def test_snapshot_refuses_a_key_with_duplicates_and_keeps_nothing(ledger_conn: Any) -> None:
+    _installed_with_tables(
+        ledger_conn,
+        ONE,
+        f"CREATE TABLE {SCHEMA}.dup (a int, b int)",
+        f"INSERT INTO {SCHEMA}.one VALUES (1, 'x')",
+        f"INSERT INTO {SCHEMA}.dup VALUES (1, 1), (1, 2), (2, 3)",
+    )
+    register(ledger_conn, SCHEMA, "dup", key=["a"])
+    register(ledger_conn, SCHEMA, "one")
+    with pytest.raises(EpochRefused, match=rf"the key \(a\) of {SCHEMA}\.dup is not unique"):
+        snapshot(ledger_conn, "dup")  # `dup` sorts before `one`: the rows copied before the refusal go too
+    _nothing_written(ledger_conn)
+    _execute(ledger_conn, f"UPDATE {SCHEMA}.dup SET a = b")
+    assert [t.row_count for t in snapshot(ledger_conn, "dup").tables] == [3, 1]
+
+
+def test_snapshot_refuses_a_key_with_nulls(ledger_conn: Any) -> None:
+    _installed_with_tables(
+        ledger_conn,
+        f"CREATE TABLE {SCHEMA}.nul (a int, b int)",
+        f"INSERT INTO {SCHEMA}.nul VALUES (1, 1), (NULL, 2)",
+    )
+    register(ledger_conn, SCHEMA, "nul", key=["b", "a"])
+    with pytest.raises(EpochRefused, match=rf"the key \(b, a\) of {SCHEMA}\.nul has nulls"):
+        snapshot(ledger_conn, "nul")
+    _nothing_written(ledger_conn)
+
+
+def test_snapshot_releases_the_session_lock(ledger_conn: Any) -> None:
+    _installed_with_tables(ledger_conn, ONE)
+    register(ledger_conn, SCHEMA, "one")
+    snapshot(ledger_conn, "ok")
+    assert _query(ledger_conn, ADVISORY_LOCKS) == [(0,)]
+
+
+def test_snapshot_waits_for_the_lock_and_sees_what_the_holder_committed(ledger_conn: Any, second_conn: Any) -> None:
+    _installed_with_tables(ledger_conn, ONE, f"INSERT INTO {SCHEMA}.one VALUES (1, 'x')")
+    register(ledger_conn, SCHEMA, "one")
+    with second_conn.cursor() as cursor:
+        _connection.lock(cursor)
+    result: dict[str, Any] = {}
+
+    def run() -> None:
+        try:
+            result["epoch"] = snapshot(ledger_conn, "waited")
+        except BaseException as error:  # reported by the assertions below
+            result["error"] = error
+
+    runner = threading.Thread(target=run, daemon=True)
+    runner.start()
+    try:
+        _wait_for_a_waiting_lock(second_conn)
+        with second_conn.cursor() as cursor:  # the other runner's work, under the lock it holds
+            cursor.execute(f"INSERT INTO {SCHEMA}.one VALUES (2, 'y')")
+        second_conn.commit()
+    finally:
+        second_conn.rollback()  # releases the lock when the test failed before the commit
+        runner.join(WAIT_SECONDS)
+    assert not runner.is_alive()
+    assert "error" not in result, result
+    assert [t.row_count for t in result["epoch"].tables] == [2]
+
+
+# --- catalog --------------------------------------------------------------------------------
+
+
+def test_catalog_is_empty_before_any_snapshot(ledger_conn: Any) -> None:
+    install(ledger_conn)
+    assert catalog(ledger_conn) == []
+    _assert_idle(ledger_conn)
+
+
+def test_catalog_lists_the_epochs_newest_first_with_their_tables(ledger_conn: Any) -> None:
+    _installed_with_tables(
+        ledger_conn,
+        ONE,
+        TWO,
+        f"INSERT INTO {SCHEMA}.one VALUES (1, 'x')",
+        f"INSERT INTO {SCHEMA}.two VALUES (1, 'p', 2)",
+    )
+    register(ledger_conn, SCHEMA, "one")
+    first = snapshot(ledger_conn, "first")
+    register(ledger_conn, SCHEMA, "two")
+    second = snapshot(ledger_conn, "second")
+    listed = catalog(ledger_conn)
+    assert listed == [second, first]
+    assert [e.name for e in listed] == ["second", "first"]
+    assert [[(t.table, t.row_count) for t in e.tables] for e in listed] == [[("one", 1), ("two", 1)], [("one", 1)]]
+    assert [e.deleted_at for e in listed] == [None, None]
+    assert [e.name for e in catalog(ledger_conn, limit=1)] == ["second"]
+    assert [e.name for e in catalog(ledger_conn, limit=5)] == ["second", "first"]
+    assert [e.name for e in catalog(ledger_conn, limit=2**63 - 1)] == ["second", "first"]
+    _assert_idle(ledger_conn)
+
+
+def test_catalog_shows_the_deletion_time_and_keeps_the_tables(ledger_conn: Any) -> None:
+    _installed_with_tables(ledger_conn, ONE)
+    register(ledger_conn, SCHEMA, "one")
+    taken = snapshot(ledger_conn, "gone")
+    _execute(ledger_conn, INSERT_TOMBSTONE.replace(EPOCH_ID, str(taken.epoch)))
+    (listed,) = catalog(ledger_conn)
+    assert listed.deleted_at is not None
+    assert listed.tables == taken.tables
+
+
+@pytest.mark.parametrize("limit", [0, -1, True, False, "x", 1.5, 2**63])
+def test_catalog_refuses_an_invalid_limit(ledger_conn: Any, limit: Any) -> None:
+    install(ledger_conn)
+    with pytest.raises(ChangesetError, match="limit must be a positive integer up to 9223372036854775807"):
+        catalog(ledger_conn, limit=limit)
+    _assert_idle(ledger_conn)

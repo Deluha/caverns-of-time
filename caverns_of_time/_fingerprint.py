@@ -14,7 +14,7 @@ from collections.abc import Callable, Collection, Sequence
 from dataclasses import dataclass
 from typing import Any
 
-from caverns_of_time._connection import Cursor, names
+from caverns_of_time._connection import Cursor, names, pin_search_path
 from caverns_of_time.errors import CavernsError, ChangesetError
 
 __all__ = [
@@ -38,7 +38,6 @@ __all__ = [
 # The kinds of object a document holds, in the order they are read.
 _KINDS = ("table", "column", "index", "constraint", "view", "function")
 
-_PIN_SEARCH_PATH_SQL = "SELECT set_config('search_path', 'pg_catalog', true)"
 # The schemas a fingerprint covers when the caller names none: every one but the system's and Caverns' own.
 _DEFAULT_SCHEMAS_SQL = (
     "SELECT nspname::text FROM pg_namespace"
@@ -249,7 +248,7 @@ def read_document(cursor: Cursor, schemas: Sequence[str]) -> dict[str, Any]:
     Every schema appears with all its kinds, empty when it holds none. Pins `search_path` to `pg_catalog` for
     the transaction, because type, default and definition texts print names relative to it.
     """
-    cursor.execute(_PIN_SEARCH_PATH_SQL)
+    pin_search_path(cursor)
     document: dict[str, Any] = {schema: {kind: {} for kind in _KINDS} for schema in schemas}
     bound = (list(schemas),)
 

@@ -5,7 +5,7 @@
 The importable package. It is generic: nothing here names a consumer or assumes a consumer's schema
 (hard rule 1). It holds the version, the shared exceptions, the console helpers and, so far, four
 components: Nozdormu, the migration ledger, Chromie, the command line, Infinite, the schema fingerprint, and
-Epochs, the snapshots of opted-in tables (so far their registry).
+Epochs, the snapshots of opted-in tables (so far their registry, the snapshot and the catalog).
 
 ## Files & entry points
 
@@ -13,13 +13,13 @@ Epochs, the snapshots of opted-in tables (so far their registry).
 |---|---|
 | `__init__.py` | `__version__`, read from the installed distribution's metadata |
 | `errors.py` | The exception types, all in one module |
-| `_connection.py` | Shared private plumbing, not a component: the `Connection` and `Cursor` protocols, the connection guard, the transaction helpers, the advisory lock every Caverns write takes (`ADVISORY_LOCK_KEY`, `lock`), the name validation (`validate_name`), the one-statement check runner and the collection-of-names guard |
+| `_connection.py` | Shared private plumbing, not a component: the `Connection` and `Cursor` protocols, the connection guard, the transaction helpers, the advisory lock every Caverns write takes (`ADVISORY_LOCK_KEY`, `lock`; `session_lock` for a REPEATABLE READ `transaction`), the name and limit validation (`validate_name`, `validate_limit`), the pinned search path (`pin_search_path`), the one-statement check runner and the collection-of-names guard |
 | `_fingerprint.py` | Shared private fingerprint machinery, not a component: `Fingerprint`, the catalog queries, the document and its hash, the default, watched and missing schemas, `Difference`, `restrict` and `compare`, and the storage of fingerprints in `caverns.fingerprint` (`record`, `latest`) |
 | `console.py` | The console helpers: status lines with their icons, tables and JSON; the only module that prints |
 | `chromie.py` | Chromie: the `chromie` command's parsing, connection configuration and dispatch (command flow only) |
 | `nozdormu.py` | Nozdormu: the `Step` and `Changeset` model, the checksum, the loaders, the ledger, `install`, `preflight`, `history`, `apply` and `baseline`; it re-exports `Connection`, whose contract lives in `_connection.py` |
 | `infinite.py` | Infinite: `fingerprint` and the `Fingerprint` it returns, `drift` and the `Drift` and `Difference` it returns |
-| `epochs.py` | Epochs: the registry of tracked tables (`register`, `unregister`, `tracked`, `TrackedTable`) in `caverns.epoch_table` |
+| `epochs.py` | Epochs: the registry of tracked tables (`register`, `unregister`, `tracked`, `TrackedTable`) in `caverns.epoch_table`, `snapshot`, `catalog` and the `Epoch`, `EpochTable` and `Column` they return |
 
 ## How it works
 
@@ -187,6 +187,22 @@ returns the stored row; another key replaces the stored one (the row's time and 
 warning through the `caverns_of_time.epochs` logger. `unregister` deletes the registry row only: the epochs
 already taken keep the table's rows. The registry is mutable configuration, so it has no trigger.
 
+**Epochs, snapshot.** `snapshot(connection, name)` copies every registered table into one new epoch: a row of
+`caverns.epoch` (the name, the latest ledger version, the time, the user, the Caverns version), a row of
+`epoch_source` per table (its key, its `columns` as a JSON list of name and type in column order, its row count) and
+a row of `epoch_row` per source row (the key as a JSON object of the key columns' values, the row as `to_jsonb`
+of it). It takes Caverns' advisory lock at session level and commits, then opens a REPEATABLE READ transaction, so
+the snapshot is taken after the lock is held (a transaction-level lock statement would take the snapshot before it
+waits) and all tables are read in one consistent view; the lock is released when the call ends. The epoch name
+follows the label rules and is unique for good: a deleted epoch keeps its name. A refusal rolls everything back,
+so nothing is written: no registered table, a name taken, a registered table or key column that no longer exists,
+a key with duplicates or with nulls. The copy of a table is one statement PostgreSQL composes (hard rule 3):
+`format` quotes the schema and table names and the key as literals from a template bound as a value, never built in
+Python. A value's type is not in the row: JSON holds numbers, strings, booleans, nulls, arrays and objects, so
+read a value's type from the epoch's `columns` (`Column.type`, printed by `format_type` with the search path
+pinned to `pg_catalog`, so a user type is schema-qualified). `catalog(connection, *, limit=None)` lists the epochs
+newest first, deleted ones included, each with its tables.
+
 **The epoch tables.** Created by the own step `epochs`, all in schema `caverns`:
 
 | Table | Holds | Rule |
@@ -198,8 +214,8 @@ already taken keep the table's rows. The registry is mutable configuration, so i
 | `epoch_deletion` | the tombstones: `epoch` (primary key, a foreign key to `epoch`), `deleted_at`, `deleted_by`, `caverns_version` | triggers reject UPDATE, DELETE and TRUNCATE |
 
 Truncating `epoch` or `epoch_source` is also refused by the foreign keys unless it cascades, and then by the
-triggers. Nothing writes the catalog, the sources, the rows or the tombstones yet: the snapshot, the queries and
-the deletion of an epoch arrive in the next commits of the phase.
+triggers. `snapshot` writes the catalog, the sources and the rows; nothing writes the tombstones yet: the queries
+and the deletion of an epoch arrive in the next commits of the phase.
 
 **Chromie, the command line.** `chromie` is installed with the `cli` extra
 (`pip install 'caverns-of-time[cli]'`), which brings its driver, psycopg 3; the library itself imports
@@ -346,9 +362,20 @@ With nothing found: `✅ No drift — the live schema matches the fingerprint at
   `ChangesetError`, `LedgerNotInstalled` and `EpochRefused` (the table is not registered).
 - `epochs.tracked(connection) -> list[TrackedTable]`: the registry ordered by schema and table, in one read-only
   transaction that writes nothing. Raises `LedgerNotInstalled`.
+- `epochs.snapshot(connection, name) -> Epoch`: copies every registered table into a new epoch called *name* (a
+  label-style name, unique for good). Raises `ChangesetError` for a bad name, `LedgerNotInstalled` and `EpochRefused`
+  (no registered table, a name taken, a registered table or key column that is gone, a key with duplicates or
+  nulls); a refusal writes nothing. Logs `took epoch NAME at ledger version V: N rows in M tables`.
+- `epochs.catalog(connection, *, limit=None) -> list[Epoch]`: the epochs newest first, deleted ones included, at
+  most *limit* (None: all) in one read-only transaction that writes nothing. Raises `ChangesetError` for a *limit*
+  that is not a positive integer up to 9223372036854775807 and `LedgerNotInstalled`.
+- `Epoch(epoch, name, ledger_version, taken_at, taken_by, caverns_version, deleted_at, tables)`: a frozen dataclass;
+  `deleted_at` is None until the epoch is deleted, `tables` a tuple of `EpochTable` ordered by schema and table.
+  `EpochTable(schema, table, key, columns, row_count)`: `key` a tuple of column names, `columns` a tuple of
+  `Column(name, type)` in column order. All frozen.
 - `TrackedTable(schema, table, key, registered_at, registered_by)`: a frozen dataclass; `key` is a tuple of column names.
 - The public names are `Connection`, `LedgerEntry`, `Status`, `StepStatus`, `Step`, `Changeset`, `Fingerprint`,
-  `Difference`, `Drift`, `TrackedTable` and the functions above; the exceptions, all in `caverns_of_time.errors`, are
+  `Difference`, `Drift`, `TrackedTable`, `Epoch`, `EpochTable`, `Column` and the functions above; the exceptions, all in `caverns_of_time.errors`, are
   `CavernsError` (the base), `ChangesetError`, `LedgerNotInstalled`, `PreflightRefused`, `StepFailed`,
   `BaselineRefused`, `NoFingerprint`, `EpochRefused` and `EpochNotFound` (raised from the next commit of the phase on).
 - The own changeset is never edited once released: a change to the ledger, the fingerprint table or the epoch
