@@ -13,7 +13,7 @@ import logging
 import os
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict
-from datetime import UTC
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Protocol
 
@@ -110,6 +110,19 @@ def build_parser() -> argparse.ArgumentParser:
     diff.add_argument("new", metavar="NEW", help="the later epoch name")
     diff.add_argument("--table", action="append", type=_table_name, help="compare only this table (repeatable)")
     diff.set_defaults(handler=_diff)
+    epoch_list = commands.add_parser("epochs", parents=[_common], help="list the epochs, newest first")
+    epoch_list.add_argument(
+        "--limit",
+        type=_non_negative_int,
+        default=DEFAULT_LOG_LIMIT,
+        help=f"the most rows to show (0: all; default: {DEFAULT_LOG_LIMIT})",
+    )
+    epoch_list.set_defaults(handler=_epochs)
+    delete_epoch = commands.add_parser("delete-epoch", parents=[_common], help="delete epochs and their rows")
+    delete_epoch.add_argument("epoch", nargs="+", metavar="EPOCH", help="an epoch name")
+    delete_epoch.add_argument("--dry-run", action="store_true", help="report what would be deleted, delete nothing")
+    delete_epoch.add_argument("--yes", action="store_true", help="skip the confirmation (required unattended)")
+    delete_epoch.set_defaults(handler=_delete_epoch)
     return parser
 
 
@@ -310,6 +323,115 @@ def _diff(args: argparse.Namespace, connection: Connection) -> int:
     else:
         console.success(f"No differences between epochs {old.name} and {new.name}.")
     return code
+
+
+def _plural(count: int, noun: str) -> str:
+    """`1 row`, `2 rows`."""
+    return f"{count} {noun}" if count == 1 else f"{count} {noun}s"
+
+
+def _epoch_json(epoch: epochs.Epoch) -> dict[str, object]:
+    """An epoch as the JSON of `epochs` and `delete-epoch`: its catalog row and its tables."""
+    return {
+        "epoch": epoch.epoch,
+        "name": epoch.name,
+        "ledger_version": epoch.ledger_version,
+        "taken_at": epoch.taken_at.isoformat(),
+        "taken_by": epoch.taken_by,
+        "caverns_version": epoch.caverns_version,
+        "deleted_at": epoch.deleted_at.isoformat() if epoch.deleted_at else None,
+        "tables": [
+            {
+                "schema": t.schema,
+                "table": t.table,
+                "key": list(t.key),
+                "columns": [asdict(column) for column in t.columns],
+                "row_count": t.row_count,
+            }
+            for t in epoch.tables
+        ],
+    }
+
+
+def _utc(moment: datetime) -> str:
+    return moment.astimezone(UTC).strftime(_TIME_FORMAT)
+
+
+def _row_count(epoch: epochs.Epoch) -> int:
+    return sum(table.row_count for table in epoch.tables)
+
+
+def _epochs(args: argparse.Namespace, connection: Connection) -> int:
+    """`chromie epochs`: the epochs, newest first, deleted ones included."""
+    found = epochs.catalog(connection, limit=args.limit or None)
+    if args.format == "json":
+        console.emit_json([_epoch_json(e) for e in found])
+    elif not found:
+        console.info("Nothing to show — no epoch is recorded.")
+    else:
+        rows = [
+            (
+                e.epoch,
+                e.name,
+                e.ledger_version,
+                _utc(e.taken_at),
+                e.taken_by,
+                len(e.tables),
+                _row_count(e),
+                _utc(e.deleted_at) if e.deleted_at else None,
+            )
+            for e in found
+        ]
+        headers = ["EPOCH", "NAME", "LEDGER", "TAKEN_AT (UTC)", "BY", "TABLES", "ROWS", "DELETED (UTC)"]
+        console.table(headers, rows, right=[0, 2, 5, 6])
+    return EXIT_OK
+
+
+def _delete_plan(connection: Connection, names: Sequence[str]) -> list[epochs.Epoch]:
+    """The epochs to delete in the order named, a repeated name once; a usage error for an unknown or deleted one."""
+    by_name = {e.name: e for e in epochs.catalog(connection)}
+    plan = []
+    for name in dict.fromkeys(names):
+        epoch = by_name.get(name)
+        if epoch is None:
+            raise UsageError(f"no epoch is named {name!r}")
+        if epoch.deleted_at is not None:
+            raise UsageError(f"epoch {name!r} is already deleted")
+        plan.append(epoch)
+    return plan
+
+
+def _delete_epoch(args: argparse.Namespace, connection: Connection) -> int:
+    """`chromie delete-epoch`: delete epochs' rows after a confirmation; the one command that writes."""
+    plan = _delete_plan(connection, args.epoch)
+    if args.dry_run:
+        if args.format == "json":
+            console.emit_json([_epoch_json(e) for e in plan])
+            return EXIT_OK
+        for e in plan:
+            counted = f"{_plural(_row_count(e), 'row')} in {_plural(len(e.tables), 'table')}"
+            console.info(f"Would delete epoch {e.name} ({counted}, taken {_utc(e.taken_at)} UTC).")
+        console.info("Dry run — nothing deleted.")
+        return EXIT_OK
+    if not args.yes:
+        if not console.interactive():
+            raise UsageError("delete-epoch needs --yes when not run interactively")
+        listed = ", ".join(e.name for e in plan)
+        question = (
+            f"Delete {_plural(len(plan), 'epoch')} ({listed}) and their {_plural(sum(map(_row_count, plan)), 'row')}?"
+        )
+        if not console.confirm(question):
+            console.info("Aborted — no changes were made.")
+            return EXIT_OK
+    deleted = epochs.delete(connection, [e.name for e in plan])
+    if args.format == "json":
+        console.emit_json([_epoch_json(e) for e in deleted])
+    else:
+        for e in deleted:
+            console.success(
+                f"Deleted epoch {e.name} ({_plural(_row_count(e), 'row')} in {_plural(len(e.tables), 'table')})."
+            )
+    return EXIT_OK
 
 
 def main(argv: Sequence[str] | None = None) -> int:

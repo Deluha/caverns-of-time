@@ -6,7 +6,7 @@ The importable package. It is generic: nothing here names a consumer or assumes 
 (hard rule 1). It holds the version, the shared exceptions, the console helpers and, so far, four
 components: Nozdormu, the migration ledger, Chromie, the command line, Infinite, the schema fingerprint, and
 Epochs, the snapshots of opted-in tables (so far their registry, the snapshot, the catalog, a table as of an epoch and the
-difference of two epochs).
+difference of two epochs, their deletion).
 
 ## Files & entry points
 
@@ -16,11 +16,11 @@ difference of two epochs).
 | `errors.py` | The exception types, all in one module |
 | `_connection.py` | Shared private plumbing, not a component: the `Connection` and `Cursor` protocols, the connection guard, the transaction helpers, the advisory lock every Caverns write takes (`ADVISORY_LOCK_KEY`, `lock`; `session_lock` for a REPEATABLE READ `transaction`), the name and limit validation (`validate_name`, `validate_limit`), the pinned search path (`pin_search_path`), the one-statement check runner and the collection-of-names guard |
 | `_fingerprint.py` | Shared private fingerprint machinery, not a component: `Fingerprint`, the catalog queries, the document and its hash, the default, watched and missing schemas, `Difference`, `restrict` and `compare`, and the storage of fingerprints in `caverns.fingerprint` (`record`, `latest`) |
-| `console.py` | The console helpers: status lines with their icons, tables and JSON; the only module that prints |
+| `console.py` | The console helpers: status lines with their icons, tables and JSON, the confirmation prompt (`confirm`, `interactive`); the only module that prints or reads |
 | `chromie.py` | Chromie: the `chromie` command's parsing, connection configuration and dispatch (command flow only) |
 | `nozdormu.py` | Nozdormu: the `Step` and `Changeset` model, the checksum, the loaders, the ledger, `install`, `preflight`, `history`, `apply` and `baseline`; it re-exports `Connection`, whose contract lives in `_connection.py` |
 | `infinite.py` | Infinite: `fingerprint` and the `Fingerprint` it returns, `drift` and the `Drift` and `Difference` it returns |
-| `epochs.py` | Epochs: the registry of tracked tables (`register`, `unregister`, `tracked`, `TrackedTable`) in `caverns.epoch_table`, `snapshot`, `catalog`, `as_of`, `diff` and the `Epoch`, `EpochTable`, `Column`, `TableAt` and `EpochDiff` (with `TableDiff`, `ColumnChange`, `RowChange`) they return |
+| `epochs.py` | Epochs: the registry of tracked tables (`register`, `unregister`, `tracked`, `TrackedTable`) in `caverns.epoch_table`, `snapshot`, `catalog`, `as_of`, `diff`, `delete` and the `Epoch`, `EpochTable`, `Column`, `TableAt` and `EpochDiff` (with `TableDiff`, `ColumnChange`, `RowChange`) they return |
 
 ## How it works
 
@@ -224,6 +224,15 @@ row. A table whose key differs between the epochs is refused (`EpochRefused`, na
 nothing and ignores the live tables; a deleted epoch is refused. Rows come back ordered by the key columns in their
 declared order, as in `as_of`.
 
+**Epochs, retention.** Nothing is pruned automatically: every epoch is kept until it is deleted by name, and a
+snapshot never deletes. `delete(connection, names)` deletes the epochs called *names*: for each it writes a tombstone
+in `caverns.epoch_deletion` (the time, the user, the Caverns version), then deletes the epoch's `epoch_row` rows,
+which the table's trigger allows only after the tombstone. The catalog row and the `epoch_source` rows stay, so
+`catalog` and `chromie epochs` still list the epoch with its deletion time and its table sizes, and the name stays
+taken for good (`snapshot` refuses it; `as_of` and `diff` refuse the epoch). It is all or nothing: one transaction
+under the advisory lock resolves every name first, so an unknown or an already deleted name deletes nothing. A
+deletion is a tombstone, not a ledger row: the ledger is the schema timeline that `preflight` and Timewalking read.
+
 **The epoch tables.** Created by the own step `epochs`, all in schema `caverns`:
 
 | Table | Holds | Rule |
@@ -235,8 +244,8 @@ declared order, as in `as_of`.
 | `epoch_deletion` | the tombstones: `epoch` (primary key, a foreign key to `epoch`), `deleted_at`, `deleted_by`, `caverns_version` | triggers reject UPDATE, DELETE and TRUNCATE |
 
 Truncating `epoch` or `epoch_source` is also refused by the foreign keys unless it cascades, and then by the
-triggers. `snapshot` writes the catalog, the sources and the rows; nothing writes the tombstones yet: the
-deletion of an epoch arrives in the next commit of the phase.
+triggers. `snapshot` writes the catalog, the sources and the rows; `delete` writes the tombstones and deletes the
+rows of the epochs it deletes: nothing else updates or deletes in these tables.
 
 **Chromie, the command line.** `chromie` is installed with the `cli` extra
 (`pip install 'caverns-of-time[cli]'`), which brings its driver, psycopg 3; the library itself imports
@@ -246,7 +255,8 @@ client does, so name the host and database in the string. Every command takes
 `--format text|json` (default `text`). Results go to stdout, warnings and errors to stderr. Exit codes:
 0 success, 1 a finding the command exists to report, 2 a usage or environment error (bad arguments, no
 connection string, a refused connection, a Caverns error); any other error, a driver or OS one included, is
-also exit 2, never a finding.
+also exit 2, never a finding. Every command only reads except `delete-epoch`, which deletes epochs' rows and asks
+first.
 
 `chromie log [--changeset NAME] [--limit N]` shows the ledger, newest first, as a table (`--limit` defaults to
 20, `0` shows every row; `--format json` is a list of objects with every ledger column, `recorded_at` as ISO 8601
@@ -317,6 +327,37 @@ with the same exit codes and no status lines:
 ```
 
 With nothing found: `✅ No differences between epochs run-41 and run-42.`
+
+`chromie epochs [--limit N]` lists the epochs, newest first, deleted ones included (`epochs.catalog`): the epoch
+number, name, ledger version, when it was taken in UTC and by whom, the number of tables and rows it holds (a deleted
+epoch keeps these counts, its rows are gone) and when it was deleted (`-` when it was not). `--limit` defaults to 20
+and `0` shows every epoch. `--format json` prints a list, `[]` when there are none, of `{"epoch", "name",
+"ledger_version", "taken_at" (ISO 8601 with its offset), "taken_by", "caverns_version", "deleted_at" (ISO 8601 or
+null), "tables": [{"schema", "table", "key", "columns": [{"name", "type"}], "row_count"}]}`. No epoch is an
+information line. Exit 0; 2 for a ledger that is not installed:
+
+```text
+EPOCH  NAME    LEDGER  TAKEN_AT (UTC)       BY        TABLES  ROWS  DELETED (UTC)
+    3  run-42       9  2026-11-22 17:06:45  postgres       2  1204  -
+    2  run-41       9  2026-11-21 17:06:45  postgres       2  1190  2026-11-22 18:00:00
+    1  run-40       7  2026-11-20 17:06:45  postgres       1    12  -
+```
+
+`chromie delete-epoch EPOCH [EPOCH ...] [--dry-run] [--yes]` deletes the named epochs and their rows (`epochs.delete`;
+the catalog rows and the names stay). An epoch that is unknown or already deleted is a usage error and nothing is
+deleted. Without `--yes` it asks on stderr, `Delete 2 epochs (run-40, run-41) and their 1216 rows? [y/N]`, and
+only `y` or `yes` goes on: any other answer or the end of input prints `ℹ️ Aborted — no changes were made.` and exits 0; when stdin is
+not a terminal it refuses without `--yes` (exit 2), so an unattended run must pass `--yes`. `--dry-run` deletes
+nothing and asks nothing: it prints one line per epoch and `ℹ️ Dry run — nothing deleted.`. A deletion prints one
+`✅ Deleted epoch NAME (N rows in M tables).` line per epoch, newest first. `--format json` prints the list of epochs
+in the shape of `chromie epochs` (those that would be deleted with `--dry-run`, with `deleted_at` null; those deleted
+otherwise, with `deleted_at` set) and no status lines. Exit 0; 2 for an unknown or an already deleted epoch, no
+confirmation possible, a ledger that is not installed:
+
+```text
+ℹ️ Would delete epoch run-40 (12 rows in 1 table, taken 2026-11-20 17:06:45 UTC).
+ℹ️ Dry run — nothing deleted.
+```
 
 `chromie drift [DIRECTORY] [--changeset NAME] [--schema NAME ...]` compares the live schema with the last
 recorded fingerprint (`infinite.drift`). `DIRECTORY` is optional: given, its changeset's applied steps whose
@@ -437,6 +478,12 @@ With nothing found: `✅ No drift — the live schema matches the fingerprint at
 - `epochs.catalog(connection, *, limit=None) -> list[Epoch]`: the epochs newest first, deleted ones included, at
   most *limit* (None: all) in one read-only transaction that writes nothing. Raises `ChangesetError` for a *limit*
   that is not a positive integer up to 9223372036854775807 and `LedgerNotInstalled`.
+- `epochs.delete(connection, names) -> list[Epoch]`: deletes the epochs called *names* (a non-empty collection of valid
+  names, never a bare string; duplicates collapse): a tombstone, then the epoch's `epoch_row` rows. The catalog and
+  source rows stay and the name stays taken. One transaction under the advisory lock, every name resolved before
+  anything is written: all or nothing. Returns the deleted epochs re-read (`deleted_at` set), newest first. Raises
+  `ChangesetError` for a bad *names*, `LedgerNotInstalled`, `EpochNotFound` (an unknown epoch) and `EpochRefused` (an
+  already deleted epoch). Logs `deleted epoch NAME: N rows in M tables` per epoch.
 - `epochs.as_of(connection, epoch, schema, table, *, limit=None) -> TableAt`: the table as it was at the epoch named
   *epoch*, rows ordered by key, at most *limit* (None: all) in one read-only transaction that writes nothing. Raises
   `ChangesetError` for a bad argument (a *limit* that is not a positive integer up to 9223372036854775807 included),

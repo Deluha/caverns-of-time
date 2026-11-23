@@ -1,7 +1,8 @@
-"""Console output: the only module of the package that prints.
+"""Console output: the only module of the package that prints or reads.
 
-Input: messages and tabular or JSON-able values from the CLI. Output: lines on stdout (results, success and
-information) or stderr (warnings and errors), so output can be piped. Icon vocabulary: ✅ success,
+Input: messages and tabular or JSON-able values from the CLI, and the answer to a confirmation from stdin. Output:
+lines on stdout (results, success and information) or stderr (warnings, errors and the confirmation question), so
+output can be piped. Icon vocabulary: ✅ success,
 ℹ️ information, ⚠️ warning, ❌ error; the text never repeats the level the icon shows.
 Conventions: `.claude/skills/caverns-of-time-development/references/style.md#messages`.
 """
@@ -12,7 +13,7 @@ import json
 import sys
 from collections.abc import Collection, Sequence
 
-__all__ = ["emit_json", "error", "info", "success", "table", "warning"]
+__all__ = ["confirm", "emit_json", "error", "info", "interactive", "success", "table", "warning"]
 
 _GAP = "  "
 _NONE_CELL = "-"
@@ -36,6 +37,20 @@ def warning(message: str) -> None:
 def error(message: str) -> None:
     """Print an error line on stderr."""
     print(f"❌ {message}", file=sys.stderr)
+
+
+def interactive() -> bool:
+    """Whether stdin is a terminal, so a person can be asked."""
+    return sys.stdin.isatty()
+
+
+def confirm(question: str) -> bool:
+    """Ask *question* on stderr and read one line from stdin; true only for `y` or `yes` (any case), else false.
+
+    End of input (no line) is a refusal.
+    """
+    print(f"{question} [y/N] ", end="", file=sys.stderr, flush=True)
+    return sys.stdin.readline().strip().lower() in ("y", "yes")
 
 
 def table(headers: Sequence[str] | None, rows: Sequence[Sequence[object]], *, right: Collection[int] = ()) -> None:
