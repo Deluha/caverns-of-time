@@ -647,6 +647,17 @@ def test_snapshot_takes_hostile_names_as_names(ledger_conn: Any) -> None:
         _execute(ledger_conn, 'DROP SCHEMA IF EXISTS "My Schema" CASCADE')
 
 
+def test_snapshot_copies_the_whole_row_of_a_table_with_a_column_named_t(ledger_conn: Any) -> None:
+    _installed_with_tables(
+        ledger_conn,
+        f"CREATE TABLE {SCHEMA}.tee (id int PRIMARY KEY, t text)",
+        f"INSERT INTO {SCHEMA}.tee VALUES (1, 'x')",
+    )
+    register(ledger_conn, SCHEMA, "tee")
+    taken = snapshot(ledger_conn, "tee")
+    assert _stored(ledger_conn, taken.epoch, "tee") == [({"id": 1}, {"id": 1, "t": "x"})]
+
+
 def test_snapshot_refuses_without_a_registered_table(ledger_conn: Any) -> None:
     install(ledger_conn)
     with pytest.raises(EpochRefused, match=r"no table is registered: call register\(\) first"):

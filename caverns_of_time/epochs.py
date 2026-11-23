@@ -98,8 +98,9 @@ _INSERT_EPOCH_SQL = (
 # bound as a value to `format`, which quotes the identifiers (%I) and the literals (%L). The source rows are read
 # once (MATERIALIZED) for both the copy and the counts; `ON CONFLICT DO NOTHING` drops a repeated key, which the
 # counts then reveal. The key is a jsonb object of the key columns' values; a JSON null among them is counted.
+# `t.*` is the whole row even when the table has a column named `t` (a bare `t` would be that column).
 _COPY_TEMPLATE = """
-WITH source AS MATERIALIZED (SELECT to_jsonb(t) AS row FROM %I.%I t),
+WITH source AS MATERIALIZED (SELECT to_jsonb(t.*) AS row FROM %I.%I t),
 inserted AS (
     INSERT INTO caverns.epoch_row (epoch, schema_name, table_name, key, row)
     SELECT %s, %L, %L, (SELECT jsonb_object_agg(k, s.row -> k) FROM unnest(%L::text[]) AS k), s.row FROM source s
