@@ -19,7 +19,17 @@ from datetime import datetime
 from pathlib import Path
 
 from caverns_of_time import __version__
-from caverns_of_time._connection import Connection, Cursor, check_connection, names, read_only, run_check, transaction
+from caverns_of_time._connection import (
+    Connection,
+    Cursor,
+    check_connection,
+    lock,
+    names,
+    read_only,
+    run_check,
+    transaction,
+    validate_name,
+)
 from caverns_of_time._fingerprint import (
     FINGERPRINT_EXISTS_SQL,
     capture,
@@ -72,20 +82,6 @@ _OUTCOME_APPLIED = "applied"
 _OUTCOME_FAILED = "failed"
 _OUTCOME_ACCEPTED = "accepted"
 _OUTCOME_BASELINE = "baseline"
-# One key for every ledger write: Caverns' writers take turns, whatever the changeset.
-_ADVISORY_LOCK_KEY = 0x43617665726E73  # "Caverns"
-
-
-def _validate_name(kind: str, value: object) -> None:
-    """A label or changeset name: a non-empty single line without surrounding whitespace."""
-    if not isinstance(value, str):
-        raise ChangesetError(f"{kind} {value!r} is not a string")
-    if not value:
-        raise ChangesetError(f"{kind} is empty")
-    if value != value.strip():
-        raise ChangesetError(f"{kind} {value!r} has surrounding whitespace")
-    if len(value.splitlines()) != 1:
-        raise ChangesetError(f"{kind} {value!r} spans more than one line")
 
 
 def _checksum(sql: str) -> str:
@@ -117,7 +113,7 @@ class Step:
     check: str | None = None
 
     def __post_init__(self) -> None:
-        _validate_name("step label", self.label)
+        validate_name("step label", self.label)
         if not isinstance(self.sql, str):
             raise ChangesetError(f"step {self.label!r} has SQL that is not a string")
         if not self.sql.strip():
@@ -148,7 +144,7 @@ class Changeset:
     steps: Sequence[Step]
 
     def __post_init__(self) -> None:
-        _validate_name("changeset name", self.name)
+        validate_name("changeset name", self.name)
         steps = tuple(self.steps)
         if not steps:
             raise ChangesetError(f"changeset {self.name!r} has no steps")
@@ -270,11 +266,92 @@ CREATE OR REPLACE TRIGGER fingerprint_no_update_delete BEFORE UPDATE OR DELETE O
 CREATE OR REPLACE TRIGGER fingerprint_no_truncate BEFORE TRUNCATE ON caverns.fingerprint
     FOR EACH STATEMENT EXECUTE FUNCTION caverns.fingerprint_append_only();
 """
+# WARNING: this statement ships with the release: never edit it once released; its checksum is recorded
+# in every consumer's ledger. A change to the epoch tables is a new step of the own changeset (hard rule 6).
+_EPOCHS_DDL_SQL = """
+CREATE TABLE IF NOT EXISTS caverns.epoch_table (
+    schema_name   text        NOT NULL,
+    table_name    text        NOT NULL,
+    key           text[]      NOT NULL CHECK (cardinality(key) > 0),
+    registered_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    registered_by text        NOT NULL DEFAULT current_user,
+    PRIMARY KEY (schema_name, table_name)
+);
+CREATE TABLE IF NOT EXISTS caverns.epoch (
+    epoch           bigint      GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    name            text        NOT NULL UNIQUE,
+    ledger_version  bigint      NOT NULL REFERENCES caverns.ledger (version),
+    taken_at        timestamptz NOT NULL DEFAULT clock_timestamp(),
+    taken_by        text        NOT NULL DEFAULT current_user,
+    caverns_version text        NOT NULL
+);
+CREATE TABLE IF NOT EXISTS caverns.epoch_source (
+    epoch       bigint NOT NULL REFERENCES caverns.epoch (epoch),
+    schema_name text   NOT NULL,
+    table_name  text   NOT NULL,
+    key         text[] NOT NULL CHECK (cardinality(key) > 0),
+    columns     jsonb  NOT NULL,
+    row_count   bigint NOT NULL CHECK (row_count >= 0),
+    PRIMARY KEY (epoch, schema_name, table_name)
+);
+CREATE TABLE IF NOT EXISTS caverns.epoch_row (
+    epoch       bigint NOT NULL,
+    schema_name text   NOT NULL,
+    table_name  text   NOT NULL,
+    key         jsonb  NOT NULL,
+    row         jsonb  NOT NULL,
+    PRIMARY KEY (epoch, schema_name, table_name, key),
+    FOREIGN KEY (epoch, schema_name, table_name)
+        REFERENCES caverns.epoch_source (epoch, schema_name, table_name) DEFERRABLE INITIALLY DEFERRED
+);
+CREATE TABLE IF NOT EXISTS caverns.epoch_deletion (
+    epoch           bigint      PRIMARY KEY REFERENCES caverns.epoch (epoch),
+    deleted_at      timestamptz NOT NULL DEFAULT clock_timestamp(),
+    deleted_by      text        NOT NULL DEFAULT current_user,
+    caverns_version text        NOT NULL
+);
+CREATE OR REPLACE FUNCTION caverns.epoch_append_only() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    RAISE EXCEPTION 'caverns.% is append-only: % refused', TG_TABLE_NAME, TG_OP;
+END
+$$;
+CREATE OR REPLACE FUNCTION caverns.epoch_row_guard() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    IF TG_OP = 'DELETE' AND EXISTS (SELECT 1 FROM caverns.epoch_deletion d WHERE d.epoch = OLD.epoch) THEN
+        RETURN OLD;
+    END IF;
+    RAISE EXCEPTION 'caverns.epoch_row keeps an epoch''s rows until the epoch is deleted: % refused', TG_OP;
+END
+$$;
+CREATE OR REPLACE TRIGGER epoch_no_update_delete BEFORE UPDATE OR DELETE ON caverns.epoch
+    FOR EACH ROW EXECUTE FUNCTION caverns.epoch_append_only();
+CREATE OR REPLACE TRIGGER epoch_no_truncate BEFORE TRUNCATE ON caverns.epoch
+    FOR EACH STATEMENT EXECUTE FUNCTION caverns.epoch_append_only();
+CREATE OR REPLACE TRIGGER epoch_source_no_update_delete BEFORE UPDATE OR DELETE ON caverns.epoch_source
+    FOR EACH ROW EXECUTE FUNCTION caverns.epoch_append_only();
+CREATE OR REPLACE TRIGGER epoch_source_no_truncate BEFORE TRUNCATE ON caverns.epoch_source
+    FOR EACH STATEMENT EXECUTE FUNCTION caverns.epoch_append_only();
+CREATE OR REPLACE TRIGGER epoch_deletion_no_update_delete BEFORE UPDATE OR DELETE ON caverns.epoch_deletion
+    FOR EACH ROW EXECUTE FUNCTION caverns.epoch_append_only();
+CREATE OR REPLACE TRIGGER epoch_deletion_no_truncate BEFORE TRUNCATE ON caverns.epoch_deletion
+    FOR EACH STATEMENT EXECUTE FUNCTION caverns.epoch_append_only();
+CREATE OR REPLACE TRIGGER epoch_row_guard_update_delete BEFORE UPDATE OR DELETE ON caverns.epoch_row
+    FOR EACH ROW EXECUTE FUNCTION caverns.epoch_row_guard();
+CREATE OR REPLACE TRIGGER epoch_row_no_truncate BEFORE TRUNCATE ON caverns.epoch_row
+    FOR EACH STATEMENT EXECUTE FUNCTION caverns.epoch_append_only();
+"""
+# True only when all five epoch tables exist; `epochs` (the registry) reads it too, to refuse before the step ran.
+EPOCHS_EXISTS_SQL = (
+    "SELECT to_regclass('caverns.epoch_table') IS NOT NULL AND to_regclass('caverns.epoch') IS NOT NULL"
+    " AND to_regclass('caverns.epoch_source') IS NOT NULL AND to_regclass('caverns.epoch_row') IS NOT NULL"
+    " AND to_regclass('caverns.epoch_deletion') IS NOT NULL"
+)
 _OWN_CHANGESET = Changeset(
     _OWN_CHANGESET_NAME,
     [
         Step("ledger", _LEDGER_DDL_SQL, check=_LEDGER_EXISTS_SQL),
         Step("fingerprint", _FINGERPRINT_DDL_SQL, check=FINGERPRINT_EXISTS_SQL),
+        Step("epochs", _EPOCHS_DDL_SQL, check=EPOCHS_EXISTS_SQL),
     ],
 )
 
@@ -295,17 +372,11 @@ _INSERT_ENTRY_SQL = (
     " VALUES (%s, %s, %s, %s, %s, %s, %s, %s) RETURNING version, changeset, label, checksum, outcome,"
     " fingerprint, error, duration_ms, recorded_at, recorded_by, caverns_version"
 )
-_LOCK_SQL = "SELECT pg_advisory_xact_lock(%s::bigint)"
 
 
 def _reject_reserved(changeset: Changeset) -> None:
     if changeset.name == _OWN_CHANGESET_NAME:
         raise ChangesetError(f"the changeset name {changeset.name!r} is reserved for Caverns' own changeset")
-
-
-def _lock(cursor: Cursor) -> None:
-    """Take the ledger's advisory lock until the transaction ends."""
-    cursor.execute(_LOCK_SQL, (_ADVISORY_LOCK_KEY,))
 
 
 def _ledger_exists(cursor: Cursor) -> bool:
@@ -426,7 +497,7 @@ def history(connection: Connection, *, changeset: str | None = None, limit: int 
     """
     check_connection(connection)
     if changeset is not None:
-        _validate_name("changeset name", changeset)
+        validate_name("changeset name", changeset)
     valid = isinstance(limit, int) and not isinstance(limit, bool) and 1 <= limit <= _HISTORY_LIMIT_MAX
     if limit is not None and not valid:
         raise ChangesetError(f"limit must be a positive integer up to {_HISTORY_LIMIT_MAX}, not {limit!r}")
@@ -494,7 +565,7 @@ def _record_failure(
     """
     try:
         with transaction(connection) as cursor:
-            _lock(cursor)
+            lock(cursor)
             if not _ledger_exists(cursor):
                 raise CavernsError("the ledger does not exist")
             entry = _insert(cursor, changeset.name, step, _OUTCOME_FAILED, error=str(error), duration_ms=duration_ms)
@@ -571,7 +642,7 @@ def _write_step(
     """
     step = status.step
     with transaction(connection) as cursor:
-        _lock(cursor)
+        lock(cursor)
         current = _recheck(changeset, status, _read_entries(cursor, changeset.name))
         if current.status is Status.APPLIED:
             return None
@@ -690,7 +761,7 @@ def baseline(
     with read_only(connection) as cursor:
         _require_installed(cursor)
     with transaction(connection) as cursor:
-        _lock(cursor)
+        lock(cursor)
         if _read_entries(cursor, changeset.name):
             raise BaselineRefused(f"changeset {changeset.name!r} already has ledger rows")
         fingerprint = capture(cursor, resolve_schemas(cursor, named, BaselineRefused, default_schemas))

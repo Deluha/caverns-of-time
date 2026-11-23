@@ -3,8 +3,9 @@
 ## Purpose & scope
 
 The importable package. It is generic: nothing here names a consumer or assumes a consumer's schema
-(hard rule 1). It holds the version, the shared exceptions, the console helpers and, so far, three
-components: Nozdormu, the migration ledger, Chromie, the command line, and Infinite, the schema fingerprint.
+(hard rule 1). It holds the version, the shared exceptions, the console helpers and, so far, four
+components: Nozdormu, the migration ledger, Chromie, the command line, Infinite, the schema fingerprint, and
+Epochs, the snapshots of opted-in tables (so far their registry).
 
 ## Files & entry points
 
@@ -12,12 +13,13 @@ components: Nozdormu, the migration ledger, Chromie, the command line, and Infin
 |---|---|
 | `__init__.py` | `__version__`, read from the installed distribution's metadata |
 | `errors.py` | The exception types, all in one module |
-| `_connection.py` | Shared private plumbing, not a component: the `Connection` and `Cursor` protocols, the connection guard, the transaction helpers, the one-statement check runner and the collection-of-names guard |
+| `_connection.py` | Shared private plumbing, not a component: the `Connection` and `Cursor` protocols, the connection guard, the transaction helpers, the advisory lock every Caverns write takes (`ADVISORY_LOCK_KEY`, `lock`), the name validation (`validate_name`), the one-statement check runner and the collection-of-names guard |
 | `_fingerprint.py` | Shared private fingerprint machinery, not a component: `Fingerprint`, the catalog queries, the document and its hash, the default, watched and missing schemas, `Difference`, `restrict` and `compare`, and the storage of fingerprints in `caverns.fingerprint` (`record`, `latest`) |
 | `console.py` | The console helpers: status lines with their icons, tables and JSON; the only module that prints |
 | `chromie.py` | Chromie: the `chromie` command's parsing, connection configuration and dispatch (command flow only) |
 | `nozdormu.py` | Nozdormu: the `Step` and `Changeset` model, the checksum, the loaders, the ledger, `install`, `preflight`, `history`, `apply` and `baseline`; it re-exports `Connection`, whose contract lives in `_connection.py` |
 | `infinite.py` | Infinite: `fingerprint` and the `Fingerprint` it returns, `drift` and the `Drift` and `Difference` it returns |
+| `epochs.py` | Epochs: the registry of tracked tables (`register`, `unregister`, `tracked`, `TrackedTable`) in `caverns.epoch_table` |
 
 ## How it works
 
@@ -32,13 +34,13 @@ sub-directories, is a step in file-name order, labelled with the file name minus
 readable from one file (`Step.from_file`).
 
 **Nozdormu, the ledger.** Every recorded change is a row of `caverns.ledger`. Caverns creates it itself:
-`install(connection)` applies Caverns' own changeset (named `caverns`, two steps: `ledger`, then `fingerprint`,
-the table of recorded fingerprints) and records each step as a ledger row, in the same transaction as its DDL.
+`install(connection)` applies Caverns' own changeset (named `caverns`, three steps: `ledger`, then `fingerprint`,
+the table of recorded fingerprints, then `epochs`, the epoch tables) and records each step as a ledger row, in the same transaction as its DDL.
 Installing again writes nothing and returns `[]`. Until the ledger exists, reading it behaves as an empty
-ledger; that is how the own changeset bootstraps. A database installed before the `fingerprint` step existed
-has only the `ledger` row: call `install()` again after upgrading, which applies `fingerprint` as a pending
+ledger; that is how the own changeset bootstraps. A database installed before the `fingerprint` or the `epochs`
+step existed lacks its row: call `install()` again after upgrading, which applies each missing step as a pending
 step; until then `preflight`, `apply`, `baseline` and `drift` raise `LedgerNotInstalled` (`history` needs only
-the ledger table and keeps working). `install` records no fingerprint.
+the ledger table and keeps working), and so do the epoch functions until `epochs` is applied. `install` records no fingerprint.
 
 **Nozdormu, preflight.** `preflight(connection, changeset)` reports one `StepStatus` (step, status and the
 ledger row that decided it, if any) per step in changeset order and writes nothing: it runs in one
@@ -171,6 +173,33 @@ apply run that writes ledger rows and per baseline:
 
 It is append-only like the ledger: triggers reject UPDATE, DELETE and TRUNCATE. Truncating the ledger is also
 refused, by the foreign key, unless it cascades, and then by the ledger's trigger.
+
+**Epochs, the registry.** Epochs are snapshots of opted-in tables, taken under a name and tagged with the ledger
+version; this release holds the opt-in registry, `caverns.epoch_table`. `register(connection, schema, table, *,
+key=None)` opts a table in, `unregister(connection, schema, table)` opts it out and `tracked(connection)` lists the
+registry. A table is named by its exact PostgreSQL schema and table name: case-sensitive, never quoted or
+folded by Caverns (PostgreSQL does the quoting), so `Odd Table` is that name and `odd table` another. The key is
+the column list that identifies a row: by default the table's primary key in index order, else the columns
+passed, in the order passed. `register` runs in one transaction under the advisory lock and refuses a table
+that does not exist or is not a table (a view is not one), a key column the table lacks (a dropped column
+included) and, without a `key`, a table with no primary key. Registering the same key again writes nothing and
+returns the stored row; another key replaces the stored one (the row's time and user are the change's) and logs a
+warning through the `caverns_of_time.epochs` logger. `unregister` deletes the registry row only: the epochs
+already taken keep the table's rows. The registry is mutable configuration, so it has no trigger.
+
+**The epoch tables.** Created by the own step `epochs`, all in schema `caverns`:
+
+| Table | Holds | Rule |
+|---|---|---|
+| `epoch_table` | the registry: `schema_name`, `table_name`, `key` (`text[]`, not empty), `registered_at`, `registered_by`; primary key (`schema_name`, `table_name`) | mutable, no trigger |
+| `epoch` | the catalog: `epoch` (identity), `name` (unique), `ledger_version` (a foreign key to `caverns.ledger`), `taken_at`, `taken_by`, `caverns_version` | triggers reject UPDATE, DELETE and TRUNCATE |
+| `epoch_source` | one row per table per epoch: `epoch`, `schema_name`, `table_name`, `key` (`text[]`), `columns` (`jsonb`), `row_count`; primary key (`epoch`, `schema_name`, `table_name`) | triggers reject UPDATE, DELETE and TRUNCATE |
+| `epoch_row` | one row per source row: `epoch`, `schema_name`, `table_name`, `key` (`jsonb`), `row` (`jsonb`); primary key (`epoch`, `schema_name`, `table_name`, `key`); a deferred foreign key to `epoch_source` | triggers reject UPDATE and TRUNCATE, and DELETE unless the epoch has a tombstone |
+| `epoch_deletion` | the tombstones: `epoch` (primary key, a foreign key to `epoch`), `deleted_at`, `deleted_by`, `caverns_version` | triggers reject UPDATE, DELETE and TRUNCATE |
+
+Truncating `epoch` or `epoch_source` is also refused by the foreign keys unless it cascades, and then by the
+triggers. Nothing writes the catalog, the sources, the rows or the tombstones yet: the snapshot, the queries and
+the deletion of an epoch arrive in the next commits of the phase.
 
 **Chromie, the command line.** `chromie` is installed with the `cli` extra
 (`pip install 'caverns-of-time[cli]'`), which brings its driver, psycopg 3; the library itself imports
@@ -307,12 +336,23 @@ With nothing found: `✅ No drift — the live schema matches the fingerprint at
   transactions, nothing written. Raises `LedgerNotInstalled` before
   `install()` (the fingerprint table does not exist), `NoFingerprint` when none is recorded, `ChangesetError`
   for a bad `schemas` or one that is not watched, and the errors of `preflight` for a `changeset`.
+- `epochs.register(connection, schema, table, *, key=None) -> TrackedTable`: opts the table in and returns its
+  registry row as stored. *schema* and *table* are non-empty strings, exact names; *key* is None (the primary key) or a
+  non-empty sequence of distinct column names, never a bare string. Raises `ChangesetError` for a bad argument,
+  `LedgerNotInstalled` when the epoch tables do not exist (call `install()`, also after an upgrade) and
+  `EpochRefused` for a table that is missing or not a table, a key column it lacks, or no `key` without a primary key.
+  The arguments are checked before the database is asked.
+- `epochs.unregister(connection, schema, table)`: removes the registry row, past epochs untouched. Raises
+  `ChangesetError`, `LedgerNotInstalled` and `EpochRefused` (the table is not registered).
+- `epochs.tracked(connection) -> list[TrackedTable]`: the registry ordered by schema and table, in one read-only
+  transaction that writes nothing. Raises `LedgerNotInstalled`.
+- `TrackedTable(schema, table, key, registered_at, registered_by)`: a frozen dataclass; `key` is a tuple of column names.
 - The public names are `Connection`, `LedgerEntry`, `Status`, `StepStatus`, `Step`, `Changeset`, `Fingerprint`,
-  `Difference`, `Drift` and the functions above; the exceptions, all in `caverns_of_time.errors`, are
+  `Difference`, `Drift`, `TrackedTable` and the functions above; the exceptions, all in `caverns_of_time.errors`, are
   `CavernsError` (the base), `ChangesetError`, `LedgerNotInstalled`, `PreflightRefused`, `StepFailed`,
-  `BaselineRefused` and `NoFingerprint`.
-- The own changeset is never edited once released: a change to the ledger or the fingerprint table is a new own
-  step (hard rule 6). The DDL of each step is idempotent, and `caverns` is a reserved changeset name.
+  `BaselineRefused`, `NoFingerprint`, `EpochRefused` and `EpochNotFound` (raised from the next commit of the phase on).
+- The own changeset is never edited once released: a change to the ledger, the fingerprint table or the epoch
+  tables is a new own step (hard rule 6). The DDL of each step is idempotent, and `caverns` is a reserved changeset name.
 - No runtime dependency for the library; the CLI's driver (psycopg 3) is the optional `cli` extra. Adding
   a dependency is an ask-first decision.
 

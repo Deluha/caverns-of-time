@@ -1,7 +1,8 @@
 """Shared connection plumbing for the components: the connection contract, its guards and transactions.
 
 Not public: the components import it, a consumer imports `Connection` from `nozdormu`. Input: a DB-API 2.0
-connection (autocommit off). Output: cursors in transactions Caverns commits or rolls back itself.
+connection (autocommit off). Output: cursors in transactions Caverns commits or rolls back itself, the advisory
+lock every Caverns write takes, and the name validation the components share.
 """
 
 from __future__ import annotations
@@ -13,13 +14,16 @@ from typing import Any, Protocol
 from caverns_of_time.errors import CavernsError, ChangesetError
 
 __all__ = [
+    "ADVISORY_LOCK_KEY",
     "Connection",
     "Cursor",
     "check_connection",
+    "lock",
     "names",
     "read_only",
     "run_check",
     "transaction",
+    "validate_name",
 ]
 
 
@@ -57,6 +61,9 @@ _CLEAN_TRANSACTION_SQL = "SELECT pg_current_xact_id_if_assigned() IS NULL"
 # Under REPEATABLE READ or SERIALIZABLE the lock statement would take the snapshot before it waits.
 _READ_COMMITTED_SQL = "SET TRANSACTION ISOLATION LEVEL READ COMMITTED"
 _READ_ONLY_SQL = "SET TRANSACTION READ ONLY"
+# One key for every Caverns write, whatever the component: Caverns' writers take turns.
+ADVISORY_LOCK_KEY = 0x43617665726E73  # "Caverns"
+_LOCK_SQL = "SELECT pg_advisory_xact_lock(%s::bigint)"
 
 
 def check_connection(connection: Connection) -> None:
@@ -114,6 +121,23 @@ def read_only(connection: Connection) -> Iterator[Cursor]:
             yield cur
     finally:
         connection.rollback()
+
+
+def lock(cursor: Cursor) -> None:
+    """Take Caverns' advisory lock until the transaction ends."""
+    cursor.execute(_LOCK_SQL, (ADVISORY_LOCK_KEY,))
+
+
+def validate_name(kind: str, value: object) -> None:
+    """A label or changeset name: a non-empty single line without surrounding whitespace."""
+    if not isinstance(value, str):
+        raise ChangesetError(f"{kind} {value!r} is not a string")
+    if not value:
+        raise ChangesetError(f"{kind} is empty")
+    if value != value.strip():
+        raise ChangesetError(f"{kind} {value!r} has surrounding whitespace")
+    if len(value.splitlines()) != 1:
+        raise ChangesetError(f"{kind} {value!r} spans more than one line")
 
 
 def names(argument: str, values: Collection[str]) -> frozenset[str]:
