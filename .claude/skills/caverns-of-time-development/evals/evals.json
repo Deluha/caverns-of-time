@@ -55,8 +55,8 @@
       "id": "route-sql-identifier",
       "prompt": "Write a helper that copies a table the caller names into the history schema.",
       "expect_reads": ["references/conventions.md"],
-      "expect_stops_to_ask": false,
-      "expect_mentions": ["R3", "identifier quoting"]
+      "expect_stops_to_ask": true,
+      "expect_mentions": ["R3", "quoted by PostgreSQL", "sign-off"]
     },
     {
       "id": "gate-guidance-budget",

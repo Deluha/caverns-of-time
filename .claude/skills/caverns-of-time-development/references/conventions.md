@@ -29,7 +29,9 @@ Enforced: C2 (`print` in package code), review for duplication.
 Caverns receives schema, table and column names from its caller and runs SQL built from them, so every
 statement is composed safely:
 
-- An identifier is composed with the driver's identifier quoting.
+- An identifier is quoted by PostgreSQL, never by Caverns' Python: the name is bound as a parameter and quoted
+  with `format('%I.%I', …)` or `quote_ident(…)`, and the statement PostgreSQL composes is executed as returned.
+  The library imports no driver, so there is no driver-side quoting to use (decision N4 in `ROADMAP.md`).
 - A value is bound as a parameter.
 - A statement is never built with an f-string, `%`, `+` or `.format()`.
 - A consumer's own migration SQL (a step's payload) is executed as given, unmodified, with no

@@ -44,6 +44,9 @@ also reads up to three files itself; wider sweeps go to `reader`.
 raw output (missing output = fail); the orchestrator runs `dev_tools/verify.py` once at the done
 gate — the full suite is not run twice.
 
+**Commit between writers.** Never commit while a writer agent is still running: the pre-commit hook stashes
+unstaged files and can drop the writer's in-flight edits. Commit once it has reported, then brief the next one.
+
 **Built-in agents.** `Explore` is denied in `.claude/settings.json` (it bypasses `reader`). `Plan`
 stays enabled and inherits the session model. `general-purpose` is never used for implementation or
 review — `implementer` and `reviewer` cover those. Forks inherit the whole conversation; use one only

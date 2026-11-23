@@ -35,9 +35,9 @@ This repository holds no credential and its workflows use no secret.
 
 ## SQL safety
 
-Caverns runs SQL built from names its caller supplies. Identifiers are composed with the driver's
-quoting and values are bound as parameters, never formatted into a statement (hard rule 3). A report
-of a statement that breaks this rule is a vulnerability report.
+Caverns runs SQL built from names its caller supplies. Identifiers are quoted by PostgreSQL from
+bound parameters and values are bound as parameters, never formatted into a statement (hard rule 3).
+A report of a statement that breaks this rule is a vulnerability report.
 
 ## Workflow supply chain
 

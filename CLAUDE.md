@@ -40,8 +40,9 @@ Binding short form; the full form of rule N is the anchored section.
 2. **One canonical helper** — shared helpers are defined once and imported, never re-implemented; library code logs
    through `logging`, CLI output goes through the console helpers, never raw `print`
    → `.claude/skills/caverns-of-time-development/references/conventions.md#r2`
-3. **Safe SQL** — an identifier supplied by a consumer is composed with the driver's quoting, a value is bound as a
-   parameter; never string formatting → `.claude/skills/caverns-of-time-development/references/conventions.md#r3`
+3. **Safe SQL** — an identifier supplied by a consumer is quoted by PostgreSQL from a bound parameter, a value is
+   bound as a parameter; never string formatting
+   → `.claude/skills/caverns-of-time-development/references/conventions.md#r3`
 4. **No files the user didn't ask for** — `tests/` is the only test location, no new markdown beyond the permanent
    docs → `.claude/skills/caverns-of-time-development/references/conventions.md#r4`
 5. **The ledger is append-only** — no code path updates or deletes a ledger row
