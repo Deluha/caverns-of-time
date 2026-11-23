@@ -13,7 +13,7 @@ Run-level snapshots of opted-in tables:
   ledger version, in one consistent REPEATABLE READ snapshot taken under Caverns' advisory lock; a key with
   duplicates or nulls refuses the whole snapshot. Rows are stored as jsonb with the epoch's own column list,
   their values printed under pinned settings (`TimeZone` UTC, `IntervalStyle` `postgres`, `extra_float_digits` 1,
-  `bytea_output` hex), so an epoch does not depend on the session that took it.
+  `bytea_output` hex, `DateStyle` `ISO, MDY`, `lc_monetary` `C`), so an epoch does not depend on the session that took it.
 - `epochs.catalog`, `epochs.as_of` (a table as an epoch recorded it) and `epochs.diff` (columns added,
   removed or retyped; rows added, removed or changed by the key, compared on the columns both epochs have).
 - Retention: nothing is pruned automatically; `epochs.delete` writes a tombstone and removes an epoch's rows,

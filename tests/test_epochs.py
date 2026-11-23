@@ -795,13 +795,14 @@ def test_snapshot_copies_the_rows_of_a_partitioned_table(ledger_conn: Any) -> No
 
 
 VALUES = (
-    f"CREATE TABLE {SCHEMA}.vals (ts timestamptz PRIMARY KEY, iv interval, f float8, bt bytea)",
+    f"CREATE TABLE {SCHEMA}.vals (ts timestamptz PRIMARY KEY, iv interval, f float8, bt bytea, tr tstzrange, m money)",
     f"INSERT INTO {SCHEMA}.vals VALUES ('2026-11-22 17:06:45+01', '1 day 02:03:04', 0.1::float8 + 0.2::float8,"
-    " '\\xdeadbeef')",
+    " '\\xdeadbeef', tstzrange('2026-11-22 17:06:45+01', '2026-11-23 17:06:45+01'), 1234.5)",
 )
 SETTINGS = (
     "SELECT current_setting('TimeZone'), current_setting('IntervalStyle'),"
-    " current_setting('extra_float_digits'), current_setting('bytea_output')"
+    " current_setting('extra_float_digits'), current_setting('bytea_output'), current_setting('DateStyle'),"
+    " current_setting('lc_monetary')"
 )
 
 
@@ -814,23 +815,32 @@ def test_snapshot_stores_the_same_values_whatever_the_sessions_output_settings(l
         "SET IntervalStyle = 'iso_8601'",
         "SET extra_float_digits = 0",
         "SET bytea_output = 'escape'",
+        "SET DateStyle = 'SQL, DMY'",
+        "SET lc_monetary = 'C'",
     )
     a = snapshot(ledger_conn, "a")
-    assert _query(ledger_conn, SETTINGS) == [("UTC", "iso_8601", "0", "escape")]
+    assert _query(ledger_conn, SETTINGS) == [("UTC", "iso_8601", "0", "escape", "SQL, DMY", "C")]
     _execute(
         ledger_conn,
         "SET TimeZone = 'Europe/Paris'",
         "SET IntervalStyle = 'sql_standard'",
         "SET extra_float_digits = 3",
         "SET bytea_output = 'hex'",
+        "SET DateStyle = 'German'",
+        "SET lc_monetary = 'en_US.utf8'",
     )
     b = snapshot(ledger_conn, "b")
-    assert _query(ledger_conn, SETTINGS) == [("Europe/Paris", "sql_standard", "3", "hex")]  # the caller's, untouched
+    assert _query(ledger_conn, SETTINGS) == [
+        ("Europe/Paris", "sql_standard", "3", "hex", "German, DMY", "en_US.utf8")
+    ]  # the caller's, untouched
+    _execute(ledger_conn, "SET DateStyle = 'ISO, MDY'")  # a driver reads a timestamptz only in an ISO style
     assert diff(ledger_conn, "a", "b").tables == ()
     assert _stored(ledger_conn, a.epoch, "vals") == _stored(ledger_conn, b.epoch, "vals")
     (row,) = as_of(ledger_conn, "b", SCHEMA, "vals").rows
     assert row["ts"] == "2026-11-22T16:06:45+00:00"
     assert row["bt"] == "\\xdeadbeef"
+    assert row["tr"] == '["2026-11-22 16:06:45+00","2026-11-23 16:06:45+00")'
+    assert row["m"] == "$1,234.50"
     assert row["f"] == 0.1 + 0.2
     assert as_of(ledger_conn, "a", SCHEMA, "vals").rows == (row,)
 
@@ -1074,9 +1084,9 @@ def test_as_of_refuses_a_deleted_epoch(ledger_conn: Any) -> None:
     _execute(ledger_conn, INSERT_TOMBSTONE.replace(EPOCH_ID, str(taken.epoch)))
     (deleted_at,) = _query(
         ledger_conn,
-        "SELECT to_char(deleted_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS') FROM caverns.epoch_deletion",
+        "SELECT to_char(deleted_at AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS') FROM caverns.epoch_deletion",
     )[0]
-    with pytest.raises(EpochRefused, match=rf"epoch 'first' was deleted at {deleted_at}\+00:00$"):
+    with pytest.raises(EpochRefused, match=rf"epoch 'first' was deleted at {deleted_at} UTC$"):
         as_of(ledger_conn, "first", SCHEMA, "one")
     _assert_idle(ledger_conn)
 
@@ -1407,7 +1417,7 @@ def test_diff_refuses_a_deleted_epoch(ledger_conn: Any) -> None:
     (epoch_a,) = _query(ledger_conn, "SELECT epoch FROM caverns.epoch WHERE name = 'a'")[0]
     _execute(ledger_conn, INSERT_TOMBSTONE.replace(EPOCH_ID, str(epoch_a)))
     for old, new in (("a", "b"), ("b", "a")):
-        with pytest.raises(EpochRefused, match=r"epoch 'a' was deleted at \d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\+00:00$"):
+        with pytest.raises(EpochRefused, match=r"epoch 'a' was deleted at \d{4}-\d\d-\d\d \d\d:\d\d:\d\d UTC$"):
             diff(ledger_conn, old, new)
         _assert_idle(ledger_conn)
 

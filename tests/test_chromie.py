@@ -662,7 +662,7 @@ def test_as_of_of_a_deleted_epoch_is_a_usage_error(
     ledger_conn.commit()
     code, out, err = _run(capsys, "as-of", "run-42", "nozdormu_test.users", "--dsn", db_dsn)
     assert (code, out) == (chromie.EXIT_USAGE, "")
-    assert re.fullmatch(r"❌ epoch 'run-42' was deleted at \d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\+00:00\n", err)
+    assert re.fullmatch(r"❌ epoch 'run-42' was deleted at \d{4}-\d\d-\d\d \d\d:\d\d:\d\d UTC\n", err)
 
 
 def test_as_of_without_an_installed_ledger_is_a_usage_error(
@@ -1118,7 +1118,7 @@ def test_delete_epoch_interactive_no_or_end_of_input_deletes_nothing(
     ("names", "message"),
     [
         (("run-1", "nope"), "no epoch is named 'nope'"),
-        (("run-1", "run-2"), r"epoch 'run-2' was deleted at \d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\+00:00"),
+        (("run-1", "run-2"), r"epoch 'run-2' was deleted at \d{4}-\d\d-\d\d \d\d:\d\d:\d\d UTC"),
     ],
 )
 def test_delete_epoch_of_an_unknown_or_deleted_epoch_is_a_usage_error_and_deletes_nothing(
