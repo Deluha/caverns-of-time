@@ -23,7 +23,7 @@ step. Grep the `## ` heading you need and read that section, not the whole file.
 | Checker mechanics: what each guard parses, scopes, exemptions (read before editing a checker or a guarded doc line) | `references/checkers.md` |
 | Grep-before-coding commands, Implementation Decision format, orchestration (roles and agents, small-edit threshold, brief, review loop), lessons loop (`#lessons`) | `references/recipes.md` |
 | Add a component or a module to the package | `references/workflows/adding-a-component.md` |
-| Change one of Caverns' own database objects (ledger, epoch catalog, history tables) | `references/workflows/changing-own-schema.md` |
+| Change one of Caverns' own database objects (ledger, fingerprint table, epoch tables) | `references/workflows/changing-own-schema.md` |
 | Change guidance: `CLAUDE.md`, the skill, an agent, a rule, a hook, `.claude/settings.json`, CI or the pre-commit config | `references/workflows/changing-guidance.md` |
 | Run a roadmap phase (sign-off, commits, review, delivery); planned scope and status | `ROADMAP.md` |
 | Test suite inventory, the database fixtures, the local test instance | `tests/README.md` |

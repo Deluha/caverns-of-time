@@ -62,9 +62,9 @@ Binding short form; the full form of rule N is the anchored section.
 ⚑ Never change without explicit user confirmation (workflow files add task-specific ⚑ gates) — a wrong guess
 invalidates a consumer's recorded history or breaks its integration:
 
-- The ledger schema and the checksum definition; the on-disk layout of epochs and history tables.
+- The ledger schema and the checksum definition; the on-disk layout of the epoch tables.
 - Public API: the `Step` signature, apply and preflight signatures, CLI commands, flags, output layout and exit codes.
-- Anything destructive Caverns runs on a consumer database (deleting an epoch, dropping a history table).
+- Anything destructive Caverns runs on a consumer database (deleting an epoch).
 - Murozond's destructive-statement list; any guard, check or threshold relaxation.
 - Adding a runtime dependency; the supported PostgreSQL versions; the licence; the scope rules of `ROADMAP.md`.
 - Connecting any test, workflow or session to a database other than the local test instance.
