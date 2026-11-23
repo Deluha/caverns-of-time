@@ -47,7 +47,7 @@ changed outside the timeline. Project Acme is the first consumer, not the design
 |---|---|---|
 | 0 — Development process | Merged | [#1](https://github.com/Deluha/caverns-of-time/pull/1) |
 | 1 — Nozdormu | Merged | [#2](https://github.com/Deluha/caverns-of-time/pull/2) |
-| 2 — Chromie and Infinite | Not started | |
+| 2 — Chromie and Infinite | In review | [#3](https://github.com/Deluha/caverns-of-time/pull/3) |
 | 3 — Epochs | Not started | |
 | 4 — Murozond and Timewalking | Not started | |
 | 5 — Acme adoption and release | Not started | |
