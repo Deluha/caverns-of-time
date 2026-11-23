@@ -14,12 +14,17 @@ import pytest
 from caverns_of_time import __version__, _connection, epochs, nozdormu
 from caverns_of_time.epochs import (
     Column,
+    ColumnChange,
     Epoch,
+    EpochDiff,
     EpochTable,
+    RowChange,
     TableAt,
+    TableDiff,
     TrackedTable,
     as_of,
     catalog,
+    diff,
     register,
     snapshot,
     tracked,
@@ -433,6 +438,7 @@ CALLS: dict[str, Callable[[Any], object]] = {
     "snapshot": lambda conn: snapshot(conn, "e"),
     "catalog": catalog,
     "as_of": lambda conn: as_of(conn, "e", SCHEMA, "one"),
+    "diff": lambda conn: diff(conn, "e", "f"),
 }
 
 
@@ -986,4 +992,340 @@ def test_as_of_refuses_an_invalid_limit(ledger_conn: Any, limit: Any) -> None:
     _taken_one(ledger_conn)
     with pytest.raises(ChangesetError, match="limit must be a positive integer up to 9223372036854775807"):
         as_of(ledger_conn, "first", SCHEMA, "one", limit=limit)
+    _assert_idle(ledger_conn)
+
+
+# --- diff -----------------------------------------------------------------------------------
+
+WIDE = f"CREATE TABLE {SCHEMA}.wide (id int PRIMARY KEY, a text, b text, c text)"
+TYPED = f"CREATE TABLE {SCHEMA}.typed (id int PRIMARY KEY, v int, w text)"
+TWO_ROWS = f"INSERT INTO {SCHEMA}.two VALUES (1, 'q', 1), (2, 'p', 2), (1, 'p', 3), (10, 'a', 4), (3, 'a', 5)"
+
+
+def _two_epochs(conn: Any, setup: list[str], tables: list[str], *between: str) -> None:
+    """Caverns installed, *setup* run, *tables* registered and snapshotted as "a"; then *between* and epoch "b"."""
+    _installed_with_tables(conn, *setup)
+    for table in tables:
+        register(conn, SCHEMA, table)
+    snapshot(conn, "a")
+    _execute(conn, *between)
+    snapshot(conn, "b")
+
+
+def _one_changed(conn: Any) -> None:
+    _two_epochs(
+        conn,
+        [ONE, f"INSERT INTO {SCHEMA}.one VALUES (10, 'ten'), (2, 'two'), (1, NULL), (5, 'five')"],
+        ["one"],
+        f"DELETE FROM {SCHEMA}.one WHERE id = 5",
+        f"INSERT INTO {SCHEMA}.one VALUES (11, 'eleven'), (3, 'three')",
+        f"UPDATE {SCHEMA}.one SET name = 'TEN' WHERE id = 10",
+        f"UPDATE {SCHEMA}.one SET name = 'uno' WHERE id = 1",
+        f"UPDATE {SCHEMA}.one SET name = 'two' WHERE id = 2",
+    )
+
+
+def test_diff_of_identical_epochs_has_no_tables(ledger_conn: Any) -> None:
+    _two_epochs(ledger_conn, [ONE, ONE_ROWS], ["one"])
+    result = diff(ledger_conn, "a", "b")
+    _assert_idle(ledger_conn)
+    assert isinstance(result, EpochDiff)
+    assert (result.old.name, result.new.name) == ("a", "b")
+    assert result.old.ledger_version <= result.new.ledger_version and result.tables == ()
+
+
+def test_diff_reports_rows_added_removed_and_changed_ordered_by_key(ledger_conn: Any) -> None:
+    _one_changed(ledger_conn)
+    result = diff(ledger_conn, "a", "b")
+    _assert_idle(ledger_conn)
+    assert result.tables == (
+        TableDiff(
+            SCHEMA,
+            "one",
+            "changed",
+            ("id",),
+            (),
+            ({"id": 3}, {"id": 11}),
+            ({"id": 5},),
+            (
+                RowChange({"id": 1}, {"name": None}, {"name": "uno"}),
+                RowChange({"id": 10}, {"name": "ten"}, {"name": "TEN"}),
+            ),
+        ),
+    )
+    assert isinstance(result.tables[0].added, tuple) and isinstance(result.tables[0].changed, tuple)
+
+
+def test_diff_the_other_way_swaps_added_and_removed_and_the_values(ledger_conn: Any) -> None:
+    _one_changed(ledger_conn)
+    (table,) = diff(ledger_conn, "b", "a").tables
+    assert table.added == ({"id": 5},) and table.removed == ({"id": 3}, {"id": 11})
+    assert table.changed[1] == RowChange({"id": 10}, {"name": "TEN"}, {"name": "ten"})
+
+
+def test_diff_orders_a_composite_key_by_its_declared_order(ledger_conn: Any) -> None:
+    _two_epochs(
+        ledger_conn,
+        [TWO, TWO_ROWS],
+        ["two"],
+        f"UPDATE {SCHEMA}.two SET c = c + 1",
+        f"DELETE FROM {SCHEMA}.two WHERE a = 2",
+    )
+    (table,) = diff(ledger_conn, "a", "b").tables
+    assert table.key == ("b", "a")  # the primary key (b, a)
+    assert table.removed == ({"b": "p", "a": 2},) and list(table.removed[0]) == ["b", "a"]
+    assert [list(row.key.values()) for row in table.changed] == [["a", 3], ["a", 10], ["p", 1], ["q", 1]]
+    assert table.changed[0] == RowChange({"b": "a", "a": 3}, {"c": 5.0}, {"c": 6.0})
+
+
+def test_diff_lists_only_the_columns_whose_values_differ_in_column_order(ledger_conn: Any) -> None:
+    _two_epochs(
+        ledger_conn,
+        [WIDE, f"INSERT INTO {SCHEMA}.wide VALUES (1, 'x', 'y', 'z'), (2, 'x', 'y', 'z')"],
+        ["wide"],
+        f"UPDATE {SCHEMA}.wide SET c = 'Z', a = 'X' WHERE id = 1",
+    )
+    (table,) = diff(ledger_conn, "a", "b").tables
+    (row,) = table.changed
+    assert row == RowChange({"id": 1}, {"a": "x", "c": "z"}, {"a": "X", "c": "Z"})
+    assert list(row.old) == ["a", "c"] and list(row.new) == ["a", "c"]
+
+
+def test_diff_reports_a_column_added_without_calling_its_rows_changed(ledger_conn: Any) -> None:
+    _two_epochs(
+        ledger_conn,
+        [ONE, ONE_ROWS],
+        ["one"],
+        f"ALTER TABLE {SCHEMA}.one ADD COLUMN extra int DEFAULT 7",
+        f"UPDATE {SCHEMA}.one SET name = 'zwei' WHERE id = 2",
+    )
+    (table,) = diff(ledger_conn, "a", "b").tables
+    assert table.columns == (ColumnChange("extra", "added", None, "integer"),)
+    assert table.changed == (RowChange({"id": 2}, {"name": "two"}, {"name": "zwei"}),)
+    assert table.added == () and table.removed == ()
+
+
+def test_diff_reports_a_column_added_alone(ledger_conn: Any) -> None:
+    _two_epochs(ledger_conn, [ONE, ONE_ROWS], ["one"], f"ALTER TABLE {SCHEMA}.one ADD COLUMN extra int DEFAULT 7")
+    (table,) = diff(ledger_conn, "a", "b").tables
+    assert (table.change, table.columns, table.changed) == (
+        "changed",
+        (ColumnChange("extra", "added", None, "integer"),),
+        (),
+    )
+
+
+def test_diff_reports_a_column_removed_without_calling_its_rows_changed(ledger_conn: Any) -> None:
+    _two_epochs(ledger_conn, [ONE, ONE_ROWS], ["one"], f"ALTER TABLE {SCHEMA}.one DROP COLUMN name")
+    (table,) = diff(ledger_conn, "a", "b").tables
+    assert table.columns == (ColumnChange("name", "removed", "text", None),)
+    assert (table.added, table.removed, table.changed) == ((), (), ())
+
+
+def test_diff_lists_columns_removed_or_changed_in_old_order_then_added_in_new_order(ledger_conn: Any) -> None:
+    _two_epochs(
+        ledger_conn,
+        [WIDE, f"INSERT INTO {SCHEMA}.wide VALUES (1, 'x', '2', 'z')"],
+        ["wide"],
+        f"ALTER TABLE {SCHEMA}.wide DROP COLUMN c",
+        f"ALTER TABLE {SCHEMA}.wide ALTER COLUMN b TYPE int USING b::int",
+        f"ALTER TABLE {SCHEMA}.wide DROP COLUMN a",
+        f"ALTER TABLE {SCHEMA}.wide ADD COLUMN z int, ADD COLUMN y text",
+    )
+    (table,) = diff(ledger_conn, "a", "b").tables
+    assert table.columns == (
+        ColumnChange("a", "removed", "text", None),
+        ColumnChange("b", "changed", "text", "integer"),
+        ColumnChange("c", "removed", "text", None),
+        ColumnChange("z", "added", None, "integer"),
+        ColumnChange("y", "added", None, "text"),
+    )
+    assert table.changed == (RowChange({"id": 1}, {"b": "2"}, {"b": 2}),)
+
+
+def test_diff_compares_values_as_json_when_a_type_changes(ledger_conn: Any) -> None:
+    _two_epochs(
+        ledger_conn,
+        [TYPED, f"INSERT INTO {SCHEMA}.typed VALUES (1, 5, '7'), (2, 6, '8')"],
+        ["typed"],
+        f"ALTER TABLE {SCHEMA}.typed ALTER COLUMN v TYPE bigint",
+        f"ALTER TABLE {SCHEMA}.typed ALTER COLUMN w TYPE int USING w::int",
+    )
+    (table,) = diff(ledger_conn, "a", "b").tables
+    assert table.columns == (
+        ColumnChange("v", "changed", "integer", "bigint"),
+        ColumnChange("w", "changed", "text", "integer"),
+    )
+    assert table.changed == (
+        RowChange({"id": 1}, {"w": "7"}, {"w": 7}),
+        RowChange({"id": 2}, {"w": "8"}, {"w": 8}),
+    )  # the equal v values (the same JSON) are not changes
+
+
+def test_diff_reports_a_table_only_in_the_new_epoch_without_its_rows(ledger_conn: Any) -> None:
+    _installed_with_tables(ledger_conn, ONE, ONE_ROWS, TWO, TWO_ROWS)
+    register(ledger_conn, SCHEMA, "one")
+    snapshot(ledger_conn, "a")
+    register(ledger_conn, SCHEMA, "two")
+    snapshot(ledger_conn, "b")
+    expected = TableDiff(SCHEMA, "two", "added", ("b", "a"), (), (), (), ())
+    assert diff(ledger_conn, "a", "b").tables == (expected,)
+    removed = TableDiff(SCHEMA, "two", "removed", ("b", "a"), (), (), (), ())
+    assert diff(ledger_conn, "b", "a").tables == (removed,)
+
+
+def test_diff_orders_the_tables_by_schema_and_table(ledger_conn: Any) -> None:
+    _installed_with_tables(ledger_conn, TYPED, ONE, TWO, "CREATE SCHEMA aa", "CREATE TABLE aa.z (id int PRIMARY KEY)")
+    try:  # the fixture drops the `caverns` and test schemas only
+        for schema, table in ((SCHEMA, "typed"), (SCHEMA, "one"), ("aa", "z")):
+            register(ledger_conn, schema, table)
+        snapshot(ledger_conn, "a")
+        _execute(
+            ledger_conn,
+            f"INSERT INTO {SCHEMA}.typed (id) VALUES (1)",
+            f"INSERT INTO {SCHEMA}.one (id) VALUES (1)",
+            "INSERT INTO aa.z VALUES (1)",
+        )
+        register(ledger_conn, SCHEMA, "two")
+        snapshot(ledger_conn, "b")
+        result = diff(ledger_conn, "a", "b")
+        assert [(t.schema, t.table, t.change) for t in result.tables] == [
+            ("aa", "z", "changed"),
+            (SCHEMA, "one", "changed"),
+            (SCHEMA, "two", "added"),
+            (SCHEMA, "typed", "changed"),
+        ]
+    finally:
+        ledger_conn.rollback()
+        _execute(ledger_conn, "DROP SCHEMA aa CASCADE")
+
+
+def _key_changed(conn: Any) -> None:
+    """Tables one (key id, then name) and two in epochs a and b; the key of `one` differs between them."""
+    _installed_with_tables(conn, ONE, "INSERT INTO nozdormu_test.one VALUES (1, 'x')", TWO, TWO_ROWS)
+    register(conn, SCHEMA, "one")
+    register(conn, SCHEMA, "two")
+    snapshot(conn, "a")
+    register(conn, SCHEMA, "one", key=["name"])
+    _execute(conn, f"INSERT INTO {SCHEMA}.two VALUES (4, 'z', 9)")
+    snapshot(conn, "b")
+
+
+def test_diff_refuses_a_table_whose_key_differs_and_names_it(ledger_conn: Any) -> None:
+    _key_changed(ledger_conn)
+    message = rf"the key of {SCHEMA}\.one differs between epochs 'a' \(id\) and 'b' \(name\)"
+    with pytest.raises(EpochRefused, match=rf"^{message}: leave the table out with tables=$"):
+        diff(ledger_conn, "a", "b")
+    _assert_idle(ledger_conn)
+    with pytest.raises(EpochRefused, match="differs"):
+        diff(ledger_conn, "a", "b", tables=[(SCHEMA, "one"), (SCHEMA, "two")])
+
+
+def test_diff_with_tables_leaves_out_the_table_whose_key_differs(ledger_conn: Any) -> None:
+    _key_changed(ledger_conn)
+    (table,) = diff(ledger_conn, "a", "b", tables=[(SCHEMA, "two")]).tables
+    assert (table.table, table.added) == ("two", ({"b": "z", "a": 4},))
+
+
+def test_diff_tables_narrows_collapses_duplicates_and_takes_any_collection(ledger_conn: Any) -> None:
+    _installed_with_tables(ledger_conn, ONE, TWO, TWO_ROWS)
+    register(ledger_conn, SCHEMA, "one")
+    register(ledger_conn, SCHEMA, "two")
+    snapshot(ledger_conn, "a")
+    _execute(ledger_conn, f"INSERT INTO {SCHEMA}.one VALUES (1, 'x')", f"UPDATE {SCHEMA}.two SET c = 0 WHERE a = 2")
+    snapshot(ledger_conn, "b")
+    assert [t.table for t in diff(ledger_conn, "a", "b").tables] == ["one", "two"]
+    for tables in ([(SCHEMA, "one")], ((SCHEMA, "one"), (SCHEMA, "one")), {(SCHEMA, "one")}):
+        assert [t.table for t in diff(ledger_conn, "a", "b", tables=tables).tables] == ["one"]
+    assert [t.table for t in diff(ledger_conn, "a", "b", tables=[(SCHEMA, "two"), (SCHEMA, "one")]).tables] == [
+        "one",
+        "two",
+    ]
+    assert diff(ledger_conn, "a", "a", tables=[(SCHEMA, "one")]).tables == ()
+
+
+def test_diff_of_a_table_that_is_unchanged_is_left_out_even_when_named(ledger_conn: Any) -> None:
+    _two_epochs(ledger_conn, [ONE, ONE_ROWS], ["one"])
+    assert diff(ledger_conn, "a", "b", tables=[(SCHEMA, "one")]).tables == ()
+
+
+def test_diff_refuses_a_named_table_that_neither_epoch_has(ledger_conn: Any) -> None:
+    _two_epochs(ledger_conn, [ONE, ONE_ROWS], ["one"])
+    for schema, table in ((SCHEMA, "missing"), ("other", "one"), (SCHEMA, "ONE")):
+        with pytest.raises(EpochNotFound, match=rf"^neither epoch 'a' nor 'b' has table {schema}\.{table}$"):
+            diff(ledger_conn, "a", "b", tables=[(SCHEMA, "one"), (schema, table)])
+        _assert_idle(ledger_conn)
+
+
+def test_diff_with_an_epoch_against_itself_has_no_differences(ledger_conn: Any) -> None:
+    _one_changed(ledger_conn)
+    result = diff(ledger_conn, "b", "b")
+    assert result.tables == () and result.old == result.new
+
+
+def test_diff_refuses_an_unknown_epoch(ledger_conn: Any) -> None:
+    _two_epochs(ledger_conn, [ONE, ONE_ROWS], ["one"])
+    for old, new, name in (("nope", "b", "nope"), ("a", "nope", "nope")):
+        with pytest.raises(EpochNotFound, match=f"no epoch is named '{name}'"):
+            diff(ledger_conn, old, new)
+        _assert_idle(ledger_conn)
+
+
+def test_diff_refuses_a_deleted_epoch(ledger_conn: Any) -> None:
+    _two_epochs(ledger_conn, [ONE, ONE_ROWS], ["one"])
+    (epoch_a,) = _query(ledger_conn, "SELECT epoch FROM caverns.epoch WHERE name = 'a'")[0]
+    _execute(ledger_conn, INSERT_TOMBSTONE.replace(EPOCH_ID, str(epoch_a)))
+    for old, new in (("a", "b"), ("b", "a")):
+        with pytest.raises(EpochRefused, match=r"epoch 'a' was deleted at \d{4}-\d\d-\d\d \d\d:\d\d:\d\d UTC$"):
+            diff(ledger_conn, old, new)
+        _assert_idle(ledger_conn)
+
+
+@pytest.mark.parametrize(
+    ("arguments", "message"),
+    [
+        (("", "b"), "epoch name is empty"),
+        (("a", " b"), "surrounding whitespace"),
+        ((None, "b"), "epoch name None is not a string"),
+        (("a", 3), "epoch name 3 is not a string"),
+    ],
+)
+def test_diff_refuses_bad_epoch_names_before_asking_the_database(
+    ledger_conn: Any, arguments: tuple[Any, ...], message: str
+) -> None:
+    with pytest.raises(ChangesetError, match=message):
+        diff(ledger_conn, *arguments)
+    _assert_idle(ledger_conn)
+
+
+@pytest.mark.parametrize(
+    ("tables", "message"),
+    [
+        ("nozdormu_test.one", "collection of .schema, table. pairs, not 'nozdormu_test.one'"),
+        (5, "collection of .schema, table. pairs, not 5"),
+        ([], "tables is empty"),
+        ((), "tables is empty"),
+        ([None], r"table None is not a \(schema, table\) pair"),
+        (["ab"], r"table 'ab' is not a \(schema, table\) pair"),
+        ([("s",)], r"is not a \(schema, table\) pair"),
+        ([("s", "t", "u")], r"is not a \(schema, table\) pair"),
+        ([["s", "t"]], r"is not a \(schema, table\) pair"),
+        ([(None, "t")], "schema None is not a string"),
+        ([("s", 3)], "table 3 is not a string"),
+        ([("s", "")], "table is empty"),
+        ([("", "t")], "schema is empty"),
+    ],
+)
+def test_diff_refuses_bad_tables_before_asking_the_database(ledger_conn: Any, tables: Any, message: str) -> None:
+    with pytest.raises(ChangesetError, match=message):
+        diff(ledger_conn, "a", "b", tables=tables)
+    _assert_idle(ledger_conn)
+
+
+def test_diff_writes_nothing_and_ends_its_transaction(ledger_conn: Any) -> None:
+    _one_changed(ledger_conn)
+    before = [_query(ledger_conn, f"SELECT count(*) FROM caverns.{t}") for t in EPOCH_TABLES]
+    diff(ledger_conn, "a", "b")
+    assert [_query(ledger_conn, f"SELECT count(*) FROM caverns.{t}") for t in EPOCH_TABLES] == before
+    assert _query(ledger_conn, ADVISORY_LOCKS) == [(0,)]
     _assert_idle(ledger_conn)

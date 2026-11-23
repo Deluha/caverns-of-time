@@ -105,6 +105,11 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"the most rows to show (0: all; default: {DEFAULT_LOG_LIMIT})",
     )
     as_of.set_defaults(handler=_as_of)
+    diff = commands.add_parser("diff", parents=[_common], help="compare two epochs row by row")
+    diff.add_argument("old", metavar="OLD", help="the earlier epoch name")
+    diff.add_argument("new", metavar="NEW", help="the later epoch name")
+    diff.add_argument("--table", action="append", type=_table_name, help="compare only this table (repeatable)")
+    diff.set_defaults(handler=_diff)
     return parser
 
 
@@ -256,6 +261,55 @@ def _as_of(args: argparse.Namespace, connection: Connection) -> int:
     if len(at.rows) < row_count:
         console.info(f"Showing {len(at.rows)} of {row_count} rows — --limit 0 shows all.")
     return EXIT_OK
+
+
+def _key_text(key: Mapping[str, object]) -> str:
+    """A row's key as `id=42, code="x"`: each value as compact JSON."""
+    return ", ".join(f"{name}={json.dumps(value, ensure_ascii=False)}" for name, value in key.items())
+
+
+def _diff_lines(result: epochs.EpochDiff) -> list[tuple[str, str, str]]:
+    """The (symbol, kind, name) line of each difference, table by table: the table, its columns, then its rows."""
+    lines: list[tuple[str, str, str]] = []
+    for t in result.tables:
+        name = f"{t.schema}.{t.table}"
+        if t.change != "changed":
+            lines.append((_CHANGE_SYMBOLS[t.change], "table", name))
+        for column in t.columns:
+            detail = f": {column.old_type} → {column.new_type}" if column.change == "changed" else ""
+            lines.append((_CHANGE_SYMBOLS[column.change], "column", f"{name}.{column.name}{detail}"))
+        lines += [("+", "row", f"{name} ({_key_text(key)})") for key in t.added]
+        lines += [("-", "row", f"{name} ({_key_text(key)})") for key in t.removed]
+        lines += [("~", "row", f"{name} ({_key_text(row.key)}): {', '.join(row.old)}") for row in t.changed]
+    return lines
+
+
+def _diff(args: argparse.Namespace, connection: Connection) -> int:
+    """`chromie diff`: two epochs row by row; 1 when anything differs."""
+    result = epochs.diff(connection, args.old, args.new, tables=args.table)
+    code = EXIT_FINDING if result.tables else EXIT_OK
+    if args.format == "json":
+        console.emit_json(
+            {
+                "old": {"epoch": result.old.name, "ledger_version": result.old.ledger_version},
+                "new": {"epoch": result.new.name, "ledger_version": result.new.ledger_version},
+                "tables": [asdict(t) for t in result.tables],
+            }
+        )
+        return code
+    old, new = result.old, result.new
+    console.info(
+        f"Comparing epoch {old.name} (ledger version {old.ledger_version})"
+        f" with {new.name} (ledger version {new.ledger_version})."
+    )
+    lines = _diff_lines(result)
+    console.table(None, lines)
+    if result.tables:
+        count, tables = len(lines), len(result.tables)
+        console.error(f"{count} difference{'s' if count != 1 else ''} in {tables} table{'s' if tables != 1 else ''}.")
+    else:
+        console.success(f"No differences between epochs {old.name} and {new.name}.")
+    return code
 
 
 def main(argv: Sequence[str] | None = None) -> int:
