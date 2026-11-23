@@ -4,8 +4,9 @@ A recorded timeline for PostgreSQL. Caverns of Time is a generic Python library 
 database a past you can query: which schema changes were applied and when, what opted-in tables looked
 like at an earlier run, and whether anything changed outside the timeline.
 
-**Status: in development, nothing released.** Phase 0 (the development process) is in place; the first
-component arrives in Phase 1. `ROADMAP.md` holds the plan and its status.
+**Status: in development, nothing released.** Phase 0 (the development process), Phase 1 (Nozdormu) and
+Phase 2 (Chromie and Infinite) are built; the CLI is installed with the `cli` extra
+(`pip install 'caverns-of-time[cli]'`). `ROADMAP.md` holds the plan and its status.
 
 ## Components
 

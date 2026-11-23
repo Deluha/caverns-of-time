@@ -46,8 +46,8 @@ changed outside the timeline. Project Blackwing is the first consumer, not the d
 | Phase | Status | Pull request |
 |---|---|---|
 | 0 — Development process | Merged | [#1](https://github.com/Deluha/caverns-of-time/pull/1) |
-| 1 — Nozdormu | In review | [#2](https://github.com/Deluha/caverns-of-time/pull/2) |
-| 2 — Chromie and Infinite | Not started | |
+| 1 — Nozdormu | Merged | [#2](https://github.com/Deluha/caverns-of-time/pull/2) |
+| 2 — Chromie and Infinite | In review | [#3](https://github.com/Deluha/caverns-of-time/pull/3) |
 | 3 — Epochs | Not started | |
 | 4 — Murozond and Timewalking | Not started | |
 | 5 — Blackwing adoption and release | Not started | |
@@ -144,6 +144,22 @@ Sign-off decisions (owner, 2026-11-22: N1–N8 confirmed as recommended; N9 conf
 
 Sign-off: command names and output layout; which object kinds the fingerprint covers; which schemas are
 watched by default; exit codes for use in CI.
+
+Sign-off decisions (owner, 2026-11-22: C1–C9 confirmed as recommended; C10 confirmed during implementation; C11 confirmed after the phase review):
+
+| # | Item | Decision |
+|---|---|---|
+| C1 | Driver and connection | Optional extra `caverns-of-time[cli]` = `psycopg[binary]>=3.2,<4`, imported by `chromie` only when it runs (without it: exit 2 naming the extra); the library keeps no runtime dependency (N4). Connection string: `--dsn`, else `CAVERNS_DSN`, else exit 2; no fallback to libpq defaults. |
+| C2 | Commands | Entry point `chromie = "caverns_of_time.chromie:main"`; all read-only; every command takes `--dsn` and `--format text\|json` (default `text`). `chromie log [--changeset NAME] [--limit N]`: ledger rows newest first, `--limit` default 20, 0 for all. `chromie status DIRECTORY [--changeset NAME]`: preflight of a directory changeset, name defaulting to the directory's name. `chromie drift [DIRECTORY] [--changeset NAME] [--schema NAME]`: drift report. `--changeset` and `--limit` join the flag table. |
+| C3 | Exit codes | 0 success (`log` rows or an empty ledger; `status` all applied; `drift` none). 1 a finding (`status`: a step pending, conflict or unknown; `drift`: any difference or disagreement). 2 usage or environment (bad arguments, connection, ledger not installed, bad changeset, no fingerprint recorded). |
+| C4 | Fingerprint kinds | Tables (`r`, `p`, `f`), columns (name, type, not null, default, identity, generated, collation), indexes (`pg_get_indexdef`), constraints (`pg_get_constraintdef`), views and materialized views (`pg_get_viewdef`), functions and procedures (identity arguments, `pg_get_functiondef`); read with `search_path` pinned to `pg_catalog`; extension-owned objects excluded. Not covered: triggers, sequences, types, grants, ownership, comments, extensions. SHA-256 of the canonical JSON document; the baseline hash takes the widened definition (Phase 1 unreleased). |
+| C5 | Watched schemas | Set by `baseline(schemas=...)` (default every schema but `pg_*`, `information_schema`, `caverns`) and inherited by each later fingerprint; without a baseline, the default. `apply`'s signature is unchanged. `drift --schema` narrows the report only. |
+| C6 | Fingerprint storage | New own step `fingerprint`: `caverns.fingerprint` (`version` bigint primary key referencing `caverns.ledger`, `schemas` text[], `document` jsonb, `hash` 64 hex, `recorded_at` `clock_timestamp()`), append-only by the same triggers as the ledger; the ledger is unchanged. `apply` writes one row in the transaction of its last ledger row, `baseline` one with its row (the ledger's `fingerprint` keeps the same hash). Before running, `apply` compares the live schema with the latest fingerprint and logs each difference as a warning; no refusal. No `drift --accept` in v0.1. |
+| C7 | Library API | `infinite.fingerprint(conn, *, schemas=None) -> Fingerprint` (`schemas`, `document`, `hash`); `infinite.drift(conn, changeset=None) -> Drift` (`fingerprint_version`, `differences` of `Difference(kind, name, change)` with change `added` / `removed` / `changed`, `disagreements` of `StepStatus`); `nozdormu.history(conn, *, changeset=None, limit=None) -> list[LedgerEntry]`; exception `NoFingerprint`. The fingerprint code moves from `nozdormu` to `infinite`. |
+| C8 | Disagreements | A step whose ledger status is `applied` but whose check is now false; `unknown` stays with `status`. Only with a changeset. |
+| C9 | Commits | As the table above; the own step `fingerprint` lands in commit 4. The guidance evals run before the pull request opens. |
+| C10 | Implementation amendment | `infinite.drift(conn, changeset=None, *, schemas=None)`: `schemas` narrows the report to watched schemas (an unwatched one is a `ChangesetError`); `Drift` also carries `schemas`. The fingerprint's constraints are check, foreign-key, primary-key, unique and exclusion (`contype` `c`, `f`, `p`, `u`, `x`): PostgreSQL 18's NOT NULL constraints (the column's `not_null`) and constraint triggers are left out. Shared private modules `_connection` (connection plumbing) and `_fingerprint` (the fingerprint machinery) keep Nozdormu and Infinite free of a mutual import; `infinite` is the public facade. |
+| C11 | Review amendment | Watched schemas (C5, made exact): the schemas of the latest `baseline` row's fingerprint; without a baseline, the default, read again at every fingerprint, so a schema created later is watched. A baseline without `schemas` takes the default. Drift and the pre-apply warning compare the watched schemas plus those the latest fingerprint covers (drift narrowed by `schemas`) with that fingerprint: a watched schema the fingerprint lacks shows its objects as added, a covered schema since dropped as removed; the fingerprint apply records covers the watched schemas. The connection string is required, but libpq fills what it omits from the standard `PG*` variables, as every libpq client does (documented, not refused). `chromie` exits 2 on any error that is not a finding, a driver or OS error included. |
 
 ### Phase 3 — Epochs
 

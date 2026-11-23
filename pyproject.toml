@@ -13,10 +13,13 @@ description = "A recorded timeline for PostgreSQL: migration ledger, run-level s
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
-# Runtime dependencies are an ask-first decision (CLAUDE.md "Ask first"); none until Phase 1 signs one off.
+# Runtime dependencies are an ask-first decision (CLAUDE.md "Ask first"); the library has none.
+# The CLI's driver is the `cli` extra below.
 dependencies = []
 
 [project.optional-dependencies]
+# The CLI's driver; the library imports no driver (the connection contract).
+cli = ["psycopg[binary]>=3.2,<4"]
 # psycopg and psycopg2 are the test suite's only drivers; the package imports neither
 # (the connection contract: caverns_of_time/README.md).
 dev = [
@@ -31,6 +34,9 @@ dev = [
     # rules must arrive as a Dependabot PR, not red CI on every PR.
     "actionlint-py==1.7.12.25",
 ]
+
+[project.scripts]
+chromie = "caverns_of_time.chromie:main"
 
 [tool.setuptools]
 packages = ["caverns_of_time"]

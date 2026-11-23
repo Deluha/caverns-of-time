@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from caverns_of_time import nozdormu
+from caverns_of_time import _connection, _fingerprint, nozdormu
 from caverns_of_time.errors import ChangesetError
 from caverns_of_time.nozdormu import Changeset, LedgerEntry, Status, Step
 
@@ -216,20 +216,42 @@ def test_from_directory_names_an_empty_step_file(tmp_path: Path) -> None:
 def test_the_ledger_column_lists_are_the_ledger_entry_fields() -> None:
     columns = [field.name for field in fields(LedgerEntry)]
     select = re.fullmatch(r"SELECT (.+?) FROM caverns\.ledger .*", nozdormu._SELECT_ENTRIES_SQL)
+    history = re.fullmatch(r"SELECT (.+?) FROM caverns\.ledger .*", nozdormu._HISTORY_SQL)
     returning = re.fullmatch(r".* RETURNING (.+)", nozdormu._INSERT_ENTRY_SQL)
-    assert select and returning
+    assert select and history and returning
     assert select.group(1).split(", ") == columns
+    assert history.group(1).split(", ") == columns
     assert returning.group(1).split(", ") == columns
 
 
-def test_every_sql_constant_names_the_one_ledger_table() -> None:
+@pytest.mark.parametrize("table", ["ledger", "fingerprint"])
+def test_every_sql_constant_names_the_own_tables_in_the_own_schema(table: str) -> None:
     constants = {
-        name: value for name, value in vars(nozdormu).items() if name.endswith("_SQL") and isinstance(value, str)
+        f"{module.__name__}.{name}": value
+        for module in (nozdormu, _connection, _fingerprint)
+        for name, value in vars(module).items()
+        if name.endswith("_SQL") and isinstance(value, str)
     }
     assert constants
+    assert any(f".{table}" in sql for sql in constants.values())
     for name, sql in constants.items():
-        for qualifier in re.findall(r"(\w+)\.ledger\b", sql):
+        for qualifier in re.findall(rf"(\w+)\.{table}\b", sql):
             assert qualifier == nozdormu._OWN_CHANGESET_NAME, name
+
+
+def test_the_own_changeset_is_the_ledger_step_then_the_fingerprint_step() -> None:
+    assert [step.label for step in nozdormu._OWN_CHANGESET.steps] == ["ledger", "fingerprint"]
+    assert all(step.check for step in nozdormu._OWN_CHANGESET.steps)
+
+
+def test_the_released_ledger_step_is_byte_identical() -> None:
+    """Its checksum is in every consumer's ledger: an edit of the statement would read as a conflict."""
+    released = "6ccdacf3430bfa341afd4f7f0d7fdba8a76c5ce344b58109387a38ca7ab1251b"
+    assert nozdormu._OWN_CHANGESET.steps[0].checksum == released
+
+
+def test_the_default_schemas_query_leaves_out_the_own_schema_by_its_name() -> None:
+    assert f"'{nozdormu._OWN_CHANGESET_NAME}'" in _fingerprint._DEFAULT_SCHEMAS_SQL
 
 
 # --- the status decision -----------------------------------------------------------------
@@ -310,10 +332,4 @@ def test_a_baseline_at_a_step_the_changeset_lacks_is_an_error() -> None:
 @pytest.mark.parametrize("values", [None, "table"])
 def test_a_collection_of_names_is_not_none_or_a_string(values: object) -> None:
     with pytest.raises(ChangesetError, match="must be a collection of names"):
-        nozdormu._names("accept", values)  # type: ignore[arg-type]
-
-
-def test_the_fingerprint_hash_ignores_key_order_and_sees_content() -> None:
-    assert nozdormu._hash_document({"b": 1, "a": [2]}) == nozdormu._hash_document({"a": [2], "b": 1})
-    assert nozdormu._hash_document({"a": 1}) != nozdormu._hash_document({"a": 2})
-    assert re.fullmatch(r"[0-9a-f]{64}", nozdormu._hash_document({}))
+        _connection.names("accept", values)  # type: ignore[arg-type]
