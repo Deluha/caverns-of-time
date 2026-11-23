@@ -24,6 +24,7 @@ from caverns_of_time._fingerprint import (
     FINGERPRINT_EXISTS_SQL,
     capture,
     compare,
+    compared_schemas,
     default_schemas,
     named_schemas,
     read_document,
@@ -62,8 +63,8 @@ _ASCII_WHITESPACE = " \t\n\r\f\v"
 _SQL_SUFFIX = ".sql"
 _CHECK_SUFFIX = ".check.sql"
 _MILLISECONDS = 1000
-# The largest `LIMIT` PostgreSQL takes (a bigint); `chromie log --limit` shares the bound.
-HISTORY_LIMIT_MAX = 2**63 - 1
+# The largest `LIMIT` PostgreSQL takes (a bigint).
+_HISTORY_LIMIT_MAX = 2**63 - 1
 
 # Caverns' own changeset; its name is also the schema that holds the ledger.
 _OWN_CHANGESET_NAME = "caverns"
@@ -426,9 +427,9 @@ def history(connection: Connection, *, changeset: str | None = None, limit: int 
     check_connection(connection)
     if changeset is not None:
         _validate_name("changeset name", changeset)
-    valid = isinstance(limit, int) and not isinstance(limit, bool) and 1 <= limit <= HISTORY_LIMIT_MAX
+    valid = isinstance(limit, int) and not isinstance(limit, bool) and 1 <= limit <= _HISTORY_LIMIT_MAX
     if limit is not None and not valid:
-        raise ChangesetError(f"limit must be a positive integer up to {HISTORY_LIMIT_MAX}, not {limit!r}")
+        raise ChangesetError(f"limit must be a positive integer up to {_HISTORY_LIMIT_MAX}, not {limit!r}")
     with read_only(connection) as cursor:
         if not _ledger_exists(cursor):
             raise LedgerNotInstalled("the ledger is not installed (caverns.ledger does not exist): call install()")
@@ -513,13 +514,16 @@ def _record_fingerprint(cursor: Cursor, entry: LedgerEntry) -> None:
 
 
 def _warn_of_drift(connection: Connection, changeset: Changeset) -> None:
-    """Log one warning per difference between the live schemas and the latest recorded fingerprint; no refusal."""
+    """Log one warning per difference between the latest recorded fingerprint and the live database; no refusal.
+
+    Compares the watched schemas plus those the fingerprint covers, so a schema dropped since reads as removed.
+    """
     with read_only(connection) as cursor:
         found = latest_fingerprint(cursor)
         if found is None:
             return
-        watched = watched_schemas(cursor)
-        differences = compare(restrict(found[1].document, watched), read_document(cursor, watched))
+        compared = compared_schemas(cursor, found[1])
+        differences = compare(restrict(found[1].document, compared), read_document(cursor, compared))
     for difference in differences:
         _log.warning(
             "drift before applying changeset %s: %s %s %s",

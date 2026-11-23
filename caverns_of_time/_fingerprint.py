@@ -23,6 +23,7 @@ __all__ = [
     "Fingerprint",
     "capture",
     "compare",
+    "compared_schemas",
     "default_schemas",
     "fingerprint_table_exists",
     "latest",
@@ -217,6 +218,14 @@ def watched_schemas(cursor: Cursor) -> list[str]:
         if row is not None:
             return sorted(row[0])
     return default_schemas(cursor)
+
+
+def compared_schemas(cursor: Cursor, recorded: Fingerprint) -> list[str]:
+    """The schemas to compare with *recorded*: the watched ones plus those *recorded* covers, sorted.
+
+    A schema that was dropped is no longer watched, but *recorded* still holds it, so its objects read as removed.
+    """
+    return sorted(set(watched_schemas(cursor)) | set(recorded.schemas))
 
 
 def resolve_schemas(

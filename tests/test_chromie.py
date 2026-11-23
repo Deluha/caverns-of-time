@@ -126,13 +126,6 @@ def test_log_refuses_a_negative_limit(capsys: pytest.CaptureFixture[str]) -> Non
     assert "--limit" in capsys.readouterr().err
 
 
-def test_log_refuses_a_limit_above_the_bigint_maximum(capsys: pytest.CaptureFixture[str]) -> None:
-    with pytest.raises(SystemExit) as raised:
-        chromie.main(["log", "--limit", "9223372036854775808"])
-    assert raised.value.code == chromie.EXIT_USAGE
-    assert "--limit" in capsys.readouterr().err
-
-
 def test_a_refused_connection_is_a_usage_error(capsys: pytest.CaptureFixture[str]) -> None:
     refused = "host=127.0.0.1 port=1 dbname=x connect_timeout=2"
     code, out, err = _run(capsys, "log", "--dsn", refused)
@@ -165,6 +158,15 @@ def test_log_refuses_a_limit_that_is_not_a_number() -> None:
     with pytest.raises(SystemExit) as raised:
         chromie.main(["log", "--limit", "many"])
     assert raised.value.code == chromie.EXIT_USAGE
+
+
+def test_log_refuses_a_limit_above_the_bigint_maximum_with_exit_2(
+    ledger_conn: Any, db_dsn: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    nozdormu.install(ledger_conn)
+    code, out, err = _run(capsys, "log", "--dsn", db_dsn, "--limit", "9223372036854775808")
+    assert (code, out) == (chromie.EXIT_USAGE, "")
+    assert "limit" in err
 
 
 def test_log_without_an_installed_ledger_is_a_usage_error(
