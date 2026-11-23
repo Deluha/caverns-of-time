@@ -1,6 +1,6 @@
 ---
 name: db-change
-description: Change one of Caverns' own database objects (the ledger, the epoch catalog, history tables) through the own-schema workflow.
+description: Change one of Caverns' own database objects (the ledger, the fingerprint table, the epoch tables) through the own-schema workflow.
 disable-model-invocation: true
 argument-hint: <what to change>
 ---

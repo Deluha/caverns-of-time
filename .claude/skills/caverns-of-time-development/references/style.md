@@ -46,6 +46,7 @@ Comments explain **why**, not **what**.
 | `--dsn` | connection string (else the environment) |
 | `--schema` | a schema name (repeatable where a command narrows to schemas) |
 | `--changeset` | a changeset name |
+| `--table` | a schema-qualified table, `SCHEMA.TABLE` (repeatable where a command narrows to tables) |
 | `--limit` | the most rows to show (0: all) |
 | `--dry-run` | report what would change, write nothing |
 | `--yes` | skip the confirmation (required unattended) |

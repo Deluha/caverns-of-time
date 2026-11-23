@@ -49,3 +49,11 @@ class BaselineRefused(CavernsError):
 
 class NoFingerprint(CavernsError):
     """Drift found nothing to compare with: no fingerprint is recorded yet."""
+
+
+class EpochNotFound(CavernsError):
+    """An epoch or an epoch's table was not found."""
+
+
+class EpochRefused(CavernsError):
+    """An epoch operation was refused: a table or key that cannot be tracked, or an epoch that cannot be used."""

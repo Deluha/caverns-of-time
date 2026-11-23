@@ -8,15 +8,16 @@ work lives in the component modules. Contract: `caverns_of_time/README.md`.
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict
-from datetime import UTC
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Protocol
 
-from caverns_of_time import console, infinite, nozdormu
+from caverns_of_time import console, epochs, infinite, nozdormu
 from caverns_of_time.errors import CavernsError
 from caverns_of_time.nozdormu import Connection
 
@@ -26,7 +27,7 @@ ENV_DSN = "CAVERNS_DSN"
 EXIT_OK = 0
 EXIT_FINDING = 1
 EXIT_USAGE = 2
-DEFAULT_LOG_LIMIT = 20
+DEFAULT_LIMIT = 20
 _TIME_FORMAT = "%Y-%m-%d %H:%M:%S"
 
 # Shared by every subcommand: each passes `parents=[_common]`.
@@ -56,6 +57,14 @@ def _non_negative_int(text: str) -> int:
     return value
 
 
+def _table_name(text: str) -> tuple[str, str]:
+    """An argparse type: SCHEMA.TABLE split at the first dot, both parts not empty."""
+    schema, _, table = text.partition(".")
+    if not schema or not table:
+        raise argparse.ArgumentTypeError(f"expected SCHEMA.TABLE, got {text!r}")
+    return schema, table
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Build the `chromie` parser; each subcommand sets `handler` with `set_defaults`."""
     parser = argparse.ArgumentParser(
@@ -67,8 +76,8 @@ def build_parser() -> argparse.ArgumentParser:
     log.add_argument(
         "--limit",
         type=_non_negative_int,
-        default=DEFAULT_LOG_LIMIT,
-        help=f"the most rows to show (0: all; default: {DEFAULT_LOG_LIMIT})",
+        default=DEFAULT_LIMIT,
+        help=f"the most rows to show (0: all; default: {DEFAULT_LIMIT})",
     )
     log.set_defaults(handler=_log)
     status = commands.add_parser(
@@ -86,6 +95,34 @@ def build_parser() -> argparse.ArgumentParser:
     drift.add_argument("--changeset", help="the changeset name (default: the directory's name)")
     drift.add_argument("--schema", action="append", help="narrow the report to this schema (repeatable)")
     drift.set_defaults(handler=_drift)
+    as_of = commands.add_parser("as-of", parents=[_common], help="show a table as it was at an epoch")
+    as_of.add_argument("epoch", metavar="EPOCH", help="the epoch name")
+    as_of.add_argument("table", metavar="SCHEMA.TABLE", type=_table_name, help="the table, schema-qualified")
+    as_of.add_argument(
+        "--limit",
+        type=_non_negative_int,
+        default=DEFAULT_LIMIT,
+        help=f"the most rows to show (0: all; default: {DEFAULT_LIMIT})",
+    )
+    as_of.set_defaults(handler=_as_of)
+    diff = commands.add_parser("diff", parents=[_common], help="compare two epochs row by row")
+    diff.add_argument("old", metavar="OLD", help="the earlier epoch name")
+    diff.add_argument("new", metavar="NEW", help="the later epoch name")
+    diff.add_argument("--table", action="append", type=_table_name, help="compare only this table (repeatable)")
+    diff.set_defaults(handler=_diff)
+    epoch_list = commands.add_parser("epochs", parents=[_common], help="list the epochs, newest first")
+    epoch_list.add_argument(
+        "--limit",
+        type=_non_negative_int,
+        default=DEFAULT_LIMIT,
+        help=f"the most rows to show (0: all; default: {DEFAULT_LIMIT})",
+    )
+    epoch_list.set_defaults(handler=_epochs)
+    delete_epoch = commands.add_parser("delete-epoch", parents=[_common], help="delete epochs and their rows")
+    delete_epoch.add_argument("epoch", nargs="+", metavar="EPOCH", help="an epoch name")
+    delete_epoch.add_argument("--dry-run", action="store_true", help="report what would be deleted, delete nothing")
+    delete_epoch.add_argument("--yes", action="store_true", help="skip the confirmation (required unattended)")
+    delete_epoch.set_defaults(handler=_delete_epoch)
     return parser
 
 
@@ -106,6 +143,15 @@ def connect(dsn: str) -> _ClosableConnection:
         raise UsageError(f"cannot connect: {exc}") from None
 
 
+def _utc(moment: datetime) -> str:
+    return moment.astimezone(UTC).strftime(_TIME_FORMAT)
+
+
+def _plural(count: int, noun: str) -> str:
+    """`1 row`, `2 rows`."""
+    return f"{count} {noun}" if count == 1 else f"{count} {noun}s"
+
+
 def _log(args: argparse.Namespace, connection: Connection) -> int:
     """`chromie log`: the ledger rows, newest first."""
     entries = nozdormu.history(connection, changeset=args.changeset, limit=args.limit or None)
@@ -115,17 +161,7 @@ def _log(args: argparse.Namespace, connection: Connection) -> int:
         scope = f"changeset {args.changeset} has no ledger rows" if args.changeset else "the ledger is empty"
         console.info(f"Nothing to show — {scope}.")
     else:
-        rows = [
-            (
-                e.version,
-                e.changeset,
-                e.label,
-                e.outcome,
-                e.recorded_at.astimezone(UTC).strftime(_TIME_FORMAT),
-                e.recorded_by,
-            )
-            for e in entries
-        ]
+        rows = [(e.version, e.changeset, e.label, e.outcome, _utc(e.recorded_at), e.recorded_by) for e in entries]
         console.table(["VERSION", "CHANGESET", "LABEL", "OUTCOME", "RECORDED_AT (UTC)", "BY"], rows, right=[0])
     return EXIT_OK
 
@@ -192,11 +228,182 @@ def _drift(args: argparse.Namespace, connection: Connection) -> int:
     rows += [("~", "step", f"{name}/{label}: recorded applied, check now false") for name, label, _ in disagreements]
     console.table(None, rows)
     if found:
-        count = len(rows)
-        console.error(f"Drift: {count} difference{'s' if count != 1 else ''}.")
+        console.error(f"Drift: {_plural(len(rows), 'difference')}.")
     else:
         console.success(f"No drift — the live schema matches the fingerprint at ledger version {version}.")
     return code
+
+
+def _cell(value: object) -> str | None:
+    """A value of a snapshotted row as a table cell: None stays None, a string as is, else its compact JSON."""
+    if value is None or isinstance(value, str):
+        return value
+    return json.dumps(value, separators=(",", ":"), ensure_ascii=False)
+
+
+def _as_of(args: argparse.Namespace, connection: Connection) -> int:
+    """`chromie as-of`: a table's rows as they were at an epoch."""
+    schema, table = args.table
+    at = epochs.as_of(connection, args.epoch, schema, table, limit=args.limit or None)
+    taken_at, columns, row_count = at.epoch.taken_at, at.table.columns, at.table.row_count
+    if args.format == "json":
+        console.emit_json(
+            {
+                "epoch": at.epoch.name,
+                "ledger_version": at.epoch.ledger_version,
+                "taken_at": taken_at.isoformat(),
+                "schema": schema,
+                "table": table,
+                "key": list(at.table.key),
+                "columns": [asdict(column) for column in columns],
+                "row_count": row_count,
+                "rows": list(at.rows),
+            }
+        )
+        return EXIT_OK
+    console.info(
+        f"{schema}.{table} at epoch {at.epoch.name} (ledger version {at.epoch.ledger_version},"
+        f" taken {_utc(taken_at)} UTC): {_plural(row_count, 'row')}, key ({', '.join(at.table.key)})."
+    )
+    if at.rows:
+        console.table([c.name for c in columns], [[_cell(row[c.name]) for c in columns] for row in at.rows])
+    if len(at.rows) < row_count:
+        console.info(f"Showing {len(at.rows)} of {row_count} rows — --limit 0 shows all.")
+    return EXIT_OK
+
+
+def _key_text(key: Mapping[str, object]) -> str:
+    """A row's key as `id=42, code="x"`: each value as compact JSON."""
+    return ", ".join(f"{name}={json.dumps(value, ensure_ascii=False)}" for name, value in key.items())
+
+
+def _diff_lines(result: epochs.EpochDiff) -> list[tuple[str, str, str]]:
+    """The (symbol, kind, name) line of each difference, table by table: the table, its columns, then its rows."""
+    lines: list[tuple[str, str, str]] = []
+    for t in result.tables:
+        name = f"{t.schema}.{t.table}"
+        if t.change != "changed":
+            lines.append((_CHANGE_SYMBOLS[t.change], "table", name))
+        for column in t.columns:
+            detail = f": {column.old_type} → {column.new_type}" if column.change == "changed" else ""
+            lines.append((_CHANGE_SYMBOLS[column.change], "column", f"{name}.{column.name}{detail}"))
+        lines += [("+", "row", f"{name} ({_key_text(key)})") for key in t.added]
+        lines += [("-", "row", f"{name} ({_key_text(key)})") for key in t.removed]
+        lines += [("~", "row", f"{name} ({_key_text(row.key)}): {', '.join(row.old)}") for row in t.changed]
+    return lines
+
+
+def _diff(args: argparse.Namespace, connection: Connection) -> int:
+    """`chromie diff`: two epochs row by row; 1 when anything differs."""
+    result = epochs.diff(connection, args.old, args.new, tables=args.table)
+    code = EXIT_FINDING if result.tables else EXIT_OK
+    if args.format == "json":
+        console.emit_json(
+            {
+                "old": {"epoch": result.old.name, "ledger_version": result.old.ledger_version},
+                "new": {"epoch": result.new.name, "ledger_version": result.new.ledger_version},
+                "tables": [asdict(t) for t in result.tables],
+            }
+        )
+        return code
+    old, new = result.old, result.new
+    console.info(
+        f"Comparing epoch {old.name} (ledger version {old.ledger_version})"
+        f" with {new.name} (ledger version {new.ledger_version})."
+    )
+    lines = _diff_lines(result)
+    console.table(None, lines)
+    if result.tables:
+        console.error(f"{_plural(len(lines), 'difference')} in {_plural(len(result.tables), 'table')}.")
+    else:
+        console.success(f"No differences between epochs {old.name} and {new.name}.")
+    return code
+
+
+def _epoch_json(epoch: epochs.Epoch) -> dict[str, object]:
+    """An epoch as the JSON of `epochs` and `delete-epoch`: its catalog row and its tables."""
+    return {
+        "epoch": epoch.epoch,
+        "name": epoch.name,
+        "ledger_version": epoch.ledger_version,
+        "taken_at": epoch.taken_at.isoformat(),
+        "taken_by": epoch.taken_by,
+        "caverns_version": epoch.caverns_version,
+        "deleted_at": epoch.deleted_at.isoformat() if epoch.deleted_at else None,
+        "tables": [
+            {
+                "schema": t.schema,
+                "table": t.table,
+                "key": list(t.key),
+                "columns": [asdict(column) for column in t.columns],
+                "row_count": t.row_count,
+            }
+            for t in epoch.tables
+        ],
+    }
+
+
+def _row_count(epoch: epochs.Epoch) -> int:
+    return sum(table.row_count for table in epoch.tables)
+
+
+def _epochs(args: argparse.Namespace, connection: Connection) -> int:
+    """`chromie epochs`: the epochs, newest first, deleted ones included."""
+    found = epochs.catalog(connection, limit=args.limit or None)
+    if args.format == "json":
+        console.emit_json([_epoch_json(e) for e in found])
+    elif not found:
+        console.info("Nothing to show — no epoch is recorded.")
+    else:
+        rows = [
+            (
+                e.epoch,
+                e.name,
+                e.ledger_version,
+                _utc(e.taken_at),
+                e.taken_by,
+                len(e.tables),
+                _row_count(e),
+                _utc(e.deleted_at) if e.deleted_at else None,
+            )
+            for e in found
+        ]
+        headers = ["EPOCH", "NAME", "LEDGER", "TAKEN_AT (UTC)", "BY", "TABLES", "ROWS", "DELETED (UTC)"]
+        console.table(headers, rows, right=[0, 2, 5, 6])
+    return EXIT_OK
+
+
+def _delete_epoch(args: argparse.Namespace, connection: Connection) -> int:
+    """`chromie delete-epoch`: delete epochs' rows after a confirmation; the one command that writes."""
+    plan = epochs.delete(connection, args.epoch, dry_run=True)  # the library validates, newest first
+    if args.dry_run:
+        if args.format == "json":
+            console.emit_json([_epoch_json(e) for e in plan])
+            return EXIT_OK
+        for e in plan:
+            counted = f"{_plural(_row_count(e), 'row')} in {_plural(len(e.tables), 'table')}"
+            console.info(f"Would delete epoch {e.name} ({counted}, taken {_utc(e.taken_at)} UTC).")
+        console.info("Dry run — nothing deleted.")
+        return EXIT_OK
+    if not args.yes:
+        if not console.interactive():
+            raise UsageError("delete-epoch needs --yes when not run interactively")
+        listed = ", ".join(e.name for e in plan)
+        question = (
+            f"Delete {_plural(len(plan), 'epoch')} ({listed}) and their {_plural(sum(map(_row_count, plan)), 'row')}?"
+        )
+        if not console.confirm(question):
+            console.info("Aborted — no changes were made.")
+            return EXIT_OK
+    deleted = epochs.delete(connection, [e.name for e in plan])
+    if args.format == "json":
+        console.emit_json([_epoch_json(e) for e in deleted])
+    else:
+        for e in deleted:
+            console.success(
+                f"Deleted epoch {e.name} ({_plural(_row_count(e), 'row')} in {_plural(len(e.tables), 'table')})."
+            )
+    return EXIT_OK
 
 
 def main(argv: Sequence[str] | None = None) -> int:
