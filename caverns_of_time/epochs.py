@@ -129,26 +129,15 @@ _INSERT_SOURCE_SQL = (
     "INSERT INTO caverns.epoch_source (epoch, schema_name, table_name, key, columns, row_count)"
     " VALUES (%s, %s, %s, %s::text[], %s::jsonb, %s)"
 )
-_SELECT_EPOCHS_SQL = """
+# The select list and the deletion join every epoch read shares; each statement adds its own tail below.
+_SELECT_EPOCH_PREFIX = """
 SELECT e.epoch, e.name, e.ledger_version, e.taken_at, e.taken_by, e.caverns_version, d.deleted_at
 FROM caverns.epoch e
 LEFT JOIN caverns.epoch_deletion d ON d.epoch = e.epoch
-ORDER BY e.epoch DESC
-LIMIT %s
 """
-_SELECT_EPOCHS_BY_ID_SQL = """
-SELECT e.epoch, e.name, e.ledger_version, e.taken_at, e.taken_by, e.caverns_version, d.deleted_at
-FROM caverns.epoch e
-LEFT JOIN caverns.epoch_deletion d ON d.epoch = e.epoch
-WHERE e.epoch = ANY(%s::bigint[])
-ORDER BY e.epoch DESC
-"""
-_SELECT_EPOCH_SQL = """
-SELECT e.epoch, e.name, e.ledger_version, e.taken_at, e.taken_by, e.caverns_version, d.deleted_at
-FROM caverns.epoch e
-LEFT JOIN caverns.epoch_deletion d ON d.epoch = e.epoch
-WHERE e.name = %s
-"""
+_SELECT_EPOCHS_SQL = _SELECT_EPOCH_PREFIX + "ORDER BY e.epoch DESC\nLIMIT %s\n"
+_SELECT_EPOCHS_BY_ID_SQL = _SELECT_EPOCH_PREFIX + "WHERE e.epoch = ANY(%s::bigint[])\nORDER BY e.epoch DESC\n"
+_SELECT_EPOCH_SQL = _SELECT_EPOCH_PREFIX + "WHERE e.name = %s\n"
 # The rows of one table of an epoch, ordered by its key columns in declared order: the key's values are collected
 # into a jsonb[] per row, which compares element by element (a number as a number, a string as a string).
 _SELECT_AT_SQL = """
@@ -484,15 +473,16 @@ def snapshot(connection: Connection, name: str) -> Epoch:
 
     The tables are read in one REPEATABLE READ transaction that starts after Caverns' advisory lock is held, so
     the copy is one consistent view, its values printed under pinned settings (UTC, `postgres` interval style,
-    `extra_float_digits` 1, hex bytea) whatever the session's; a refusal writes nothing. Raises `ChangesetError`
-    for a bad *name*, `LedgerNotInstalled` before `install()` and `EpochRefused` for a name that is taken (a deleted
-    epoch's too), no registered table, a registered table or key column that no longer exists, and a key with
-    duplicates or nulls.
+    `extra_float_digits` 1, hex bytea, `ISO, MDY` dates, `C` money) whatever the session's; a refusal writes
+    nothing. Raises `ChangesetError` for a bad *name*, `LedgerNotInstalled` before `install()` and `EpochRefused`
+    for a name that is taken (a deleted epoch's too), no registered table, a registered table or key column that no
+    longer exists, and a key with duplicates or nulls.
     """
     check_connection(connection)
     validate_name("epoch name", name)
     with session_lock(connection), transaction(connection, repeatable_read=True) as cursor:
         _require_installed(cursor)
+        pin_output_settings(cursor)  # first: a driver reads a timestamptz only in an ISO `DateStyle`
         cursor.execute(_EPOCH_NAME_SQL, (name,))
         taken = cursor.fetchone()
         if taken is not None:
@@ -502,7 +492,6 @@ def snapshot(connection: Connection, name: str) -> Epoch:
         if not registered:
             raise EpochRefused("no table is registered: call register() first")
         pin_search_path(cursor)
-        pin_output_settings(cursor)
         cursor.execute(_INSERT_EPOCH_SQL, (name, __version__))
         created = cursor.fetchone()
         assert created is not None  # an INSERT ... RETURNING always returns its row
@@ -549,8 +538,8 @@ def _find_epoch(cursor: Cursor, name: str) -> Epoch:
         raise EpochNotFound(f"no epoch is named {name!r}")
     (found,) = _read_epochs(cursor, [row])
     if found.deleted_at is not None:
-        deleted = found.deleted_at.astimezone(UTC).isoformat(timespec="seconds")
-        raise EpochRefused(f"epoch {name!r} was deleted at {deleted}")
+        deleted = found.deleted_at.astimezone(UTC).strftime("%Y-%m-%d %H:%M:%S")
+        raise EpochRefused(f"epoch {name!r} was deleted at {deleted} UTC")
     return found
 
 

@@ -76,13 +76,16 @@ _SESSION_LOCK_SQL = "SELECT pg_advisory_lock(%s::bigint)"
 _SESSION_UNLOCK_SQL = "SELECT pg_advisory_unlock(%s::bigint)"
 # Lets a catalog read name an object by its schema-qualified type regardless of the caller's search_path.
 _PIN_SEARCH_PATH_SQL = "SELECT set_config('search_path', 'pg_catalog', true)"
-# The settings that change how a value prints (`to_jsonb` of a timestamptz, interval, float8 or bytea).
+# The settings that change how a value prints (`to_jsonb` of a timestamptz, a range of them, interval, float8,
+# bytea or money).
 _PIN_OUTPUT_SETTINGS_SQL = (
     "SELECT set_config('TimeZone', 'UTC', true), set_config('IntervalStyle', 'postgres', true),"
-    " set_config('extra_float_digits', '1', true), set_config('bytea_output', 'hex', true)"
+    " set_config('extra_float_digits', '1', true), set_config('bytea_output', 'hex', true),"
+    " set_config('DateStyle', 'ISO, MDY', true), set_config('lc_monetary', 'C', true)"
 )
 _LIMIT_MAX = 2**63 - 1  # a bigint, what `LIMIT` takes
-# True only when all five epoch tables exist; `epochs` (the registry) reads it too, to refuse before the step ran.
+# True only when all five epoch tables exist. Used by the `epochs` own step's check (nozdormu) and by the epoch
+# functions (`epochs`), which refuse with it before that step ran.
 EPOCHS_EXISTS_SQL = (
     "SELECT to_regclass('caverns.epoch_table') IS NOT NULL AND to_regclass('caverns.epoch') IS NOT NULL"
     " AND to_regclass('caverns.epoch_source') IS NOT NULL AND to_regclass('caverns.epoch_row') IS NOT NULL"
@@ -205,7 +208,7 @@ def pin_search_path(cursor: Cursor) -> None:
 
 
 def pin_output_settings(cursor: Cursor) -> None:
-    """Pin the settings that shape how values print (time zone, interval style, float digits, bytea output).
+    """Pin the settings that shape how values print (time zone, interval and date style, float digits, bytea, money).
 
     Until the transaction ends, so what a snapshot stores does not depend on the session that took it.
     """

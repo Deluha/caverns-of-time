@@ -207,9 +207,9 @@ Python. A value's type is not in the row: JSON holds numbers, strings, booleans,
 read a value's type from the epoch's `columns` (`Column.type`, printed by `format_type` with the search path
 pinned to `pg_catalog`, so a user type is schema-qualified). The values are printed under settings the snapshot
 pins for its transaction, so an epoch does not depend on the session that took it: `TimeZone` `UTC` (a timestamptz
-ends `+00:00`), `IntervalStyle` `postgres`, `extra_float_digits` 1 and `bytea_output` `hex`; the caller's own settings
-are untouched afterwards. If releasing the advisory lock fails after the epoch is committed, the snapshot still
-returns, with a warning (`could not release Caverns' advisory lock: <error>`) through the
+ends `+00:00`), `IntervalStyle` `postgres`, `extra_float_digits` 1, `bytea_output` `hex`, `DateStyle` `ISO, MDY` and
+`lc_monetary` `C`; the caller's own settings are untouched afterwards. If releasing the advisory lock fails
+after the epoch is committed, the snapshot still returns, with a warning (`could not release Caverns' advisory lock: <error>`) through the
 `caverns_of_time._connection` logger. `catalog(connection, *, limit=None)` lists the epochs
 newest first, deleted ones included, each with its tables.
 
@@ -358,7 +358,7 @@ EPOCH  NAME    LEDGER  TAKEN_AT (UTC)       BY        TABLES  ROWS  DELETED (UTC
 `chromie delete-epoch EPOCH [EPOCH ...] [--dry-run] [--yes]` deletes the named epochs and their rows (`epochs.delete`;
 the catalog rows and the names stay). An epoch that is unknown or already deleted is a usage error and nothing is
 deleted: the plan, for `--dry-run` and the confirmation alike, comes from `epochs.delete(..., dry_run=True)`, so the
-error is the library's. Without `--yes` it asks on stderr, `Delete 2 epochs (run-40, run-41) and their 1216 rows? [y/N]`, and
+error is the library's. Without `--yes` it asks on stderr, `Delete 2 epochs (run-42, run-40) and their 1216 rows? [y/N]`, and
 only `y` or `yes` goes on: any other answer, the end of input or Ctrl-C prints `ℹ️ Aborted — no changes were made.` and exits 0; when stdin is
 not a terminal it refuses without `--yes` (exit 2), so an unattended run must pass `--yes`. `--dry-run` deletes
 nothing and asks nothing: it prints one line per epoch, newest first, and `ℹ️ Dry run — nothing deleted.`. A deletion prints one
