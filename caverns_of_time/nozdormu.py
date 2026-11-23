@@ -28,6 +28,7 @@ from caverns_of_time._connection import (
     read_only,
     run_check,
     transaction,
+    validate_limit,
     validate_name,
 )
 from caverns_of_time._fingerprint import (
@@ -73,8 +74,6 @@ _ASCII_WHITESPACE = " \t\n\r\f\v"
 _SQL_SUFFIX = ".sql"
 _CHECK_SUFFIX = ".check.sql"
 _MILLISECONDS = 1000
-# The largest `LIMIT` PostgreSQL takes (a bigint).
-_HISTORY_LIMIT_MAX = 2**63 - 1
 
 # Caverns' own changeset; its name is also the schema that holds the ledger.
 _OWN_CHANGESET_NAME = "caverns"
@@ -498,9 +497,7 @@ def history(connection: Connection, *, changeset: str | None = None, limit: int 
     check_connection(connection)
     if changeset is not None:
         validate_name("changeset name", changeset)
-    valid = isinstance(limit, int) and not isinstance(limit, bool) and 1 <= limit <= _HISTORY_LIMIT_MAX
-    if limit is not None and not valid:
-        raise ChangesetError(f"limit must be a positive integer up to {_HISTORY_LIMIT_MAX}, not {limit!r}")
+    validate_limit(limit)
     with read_only(connection) as cursor:
         if not _ledger_exists(cursor):
             raise LedgerNotInstalled("the ledger is not installed (caverns.ledger does not exist): call install()")
