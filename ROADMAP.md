@@ -4,7 +4,7 @@ The planned scope of the next release. `RELEASE_NOTES.md` records what shipped; 
 what is planned. A release's section leaves this file when the release is tagged. Owner decisions are dated.
 
 Approved by the owner on 2026-11-22.
-Amended by the owner on 2026-11-25 after a review against the code of Phases 0–3 (decisions R1–R12 below).
+Amended by the owner on 2026-11-25 after two reviews against the code of Phases 0–3 (decisions R1–R31 below).
 
 ## v0.1 — A recorded timeline for PostgreSQL
 
@@ -47,18 +47,37 @@ changed outside the timeline. The first consumer is not the design target.
 
 | # | Item | Decision |
 |---|---|---|
-| R1 | Step archive | The ledger stores a step's checksum, never its SQL, so a replay has nothing to run. A new own table archives the SQL of each applied step, keyed by checksum, append-only, written by `apply`; the ledger is unchanged (the pattern of C6). A step applied before the archive exists replays only from a supplied changeset whose checksum matches. Phase 5. |
-| R2 | Baseline schema dump | The fingerprint cannot regenerate a schema (no column order, sequences, types, triggers or partition bounds). The consumer supplies a schema dump as a file; Caverns stores it with the baseline and never runs `pg_dump` itself. Phase 5. |
-| R3 | Scratch database | Timewalking refuses a scratch target that is the source database or is not empty. Who creates the scratch database is a Phase 5 sign-off item. |
-| R4 | Drift is recorded | Today `apply` logs drift as a warning and then records a fingerprint that absorbs it, leaving no trace. The differences found before an apply are recorded in a new append-only own table. An `on_drift` choice of warn (default) or refuse on `apply` is a Phase 4 sign-off item. Phase 4. |
-| R5 | Murozond sign-off widened | The acknowledgement parameter on `apply` and `preflight`, the `chromie status` output and exit code for a destructive or unknown step, the classifier approach without a SQL parser (no runtime dependency) and whether an acknowledgement is recorded join the Phase 4 sign-off. |
-| R6 | Phase split | Old Phase 4 becomes Phase 4 (Murozond) and Phase 5 (Timewalking), one pull request each; adoption and release become Phase 7. |
-| R7 | Write commands | New Phase 6: `chromie install`, `chromie apply DIRECTORY` and `chromie baseline`, so a project with a directory of SQL files adopts without writing Python. Amends C2 ("all read-only") and E6; D3 stands: the library API stays the integration point for a consumer with its own runner. `snapshot`, `track` and `untrack` commands are a Phase 6 sign-off item. |
-| R8 | `chromie show VERSION` | Prints the archived SQL a ledger row ran. Phase 5. |
-| R9 | Release readiness | Phase 7 gains a commit: the `py.typed` marker, classifiers, a release workflow, CI on every supported Python version (not the PostgreSQL matrix, which stays deferred), the database privileges Caverns needs, a known-limitations section and a stability statement for the JSON output. |
-| R10 | Non-transactional statements | Stay out of v0.1 (N4). The adoption guide documents the way through: run the statement outside Caverns, give the step a check, `accept` it. A `Step` flag joins Later; it is pulled into v0.1 only if the first consumer needs it. |
-| R11 | Timeouts | `apply` sets no `lock_timeout` or `statement_timeout` and waits on its advisory lock without limit. v0.1 documents the session-level settings in the adoption guide; a parameter joins Later. |
-| R12 | Later list | Epochs extras, wider fingerprint coverage with `drift --accept`, and ledger tamper evidence join Later (listed there). |
+| R1 | Step archive | The ledger stores a step's checksum, never its SQL, so a replay has nothing to run. A new own table archives the SQL of each applied step, keyed by checksum, append-only, written by `apply`; the ledger is unchanged (the pattern of C6). A step applied before the archive exists replays only from a supplied changeset whose checksum matches. Phase 6. |
+| R2 | Baseline schema dump | The fingerprint cannot regenerate a schema (no column order, sequences, types, triggers or partition bounds). The consumer supplies a schema dump as a file; Caverns stores it with the baseline and never runs `pg_dump` itself. Phase 6. |
+| R3 | Scratch database | Timewalking refuses a scratch target that is the source database or is not empty. Who creates the scratch database is a Phase 6 sign-off item. |
+| R4 | Drift is recorded | Today `apply` logs drift as a warning and then records a fingerprint that absorbs it, leaving no trace. The differences found before an apply are recorded in a new append-only own table. An `on_drift` choice of refuse (*proposed default*, R25) or warn on `apply` is a Phase 5 sign-off item. Phase 5. |
+| R5 | Murozond sign-off widened | The acknowledgement parameter on `apply` and `preflight`, the `chromie status` output and exit code for a destructive or unknown step, the classifier approach without a SQL parser (no runtime dependency) and whether an acknowledgement is recorded join the Phase 5 sign-off. |
+| R6 | Phase split | Old Phase 4 becomes Murozond and Timewalking, one pull request each (Phases 5 and 6 after R13); adoption and release follow the write commands. |
+| R7 | Write commands | New Phase 7: `chromie install`, `chromie apply DIRECTORY` and `chromie baseline`, so a project with a directory of SQL files adopts without writing Python. Amends C2 ("all read-only") and E6; D3 stands: the library API stays the integration point for a consumer with its own runner. `snapshot`, `track` and `untrack` commands are a Phase 7 sign-off item. |
+| R8 | `chromie show VERSION` | Prints the archived SQL a ledger row ran. Phase 6. |
+| R9 | Release readiness | Phase 8 gains a commit: the `py.typed` marker, classifiers, a release workflow, CI on every supported Python version (not the PostgreSQL matrix, which stays deferred), the database privileges Caverns needs, a known-limitations section and a stability statement for the JSON output. |
+| R10 | Non-transactional statements | Superseded by R24: steps that cannot run in a transaction join v0.1. |
+| R11 | Timeouts | Superseded by R20: `apply` sets a default `lock_timeout`. |
+| R12 | Later list | Epochs extras, wider fingerprint coverage with `drift --accept`, and ledger tamper evidence join Later (listed there; R26 pulls part of the coverage into v0.1). |
+| R13 | Hardening phase | A second review (migration tooling, PostgreSQL operations, library engineering) found hazards in what Phases 1–3 built. New Phase 4 fixes them before new components are added; the later phases shift by one. |
+| R14 | Step before the baseline | A step added at or before the baseline's step is today treated as applied and never runs. Preflight reports it with its own status and `apply` refuses until it is acknowledged. Amends N3. Phase 4. |
+| R15 | Recorded error | A `failed` row keeps the driver's whole message for good, and a failing statement can quote a secret literal. The row keeps the error code and the primary message only; the docs state that step SQL must not carry secrets. Phase 4. |
+| R16 | Row-level security | A snapshot of a table under row-level security copies only the rows its role sees and records success. Refused unless the role bypasses row security (*proposed*; recording the fact per table is the alternative). Phase 4. |
+| R17 | Session lock release | The snapshot's session advisory lock ignores a failed unlock, which a transaction-mode connection pooler can cause. The result is checked and raised; a session-mode pooler is a documented requirement. Phase 4. |
+| R18 | Fingerprint settings | The fingerprint is read with `search_path` pinned but not the output settings, so a definition can read differently between sessions or minor versions. It is read under the pinned settings of E8 and records the server version. Phase 4. |
+| R19 | Own-step checksums | Only the `ledger` step's checksum is pinned by a test. Every own step's checksum is pinned, so an accidental edit cannot make `install` refuse after a release. Phase 4. |
+| R20 | Lock timeout | `apply` and `snapshot` set a default `lock_timeout` for their own lock and for each step, overridable by a parameter. Supersedes R11. Phase 4. |
+| R21 | Privilege model | `install` accepts an existing `caverns` schema of any owner and revokes nothing. It checks the owner, revokes access from `PUBLIC` and documents the grants a runner role needs. The docs state that the append-only triggers guard against mistakes, not against the schema's owner or a superuser. Phase 4. |
+| R22 | Standby and replication | A write on a standby is refused with a Caverns error, not a driver error. Logical replication of the `caverns` schema is unsupported and listed under known limitations. Phase 4. |
+| R23 | Lock hazards | Murozond also flags statements that take long locks or rewrite a table (`CREATE INDEX` without `CONCURRENTLY`, `ADD CONSTRAINT` without `NOT VALID`, `ALTER COLUMN TYPE`, `SET NOT NULL`). The list is a Phase 5 sign-off item. |
+| R24 | Non-transactional steps | A flag on `Step` runs a step outside a transaction and records it. Supersedes R10. Phase 5. |
+| R25 | Drift default | `on_drift` refuses by default (*proposed*, confirmed at the Phase 5 sign-off), with an explicit way to proceed. Amends R4. |
+| R26 | Fingerprint coverage | Triggers, row-level-security flags and policies, and enum labels join the fingerprint before the drift record is built. Amends C4. Phase 5. Grants, sequences, other types, extensions, storage options and publications stay Later. |
+| R27 | Snapshot size | A snapshot estimates the size of what it copies and checks the key size before copying; the cost of its long transaction is documented. Batching stays Later. Phase 4. |
+| R28 | Search path of steps | A step runs under the caller's `search_path`. The adoption guide requires schema-qualified steps; pinning a declared schema in `apply` is a Phase 4 sign-off item. |
+| R29 | Release practice | Phase 8's release readiness (R9) also covers: a CI job that builds the wheel and sdist, checks their contents and runs `chromie` from a clean install; a stability and deprecation policy naming the public surface; trusted publishing from a protected environment, the tag equal to the version, a rehearsal on the test index; the supported Python versions in CI and a statement of the tested PostgreSQL version; a coverage threshold; format and file-hygiene checks; a `NullHandler` on the library logger; current licence metadata and project links; a dependency-update cooldown and dependency review on pull requests; a code of conduct and an issue template; a `schema_version` key in the JSON output. `chromie --version` lands in Phase 7. |
+| R30 | The name | The project name and the codenames, which are import paths, come from a game franchise, and a rename after publishing is a breaking change. Before anything is published the owner checks the name's availability on the package index and its trademark exposure and confirms or changes it: a Phase 8 sign-off item, taken early. |
+| R31 | Later and not planned | A run identifier tying one apply's rows together, property-based tests for the checksum and the classifier, and batched snapshots join Later. Not planned: expand-and-contract orchestration, declarative schema diff, OpenTelemetry hooks, shell completion, mutation testing, a separate SBOM. |
 
 ### Status
 
@@ -68,10 +87,11 @@ changed outside the timeline. The first consumer is not the design target.
 | 1 — Nozdormu | Merged | [#2](https://github.com/Deluha/caverns-of-time/pull/2) |
 | 2 — Chromie and Infinite | Merged | [#3](https://github.com/Deluha/caverns-of-time/pull/3) |
 | 3 — Epochs | Merged | [#4](https://github.com/Deluha/caverns-of-time/pull/4) |
-| 4 — Murozond | Not started | |
-| 5 — Timewalking | Not started | |
-| 6 — Chromie write commands | Not started | |
-| 7 — First consumer adoption and release | Not started | |
+| 4 — Hardening | Not started | |
+| 5 — Murozond | Not started | |
+| 6 — Timewalking | Not started | |
+| 7 — Chromie write commands | Not started | |
+| 8 — First consumer adoption and release | Not started | |
 
 ### Running a phase
 
@@ -87,7 +107,7 @@ is merged. Kick-off prompt: "Implement Phase N of `ROADMAP.md` following its Run
    findings are fixed in further commits and reviewed again.
 5. **Deliver.** One pull request for the phase; the phase's Status row names it ("In review"). The next
    phase's first commit sets the previous row to "Merged". Each phase adds its entry to one
-   "v0.1.0 — in development" section at the top of `RELEASE_NOTES.md`; Phase 7 turns it into the release
+   "v0.1.0 — in development" section at the top of `RELEASE_NOTES.md`; Phase 8 turns it into the release
    entry and removes the v0.1 section from this file.
 6. **Stay in scope.** The scope rules bind every phase. A phase that finds an agreed item infeasible, or
    needs something not listed here, stops and asks the owner; it never narrows or widens scope itself.
@@ -210,22 +230,48 @@ Sign-off decisions (owner, 2026-11-23: E1–E7 confirmed as recommended; E8 conf
 | E7 | Commits | As the table above; the own step `epochs` lands in commit 1 with all five tables. |
 | E8 | Review amendment | A snapshot prints its values under pinned settings, transaction-local: `TimeZone` `UTC`, `IntervalStyle` `postgres`, `extra_float_digits` `1`, `bytea_output` `hex`, `DateStyle` `ISO, MDY`, `lc_monetary` `C`, so what `epoch_row.row` stores does not depend on the caller's session. `delete(conn, names, *, dry_run=False)`: with `dry_run` the same checks and errors, returns the epochs it would delete and writes nothing; `chromie delete-epoch` uses it for `--dry-run` and its confirmation. A key column whose type differs between two epochs is a key that differs (`diff` refuses the table). A primary key's `INCLUDE` columns are not key columns. A declined confirmation exits 0. The guidance's "history tables" wording becomes "the epoch tables". |
 
-### Phase 4 — Murozond
+### Phase 4 — Hardening
+
+Fixes what the second review found in Phases 1–3 (R13–R22, R27, R28). No new component.
 
 | Commit | Content |
 |---|---|
-| 1 | Murozond: classify each step's SQL as safe, destructive or unknown. |
-| 2 | Murozond wired into preflight and apply: a destructive or unknown step needs an explicit acknowledgement. |
+| 1 | Every own step's checksum pinned by a test (R19). |
+| 2 | A step at or before the baseline's step without a row: its own preflight status, refused by apply until acknowledged (R14). |
+| 3 | A `failed` row records the error code and primary message only (R15). |
+| 4 | Default `lock_timeout` in apply and snapshot, with a parameter (R20). |
+| 5 | Privilege model: owner check and revoked public access at install (R21). |
+| 6 | A standby is refused with a Caverns error; the session lock's release is checked (R22, R17). |
+| 7 | Fingerprint read under pinned output settings; server version recorded (R18). |
+| 8 | Snapshot: row-level security refusal, size estimate and key-size check (R16, R27). |
+| 9 | Docs and release-notes entry. |
+
+Sign-off: the new status's name and how it is acknowledged; what a `failed` row keeps; the default timeout's
+value (5 seconds — *proposed*) and the parameter on `apply` and `snapshot`; the owner check, the grants and
+what `install` does with a schema of another owner, and whether these arrive as a new own step; whether the
+fingerprint change alters recorded hashes; refusal or record for row-level security; the snapshot size
+limits; whether `apply` pins a declared schema (R28).
+
+### Phase 5 — Murozond
+
+| Commit | Content |
+|---|---|
+| 1 | Murozond: classify each step's SQL as safe, destructive, lock hazard or unknown (R23). |
+| 2 | Murozond wired into preflight and apply: a destructive, lock-hazard or unknown step needs an explicit acknowledgement. |
 | 3 | `chromie status` shows each step's classification. |
-| 4 | Drift record (R4): the differences found before an apply are stored in a new own table. |
-| 5 | Docs and release-notes entry. |
+| 4 | Steps that cannot run in a transaction: a flag on `Step` (R24). |
+| 5 | Fingerprint covers triggers, row-level-security flags and policies, and enum labels (R26). |
+| 6 | Drift record (R4): the differences found before an apply are stored in a new own table; `on_drift`. |
+| 7 | Docs and release-notes entry. |
 
-Sign-off: the list of statements treated as destructive; how SQL inside function bodies and `DO` blocks is
-classified; the classifier approach without a SQL parser; the acknowledgement parameter on `apply` and
-`preflight` and whether an acknowledgement is recorded; the `chromie status` output and exit code; the drift
-record's layout and the `on_drift` choice (warn — *proposed default* — or refuse).
+Sign-off: the list of statements treated as destructive and the list treated as lock hazards; how SQL inside
+function bodies and `DO` blocks is classified; the classifier approach without a SQL parser; the
+acknowledgement parameter on `apply` and `preflight` and whether an acknowledgement is recorded; the
+`chromie status` output and exit code; the `Step` flag's name, how a failure is recorded without a rollback
+and what is said about an invalid index left behind; the new fingerprint kinds; the drift record's layout and
+the `on_drift` default (refuse — *proposed* — or warn).
 
-### Phase 5 — Timewalking
+### Phase 6 — Timewalking
 
 | Commit | Content |
 |---|---|
@@ -239,28 +285,30 @@ record's layout and the `on_drift` choice (warn — *proposed default* — or re
 Sign-off: the archive table's layout and whether a step's check is archived; how the dump is supplied and
 stored, and what a baseline taken before this phase does; who creates the scratch database and how it is
 named to Timewalking (a second connection string — *proposed*); the refusals of R3; how a step with no
-archived SQL is replayed; the `timewalk` and `show` output and exit codes.
+archived SQL is replayed; the `timewalk` and `show` output and exit codes; how archived SQL that carries a
+secret is handled (R15).
 
-### Phase 6 — Chromie write commands
+### Phase 7 — Chromie write commands
 
 | Commit | Content |
 |---|---|
 | 1 | `chromie install`. |
 | 2 | `chromie apply DIRECTORY`: preflight, Murozond's acknowledgements, apply. |
 | 3 | `chromie baseline`. |
-| 4 | Docs and release-notes entry. |
+| 4 | `chromie --version`. |
+| 5 | Docs and release-notes entry. |
 
 Sign-off: command names, flags and output; confirmation and `--yes` behaviour (as `delete-epoch`, E6); how
 `reapply`, `accept` and Murozond's acknowledgements are given on the command line; a `--dry-run` for
 `apply`; exit codes; whether `snapshot`, `track` and `untrack` commands join.
 
-### Phase 7 — First consumer adoption and release
+### Phase 8 — First consumer adoption and release
 
 | Commit | Content |
 |---|---|
-| 1 | Adoption guide: installing the package, writing an adapter, taking the baseline, the database privileges Caverns needs, non-transactional statements (R10), lock and statement timeouts (R11). |
+| 1 | Adoption guide: installing the package, writing an adapter, taking the baseline, the database privileges Caverns needs, schema-qualified steps (R28), the session-mode pooler requirement (R17), the connection string in the environment rather than on the command line. |
 | 2 | End-to-end test: a sample consumer project with a tuple-style changeset list, run through an adapter. |
-| 3 | Release readiness (R9): `py.typed`, classifiers, release workflow, CI on every supported Python version, known limitations, JSON output stability statement. |
+| 3 | Release readiness (R9, R29): packaging and typing marker, built-distribution check in CI, stability policy, release workflow, supported versions, coverage and format gates, community files, known limitations, JSON output version. |
 | 4 | v0.1.0 release: version, release notes, this section removed. |
 
 The consumer side is a separate pull request in the consumer's own repository, under that repository's own
@@ -268,16 +316,20 @@ rules.
 
 Sign-off: how the first consumer installs the package (git dependency or a package index); who takes the
 baseline on the live database and when; whether the first consumer uses Epochs at all; which Python versions
-are supported; where the release is published.
+are supported; where the release is published; the project name (R30); the stability policy's terms.
 
 ### Later (not in v0.1)
 
 - Row-level history by trigger for slowly changing tables.
 - A PostgreSQL version matrix.
 - Rollback (down) steps.
-- Steps that cannot run in a transaction (`CREATE INDEX CONCURRENTLY`): a flag on `Step`.
-- Lock and statement timeout parameters on `apply`.
 - Epochs: snapshot of a subset of tables, a key filter on `as-of`, export and restore of an epoch,
-  keep-last-N retention.
-- Fingerprint coverage of triggers, sequences, types, extensions and grants; `drift --accept`.
+  keep-last-N retention, batched snapshots.
+- Fingerprint coverage of grants, sequences, other types, extensions, storage options and publications;
+  `drift --accept`.
 - Ledger tamper evidence: a hash chain over the rows and a `chromie verify`.
+- A run identifier tying one apply's ledger rows, fingerprint and drift record together.
+- Property-based tests for the checksum and the classifier.
+
+Not planned: expand-and-contract orchestration, declarative schema diff, OpenTelemetry hooks, shell
+completion, mutation testing, a separate SBOM (R31).
