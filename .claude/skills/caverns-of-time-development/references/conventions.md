@@ -12,7 +12,10 @@ adapter that lives in the consumer's repository; a sample consumer in `tests/` i
 an exception. Schema, table and column names Caverns works on always arrive as arguments or
 configuration, never as constants.
 
-Enforced: C1 (known consumer names), review for the rest.
+No consuming project (its name, repository, schema or other detail) is named anywhere in this repository —
+docs, guidance, tests and tooling included.
+
+Enforced: C1 (known consumer names, all paths and text files), review for the rest.
 
 ## R2 one canonical helper
 

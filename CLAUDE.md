@@ -35,8 +35,9 @@ simplicity audit (`.claude/skills/caverns-of-time-development/references/convent
 
 Binding short form; the full form of rule N is the anchored section.
 
-1. **Generic core** — no consumer's name, schema, table or convention inside the package; a consumer integrates
-   through an adapter in its own repository → `.claude/skills/caverns-of-time-development/references/conventions.md#r1`
+1. **Generic core** — no consumer's name, schema, table or convention inside the package, and no consuming project
+   named anywhere in the repository; a consumer integrates through an adapter in its own repository
+   → `.claude/skills/caverns-of-time-development/references/conventions.md#r1`
 2. **One canonical helper** — shared helpers are defined once and imported, never re-implemented; library code logs
    through `logging`, CLI output goes through the console helpers, never raw `print`
    → `.claude/skills/caverns-of-time-development/references/conventions.md#r2`

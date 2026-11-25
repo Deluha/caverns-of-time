@@ -1,15 +1,17 @@
 """Mechanical convention checks C1–C9 for the hard rules of CLAUDE.md.
 
-Each check is a pure function over (path, source) pairs or a file list, so the
-tests feed it synthetic input; main() wires the tracked files of the real
-repository. Exit 0 = clean, 1 = violations, 2 = a git failure (never green).
-Stdlib only. Rule table and exemptions: the skill's
-references/checkers.md#checker-project-conventions.
+Each check is a pure function over (path, source) pairs or a file list, so
+the tests feed it synthetic input; main() wires the tracked files of the
+real repository. Exit 0 = clean, 1 = violations, 2 = a git failure (never
+green). C1 matches banned consumer names by SHA-256 digest, so the names
+stay out of the repository. Stdlib only. Rule table and exemptions: the
+skill's references/checkers.md#checker-project-conventions.
 """
 
 from __future__ import annotations
 
 import ast
+import hashlib
 import re
 import sys
 from collections.abc import Iterable, Iterator
@@ -23,8 +25,14 @@ from dev_tools.check_docs_sync import GitError, git  # noqa: E402
 PACKAGE = "caverns_of_time/"
 TESTS = "tests/"
 
-# C1: names of consuming projects; none may appear inside the package.
-CONSUMER_TOKENS = ("acme",)
+# C1: (length, SHA-256 hex digest) of each lowercase name of a consuming project; no such name may appear
+# anywhere in the repository, as a substring of any word. To add a name:
+#   python -c "import hashlib; w = b'<lowercase word>'; print(len(w), hashlib.sha256(w).hexdigest())"
+# Hashing keeps the name out of the repository; it is not a secret.
+CONSUMER_TOKENS: frozenset[tuple[int, str]] = frozenset(
+    {(9, "07de97ba846bea2c77ab629017947804aa3bd8880dd65eea0cf5357b9cedf6b1")}
+)
+WORD_RE = re.compile(r"[a-z0-9]+")
 # C2: the one package module allowed to call print().
 CONSOLE_MODULE = PACKAGE + "console.py"
 # C3: cursor / connection methods whose first argument is a SQL statement.
@@ -61,16 +69,36 @@ def _package_sources(sources: Iterable[Source]) -> Iterator[Source]:
     return ((p, s) for p, s in sources if p.startswith(PACKAGE) and p.endswith(".py"))
 
 
-def check_generic_core(sources: Iterable[Source]) -> list[str]:
-    """C1 (R1): no consumer name inside the package."""
+def _banned_names(word: str, tokens: frozenset[tuple[int, str]]) -> list[str]:
+    """The substrings of `word` whose (length, SHA-256) is a banned token."""
+    return [
+        part
+        for size in sorted({size for size, _ in tokens})
+        for part in (word[i : i + size] for i in range(len(word) - size + 1))
+        if (size, hashlib.sha256(part.encode()).hexdigest()) in tokens
+    ]
+
+
+def check_generic_core(
+    files: Iterable[str], sources: Iterable[Source], tokens: frozenset[tuple[int, str]] = CONSUMER_TOKENS
+) -> list[str]:
+    """C1 (R1): no banned consumer name, case-insensitive, inside any word of a path or a text line."""
     out = []
+    cache: dict[str, list[str]] = {}  # each distinct word is matched once
+
+    def names(text: str) -> list[str]:
+        found: list[str] = []
+        for word in WORD_RE.findall(text.lower()):
+            if word not in cache:
+                cache[word] = _banned_names(word, tokens)
+            found += cache[word]
+        return list(dict.fromkeys(found))
+
+    for path in files:
+        out += [f"{path}: C1 consumer name `{name}` in a path (R1)" for name in names(path)]
     for path, source in sources:
-        if not path.startswith(PACKAGE):
-            continue
         for number, line in enumerate(source.splitlines(), 1):
-            for token in CONSUMER_TOKENS:
-                if token in line.lower():
-                    out.append(f"{path}:{number}: C1 consumer name `{token}` inside the package (R1)")
+            out += [f"{path}:{number}: C1 consumer name `{name}` in the repository (R1)" for name in names(line)]
     return out
 
 
@@ -239,7 +267,7 @@ def check_test_skips(sources: Iterable[Source]) -> list[str]:
 
 def run_all(files: list[str], sources: list[Source]) -> list[str]:
     return (
-        check_generic_core(sources)
+        check_generic_core(files, sources)
         + check_no_print(sources)
         + check_safe_sql(sources)
         + check_file_locations(files)
@@ -252,14 +280,19 @@ def run_all(files: list[str], sources: list[Source]) -> list[str]:
 
 
 def repo_inputs(repo_root: Path = REPO_ROOT) -> tuple[list[str], list[Source]]:
-    """Tracked plus untracked-but-not-ignored files that exist, and the text of the package and test files."""
+    """Tracked plus untracked-but-not-ignored files that exist, and the text of those that decode as UTF-8.
+
+    A package or test source (`.py`, `.sql`, `.md`) that does not decode raises; any other such file is skipped.
+    """
     listed = git("ls-files", "--cached", "--others", "--exclude-standard").splitlines()
     files = sorted({f for f in listed if (repo_root / f).is_file()})
-    sources = [
-        (f, (repo_root / f).read_text(encoding="utf-8"))
-        for f in files
-        if f.startswith((PACKAGE, TESTS)) and f.endswith((".py", ".sql", ".md"))
-    ]
+    sources = []
+    for f in files:
+        try:
+            sources.append((f, (repo_root / f).read_text(encoding="utf-8")))
+        except UnicodeDecodeError:
+            if f.startswith((PACKAGE, TESTS)) and f.endswith((".py", ".sql", ".md")):
+                raise  # a source file the checks parse must decode
     return files, sources
 
 

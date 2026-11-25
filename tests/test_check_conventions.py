@@ -2,14 +2,48 @@
 
 from __future__ import annotations
 
+import hashlib
+import re
+
 from dev_tools import check_conventions as cc
 
 PKG = "caverns_of_time/"
 
 
-def test_c1_consumer_name_in_package_only() -> None:
-    out = cc.check_generic_core([(PKG + "a.py", '"""Doc."""\nX = "Project Acme"\n'), ("tests/t.py", "acme")])
-    assert out == [f"{PKG}a.py:2: C1 consumer name `acme` inside the package (R1)"]
+BANNED = frozenset({(4, hashlib.sha256(b"acme").hexdigest())})
+
+
+def test_c1_consumer_name_anywhere_in_the_repository() -> None:
+    sources = [
+        (PKG + "a.py", '"""Doc."""\nX = "Acme"\n'),
+        ("docs/notes.md", "clean\nsee Project_Acme here\n"),
+        ("tests/t.py", "ACME"),
+        ("README.md", "nothing to see\n"),
+    ]
+    assert cc.check_generic_core([], sources, BANNED) == [
+        f"{PKG}a.py:2: C1 consumer name `acme` in the repository (R1)",
+        "docs/notes.md:2: C1 consumer name `acme` in the repository (R1)",
+        "tests/t.py:1: C1 consumer name `acme` in the repository (R1)",
+    ]
+
+
+def test_c1_glued_forms_and_one_report_per_line() -> None:
+    for text in ("AcmeAdapter", "ProjectAcme", "acmes", "acmedb", "xacme", "acme2", "a1acme"):
+        assert len(cc.check_generic_core([], [("a.md", text)], BANNED)) == 1, text
+    assert len(cc.check_generic_core([], [("a.md", "acme and Acme, acmedb\n")], BANNED)) == 1
+    assert cc.check_generic_core([], [("a.md", "ac me\nacm\n")], BANNED) == []
+
+
+def test_c1_path_hit() -> None:
+    out = cc.check_generic_core(["docs/Acme_notes/x.bin", "docs/ok.bin"], [], BANNED)
+    assert out == ["docs/Acme_notes/x.bin: C1 consumer name `acme` in a path (R1)"]
+
+
+def test_c1_real_constant_shape() -> None:
+    assert cc.CONSUMER_TOKENS
+    for size, digest in cc.CONSUMER_TOKENS:
+        assert isinstance(size, int) and size > 0
+        assert re.fullmatch(r"[0-9a-f]{64}", digest)
 
 
 def test_c2_print_outside_console_module() -> None:
