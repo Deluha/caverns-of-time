@@ -19,7 +19,10 @@ Named after the keepers of time in Warcraft lore. Each arrives in its roadmap ph
 | **Infinite** | Drift detector: live schema versus what the ledger says | 2 |
 | **Epochs** | Run-level snapshots of opted-in tables | 3 |
 | **Murozond** | Destructive-change guard on a changeset before apply | 4 |
-| **Timewalking** | Rebuild the schema at a past ledger version in a scratch database | 4 |
+| **Timewalking** | Rebuild the schema at a past ledger version in a scratch database | 5 |
+
+The name and the component codenames are a homage to World of Warcraft. This project is not affiliated with,
+endorsed by or sponsored by Blizzard Entertainment.
 
 ## Install
 
