@@ -75,6 +75,8 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON caverns.epoch_table TO runner;  -- the m
 GRANT DELETE ON caverns.epoch_row TO runner;                           -- `delete` removes a deleted epoch's rows
 ```
 
+A run with `on_drift="warn"` that fails records its `failed` row together with the drift, so a runner without the
+`caverns.drift` grant cannot record that failure (a `CavernsError`, as for any unrecordable failure).
 Reading (`preflight`, `history`, `drift`, `catalog`, `as_of`, `diff`) needs `USAGE` and `SELECT` only. `install`
 runs as the schema's owner or a member of the owner's role that inherits its privileges. The append-only triggers guard against mistakes, not
 against the schema's owner or a superuser, who can drop or disable them. **Upgrade:** run `install()` once after
@@ -222,8 +224,8 @@ It is append-only like the ledger: triggers reject UPDATE, DELETE and TRUNCATE (
 generic trigger function the step creates and revokes from `PUBLIC` itself). It holds the classification, never the SQL.
 **Upgrade:** run `install()` once after upgrading, as the schema's owner; it applies `acknowledgement`. Until then
 `preflight`, `apply` and `baseline` raise `LedgerNotInstalled` (the own changeset is not fully applied), so a runner
-role cannot apply either: grant it the privilege above on `caverns.acknowledgement` after `install`. Statements that cannot run inside a transaction (`CREATE INDEX CONCURRENTLY`) are
-unsupported in v0.1: such a step fails and is recorded as a failed step.
+role cannot apply either: grant it the privilege above on `caverns.acknowledgement` after `install`. A statement that cannot run inside a transaction (`CREATE INDEX CONCURRENTLY`) is
+supported through the `-- caverns:no-transaction` marker (see the model and "A step outside a transaction").
 
 **The drift table.** `caverns.drift`, created by the own step `drift`, holds one row per run that proceeded past drift
 (`on_drift="warn"` and at least one difference):
@@ -750,6 +752,9 @@ With nothing found: `✅ No drift — the live schema matches the fingerprint at
   `Risk` (`safe`, `destructive`, `lock_hazard` or `unknown`, a `StrEnum` whose values are those strings) and a tuple
   of `Finding(risk, statement, reason)` values (`risk` never `safe`, `statement` 1-based, `reason` fixed keyword
   text), in statement order and then action order. It raises nothing for any text, runs no SQL and reads no database.
+- The tables `caverns.acknowledgement` (one row per acknowledged step that ran) and `caverns.drift` (one row per run
+  that proceeded past drift) are append-only own tables, created by the own steps `acknowledgement` and `drift`;
+  their columns are documented above, and no function reads them in this release: query them.
 - The public names are `Connection`, `LedgerEntry`, `Status`, `StepStatus`, `Step`, `Changeset`, `Fingerprint`,
   `Difference`, `Drift`, `Classification`, `Finding`, `Risk`, `TrackedTable`, `Epoch`, `EpochTable`, `Column`, `TableAt`, `EpochDiff`, `TableDiff`, `ColumnChange`, `RowChange` and the functions above; the exceptions, all in `caverns_of_time.errors`, are
   `CavernsError` (the base), `ChangesetError`, `LedgerNotInstalled`, `PreflightRefused`, `GuardRefused`, `DriftRefused`, `StepFailed`,
@@ -771,6 +776,8 @@ With nothing found: `✅ No drift — the live schema matches the fingerprint at
 - Murozond reads keywords, not a parse tree: a construct it does not model is read by its leading keywords, and a
   `DO` block, a function body and dynamic SQL are never read. A volatile `DEFAULT` on `ADD COLUMN` and
   `SET ACCESS METHOD` rewrite a table and are not flagged.
+- The drift check runs in its own transaction before the first step: drift made between it and the first step is not
+  seen, and the run's fingerprint absorbs it unrecorded.
 - Logical replication of the `caverns` schema is unsupported: the ledger, fingerprint and epoch tables are not
   designed to be replicated, and a subscriber's copy is not a ledger Caverns can write.
 
