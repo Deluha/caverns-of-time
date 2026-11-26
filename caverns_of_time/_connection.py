@@ -3,7 +3,7 @@
 Not public: the components import it, a consumer imports `Connection` from `nozdormu`. Input: a DB-API 2.0
 connection (autocommit off). Output: cursors in transactions Caverns commits or rolls back itself, the advisory
 lock every Caverns write takes (per transaction, or per session ahead of a REPEATABLE READ transaction), and the
-validation and catalog helpers the components share (names, limits, the pinned search path and output settings).
+validation and catalog helpers the components share (names, limits, the pinned search path and settings).
 """
 
 from __future__ import annotations
@@ -25,6 +25,7 @@ __all__ = [
     "check_writable",
     "lock",
     "names",
+    "pin_definition_settings",
     "pin_output_settings",
     "pin_search_path",
     "read_only",
@@ -96,6 +97,12 @@ _PIN_OUTPUT_SETTINGS_SQL = (
     "SELECT set_config('TimeZone', 'UTC', true), set_config('IntervalStyle', 'postgres', true),"
     " set_config('extra_float_digits', '1', true), set_config('bytea_output', 'hex', true),"
     " set_config('DateStyle', 'ISO, MDY', true), set_config('lc_monetary', 'C', true)"
+)
+# On top of the output settings, the ones that change how a definition prints: `pg_get_viewdef`, `pg_get_expr` and
+# `pg_get_functiondef` quote every identifier under `quote_all_identifiers`, and read a string literal by
+# `standard_conforming_strings`.
+_PIN_DEFINITION_SETTINGS_SQL = (
+    "SELECT set_config('quote_all_identifiers', 'off', true), set_config('standard_conforming_strings', 'on', true)"
 )
 _LIMIT_MAX = 2**63 - 1  # a bigint, what `LIMIT` takes
 # True only when all five epoch tables exist. Used by the `epochs` own step's check (nozdormu) and by the epoch
@@ -302,6 +309,17 @@ def pin_output_settings(cursor: Cursor) -> None:
     Until the transaction ends, so what a snapshot stores does not depend on the session that took it.
     """
     cursor.execute(_PIN_OUTPUT_SETTINGS_SQL)
+
+
+def pin_definition_settings(cursor: Cursor) -> None:
+    """Pin the settings that shape how a catalog prints a definition: the output settings, identifier quoting and
+    string literals.
+
+    Until the transaction ends; the caller's session is untouched. The fingerprint reads under them, so its hash
+    does not depend on the session that took it.
+    """
+    pin_output_settings(cursor)
+    cursor.execute(_PIN_DEFINITION_SETTINGS_SQL)
 
 
 def validate_limit(limit: object) -> None:

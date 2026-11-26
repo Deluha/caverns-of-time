@@ -18,6 +18,7 @@ from caverns_of_time._fingerprint import (
     capture,
     compare,
     compared_schemas,
+    fingerprint_current,
     fingerprint_table_exists,
     latest,
     named_schemas,
@@ -70,7 +71,8 @@ def drift(
     read-only transaction reads the fingerprint, runs the checks and reads the catalogs. *schemas* narrows the
     report to some of the compared schemas (`Drift.schemas` holds the narrowed set). With a
     *changeset*, a step recorded as applied whose check is now false is a disagreement. Raises
-    `LedgerNotInstalled` before `install()`, `NoFingerprint` when none is recorded yet, `ChangesetError` for an
+    `LedgerNotInstalled` before `install()` (or before the `install()` that adds the fingerprint table's
+    `server_version` column), `NoFingerprint` when none is recorded yet, `ChangesetError` for an
     unwatched schema or bad *schemas*, and the errors of `preflight` for a *changeset*.
     """
     check_connection(connection)
@@ -81,6 +83,10 @@ def drift(
             raise LedgerNotInstalled(
                 "the fingerprint table is not installed (caverns.fingerprint does not exist): call install()"
             )
+        if not fingerprint_current(cursor):
+            raise LedgerNotInstalled(
+                "the fingerprint table is out of date (caverns.fingerprint lacks server_version): call install()"
+            )
         found = latest(cursor)
         if found is None:
             raise NoFingerprint("no fingerprint is recorded yet: apply a changeset or take a baseline first")
@@ -90,7 +96,7 @@ def drift(
         if unwatched:
             raise ChangesetError(f"the schema {unwatched[0]!r} is not watched (watched: {', '.join(watched)})")
         compared = tuple(named if named is not None else watched)
-        # The checks run before the document is read: reading pins `search_path` to `pg_catalog` for the transaction.
+        # The checks run before the document is read: reading pins `search_path` and more.
         disagreements = tuple(
             status
             for status in statuses

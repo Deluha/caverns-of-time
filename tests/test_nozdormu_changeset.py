@@ -11,6 +11,7 @@ from pathlib import Path
 import pytest
 
 from caverns_of_time import _connection, _fingerprint, epochs, nozdormu
+from caverns_of_time._fingerprint import Fingerprint
 from caverns_of_time.errors import ChangesetError
 from caverns_of_time.nozdormu import Changeset, LedgerEntry, Status, Step, StepStatus
 
@@ -224,6 +225,15 @@ def test_the_ledger_column_lists_are_the_ledger_entry_fields() -> None:
     assert returning.group(1).split(", ") == columns
 
 
+def test_the_fingerprint_column_lists_are_the_version_and_the_fingerprint_fields() -> None:
+    columns = ["version", *(field.name for field in fields(Fingerprint))]
+    select = re.fullmatch(r"SELECT (.+?) FROM caverns\.fingerprint .*", _fingerprint._LATEST_FINGERPRINT_SQL)
+    insert = re.fullmatch(r"INSERT INTO caverns\.fingerprint \((.+?)\) VALUES .*", _fingerprint._RECORD_FINGERPRINT_SQL)
+    assert select and insert
+    assert select.group(1).split(", ") == columns
+    assert insert.group(1).split(", ") == columns
+
+
 @pytest.mark.parametrize(
     "table", ["ledger", "fingerprint", "epoch_table", "epoch_source", "epoch_row", "epoch_deletion"]
 )
@@ -241,9 +251,9 @@ def test_every_sql_constant_names_the_own_tables_in_the_own_schema(table: str) -
             assert qualifier == nozdormu._OWN_CHANGESET_NAME, name
 
 
-def test_the_own_changeset_is_the_ledger_fingerprint_epochs_and_privileges_steps() -> None:
+def test_the_own_changeset_is_the_ledger_fingerprint_epochs_privileges_and_fingerprint_server_steps() -> None:
     labels = [step.label for step in nozdormu._OWN_CHANGESET.steps]
-    assert labels == ["ledger", "fingerprint", "epochs", "privileges"]
+    assert labels == ["ledger", "fingerprint", "epochs", "privileges", "fingerprint_server"]
     assert all(step.check for step in nozdormu._OWN_CHANGESET.steps)
 
 
@@ -254,6 +264,7 @@ _OWN_STEP_CHECKSUMS = {
     "fingerprint": "69a4b5b9fe688d80e5089127f8f2c022dcdeb5d1aee13279a7ab0bd62bc8ba31",
     "epochs": "d35779e89163f27f628f153510a5030bac36a37e58ad9bdf59dcb4cb5ecb8b2f",
     "privileges": "e5c174e922f0240159a9531d986e7c6257df73bfa3d53ba61e94dcd149eaab76",
+    "fingerprint_server": "83988cb43b79b838e7d58659a1cee8003bcf20e3670b5025bd6f2bc0d8bde5fb",
 }
 
 

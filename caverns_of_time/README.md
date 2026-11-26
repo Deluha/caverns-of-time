@@ -35,15 +35,16 @@ sub-directories, is a step in file-name order, labelled with the file name minus
 readable from one file (`Step.from_file`).
 
 **Nozdormu, the ledger.** Every recorded change is a row of `caverns.ledger`. Caverns creates it itself:
-`install(connection)` applies Caverns' own changeset (named `caverns`, four steps: `ledger`, then `fingerprint`,
-the table of recorded fingerprints, then `epochs`, the epoch tables, then `privileges`, below) and records each step as a ledger row, in the same transaction as its DDL.
+`install(connection)` applies Caverns' own changeset (named `caverns`, five steps: `ledger`, then `fingerprint`,
+the table of recorded fingerprints, then `epochs`, the epoch tables, then `privileges`, below, then `fingerprint_server`,
+the fingerprint table's `server_version` column) and records each step as a ledger row, in the same transaction as its DDL.
 Installing again writes nothing and returns `[]`. Until the ledger exists, reading it behaves as an empty
-ledger; that is how the own changeset bootstraps. A database installed before the `fingerprint`, the `epochs` or
-the `privileges` step existed lacks its row: call `install()` again after upgrading, which applies each missing step
+ledger; that is how the own changeset bootstraps. A database installed before the `fingerprint`, the `epochs`, the
+`privileges` or the `fingerprint_server` step existed lacks its row: call `install()` again after upgrading, which applies each missing step
 as a pending step; until then `preflight`, `apply` and `baseline` raise `LedgerNotInstalled` (`history` needs only
 the ledger table and keeps working), and so do the epoch functions until `epochs` is applied. `drift` raises it before
 the `fingerprint` step; before the `epochs` step it does so only given a changeset (its `preflight` runs first):
-without one it checks only `caverns.fingerprint`. `install` records no fingerprint.
+without one it checks only `caverns.fingerprint` and its `server_version` column (`LedgerNotInstalled`: "the fingerprint table is out of date", until `install()` adds it). `install` records no fingerprint.
 
 **Nozdormu, privileges.** The own step `privileges` revokes every privilege of `PUBLIC` on the schema `caverns`,
 on its tables, its sequences and its functions (`REVOKE ALL ... FROM PUBLIC`); its check is that `PUBLIC` holds none
@@ -159,7 +160,11 @@ step's), which makes its schemas the watched schemas.
 **Infinite, the fingerprint.** `infinite.fingerprint(connection, *, schemas=None)` reads the shape of a
 database's schemas from the system catalogs, in one read-only transaction that writes nothing and is always
 rolled back, with `search_path` pinned to `pg_catalog` so that type, default and definition texts print the same
-whatever the session's path. The document is keyed by schema, then by kind, then by object name; every schema
+whatever the session's path, and with the settings that shape how a catalog prints a definition pinned for the
+transaction (the caller's session is untouched): `TimeZone` `UTC`, `IntervalStyle` `postgres`, `extra_float_digits` 1,
+`bytea_output` `hex`, `DateStyle` `ISO, MDY`, `lc_monetary` `C`, `quote_all_identifiers` `off` and
+`standard_conforming_strings` `on`. A hash does not depend on the session that took it, and a hash recorded under default
+settings is unchanged. The document is keyed by schema, then by kind, then by object name; every schema
 named appears with all six kinds, empty when it holds none, so an empty or dropped schema is visible:
 
 | Kind | Key | Value |
@@ -210,6 +215,7 @@ apply run that writes ledger rows and per baseline:
 | `document` | the fingerprint's document (`jsonb`) |
 | `hash` | its SHA-256 (64 lower-case hex digits) |
 | `recorded_at` | `clock_timestamp()` at insert |
+| `server_version` | the server's `server_version_num` when the fingerprint was read (`integer`, positive; added by the own step `fingerprint_server`; null for a row recorded before it). It sits beside the hash, not in it |
 
 It is append-only like the ledger: triggers reject UPDATE, DELETE and TRUNCATE. Truncating the ledger is also
 refused, by the foreign key, unless it cascades, and then by the ledger's trigger.
@@ -515,8 +521,10 @@ With nothing found: `✅ No drift — the live schema matches the fingerprint at
   row is written per step up to it). Raises
   `BaselineRefused` (the changeset has rows; a named schema that does not exist) and `ChangesetError` (a
   `through` the changeset lacks, a bare string for `schemas`, an empty `schemas`). It stores the fingerprint.
-- `infinite.fingerprint(connection, *, schemas=None) -> Fingerprint`: `Fingerprint(schemas, document, hash)`, a
-  frozen dataclass of the sorted, unique schema names (a tuple), the document and its SHA-256 hex; without
+- `infinite.fingerprint(connection, *, schemas=None) -> Fingerprint`: `Fingerprint(schemas, document, hash, server_version)`, a
+  frozen dataclass of the sorted, unique schema names (a tuple), the document, its SHA-256 hex and the server's
+  `server_version_num` read in the same transaction (`int | None`: None only for a row recorded before the
+  `fingerprint_server` step; the hash covers the document alone); without
   `schemas`, the watched ones. It runs in one read-only transaction and writes nothing. Raises `ChangesetError` for a bare string, a name that is not a string
   or an empty collection for `schemas`, and for a named schema that does not exist; the connection is checked as
   for every public function.
@@ -525,7 +533,7 @@ With nothing found: `✅ No drift — the live schema matches the fingerprint at
   schemas compared (a tuple), the `Difference(kind, name, change)` values (`kind` one of the six kinds, `change`
   `added`, `removed` or `changed`) and the `StepStatus` values of the disagreements, each a tuple. Read-only
   transactions, nothing written. Raises `LedgerNotInstalled` before
-  `install()` (the fingerprint table does not exist; given a *changeset*, also before the `epochs` step, by its
+  `install()` (the fingerprint table does not exist or lacks its `server_version` column; given a *changeset*, also before the `epochs` step, by its
   `preflight`), `NoFingerprint` when none is recorded, `ChangesetError`
   for a bad `schemas` or one that is not watched, and the errors of `preflight` for a `changeset`.
 - `epochs.register(connection, schema, table, *, key=None) -> TrackedTable`: opts the table in and returns its

@@ -38,6 +38,7 @@ from caverns_of_time._connection import (
 )
 from caverns_of_time._fingerprint import (
     FINGERPRINT_EXISTS_SQL,
+    FINGERPRINT_SERVER_SQL,
     capture,
     compare,
     compared_schemas,
@@ -381,6 +382,11 @@ WHERE NOT pg_has_role(current_user, owner_oid, 'MEMBER')
 ORDER BY rank, description
 LIMIT 1
 """
+# WARNING: this statement ships with the release: never edit it once released; its checksum is recorded
+# in every consumer's ledger. A change to the fingerprint table is a new step of the own changeset (hard rule 6).
+_FINGERPRINT_SERVER_DDL_SQL = (
+    "ALTER TABLE caverns.fingerprint ADD COLUMN IF NOT EXISTS server_version integer CHECK (server_version > 0);"
+)
 _OWN_CHANGESET = Changeset(
     _OWN_CHANGESET_NAME,
     [
@@ -388,6 +394,7 @@ _OWN_CHANGESET = Changeset(
         Step("fingerprint", _FINGERPRINT_DDL_SQL, check=FINGERPRINT_EXISTS_SQL),
         Step("epochs", _EPOCHS_DDL_SQL, check=EPOCHS_EXISTS_SQL),
         Step("privileges", _PRIVILEGES_DDL_SQL, check=_PRIVILEGES_REVOKED_SQL),
+        Step("fingerprint_server", _FINGERPRINT_SERVER_DDL_SQL, check=FINGERPRINT_SERVER_SQL),
     ],
 )
 
