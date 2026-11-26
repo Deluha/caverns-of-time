@@ -1093,7 +1093,7 @@ def test_lock_with_no_argument_bounds_the_wait_by_the_default(ledger_conn: Any) 
 
 @pytest.mark.parametrize(
     ("option", "seen", "after"),
-    [(None, "7s", "7s"), (0.2, "200ms", "7s"), (0.0001, "1ms", "7s"), ("default", "5s", "7s")],
+    [(None, "7s", "7s"), (0.2, "200ms", "7s"), (0.001, "1ms", "7s"), ("default", "5s", "7s")],
 )
 def test_apply_sets_the_lock_timeout_for_each_step_only(ledger_conn: Any, option: Any, seen: str, after: str) -> None:
     install(ledger_conn)
@@ -1236,10 +1236,10 @@ def test_a_later_steps_own_lock_wait_is_still_bounded(ledger_conn: Any, second_c
 
 def test_a_lock_timeout_that_is_not_valid_is_refused_before_anything_runs(ledger_conn: Any) -> None:
     install(ledger_conn)
-    for value in (0, -1, True, float("nan"), float("inf"), "5", 1e10):
+    for value in (0, -1, True, float("nan"), float("inf"), "5", 1e10, 10**400, 1e-9, 0.0005):
         with pytest.raises(ChangesetError, match="lock_timeout"):
             apply(ledger_conn, APP, lock_timeout=value)  # type: ignore[arg-type]
-    apply(ledger_conn, APP, lock_timeout=0.0001)  # one millisecond is a valid timeout
+    apply(ledger_conn, APP, lock_timeout=0.001)  # one millisecond is a valid timeout
     assert _query(ledger_conn, APP_ROWS) == [("schema", "applied"), ("table", "applied"), ("index", "applied")]
 
 

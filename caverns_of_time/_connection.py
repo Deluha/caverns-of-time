@@ -8,7 +8,7 @@ validation and catalog helpers the components share (names, limits, the pinned s
 
 from __future__ import annotations
 
-import math
+import reprlib
 from collections.abc import Collection, Iterator, Sequence
 from contextlib import contextmanager
 from typing import Any, Protocol
@@ -349,19 +349,21 @@ def validate_limit(limit: object) -> None:
 
 
 def validate_lock_timeout(value: object) -> None:
-    """A lock timeout: None (the session's own) or a positive finite number of seconds, 1 ms to the integer limit."""
+    """A lock timeout: None (the session's own) or a number of seconds from 1 ms to the integer limit.
+
+    Checked on milliseconds computed without a float conversion of an int, so an int too large for a float is
+    refused, not an `OverflowError`; NaN and infinity fail the comparison. A bool is not a number here.
+    """
     if value is None:
         return
     if (
         not isinstance(value, int | float)
         or isinstance(value, bool)
-        or not math.isfinite(value)
-        or not 0 < value
-        or _milliseconds(value) > _LOCK_TIMEOUT_MAX_MS
+        or not 1 <= value * MILLISECONDS <= _LOCK_TIMEOUT_MAX_MS
     ):
         raise ChangesetError(
-            f"lock_timeout must be None or a positive number of seconds up to {_LOCK_TIMEOUT_MAX_MS // MILLISECONDS},"
-            f" not {value!r}"
+            f"lock_timeout must be None or a number of seconds from {1 / MILLISECONDS} (1 ms) up to "
+            f"{_LOCK_TIMEOUT_MAX_MS / MILLISECONDS}, not {reprlib.repr(value)}"
         )
 
 

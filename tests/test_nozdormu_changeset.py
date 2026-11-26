@@ -405,12 +405,31 @@ def test_an_error_without_a_code_records_the_first_line_of_its_text() -> None:
     assert nozdormu._recorded_error(ValueError("")) == "ValueError"
 
 
-@pytest.mark.parametrize("value", [None, 0.0001, 0.2, 5, 5.0, 2147483.647])
+@pytest.mark.parametrize("value", [None, 0.001, 0.2, 1, 5, 5.0, 2147483, 2147483.647])
 def test_a_lock_timeout_that_is_none_or_a_positive_number_is_accepted(value: object) -> None:
     _connection.validate_lock_timeout(value)
 
 
-@pytest.mark.parametrize("value", [0, 0.0, -1, True, False, float("nan"), float("inf"), float("-inf"), "5", 1e10, [5]])
+@pytest.mark.parametrize(
+    "value",
+    [
+        0,
+        0.0,
+        -1,
+        True,
+        False,
+        float("nan"),
+        float("inf"),
+        float("-inf"),
+        "5",
+        1e10,
+        [5],
+        10**400,
+        -(10**400),
+        1e-9,
+        0.0009,
+    ],
+)
 def test_a_lock_timeout_that_is_not_a_positive_number_is_refused(value: object) -> None:
     with pytest.raises(ChangesetError, match="lock_timeout"):
         _connection.validate_lock_timeout(value)

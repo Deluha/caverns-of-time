@@ -109,7 +109,8 @@ nothing. The rows written are returned and logged.
 *Lock timeout.* `lock_timeout` is the seconds one step's transaction waits for a lock its SQL needs, and the
 run's first step waits for Caverns' lock: the transaction sets `lock_timeout` to it (transaction-local, so the
 session's own setting is untouched afterwards) before it takes Caverns' advisory lock, and the step's SQL runs under
-it. It is `5.0` by default; a positive finite number (rounded to milliseconds, at least 1 ms, at most 2147483.647 s),
+it. It is `5.0` by default; a number from 0.001 s to 2147483.647 s (rounded to milliseconds; a smaller or larger one, NaN, infinity or an
+int too large for a float is refused),
 else `ChangesetError`; `None` leaves the session's own `lock_timeout` in force. A timeout on that first wait for
 Caverns' lock (another Caverns run holds it) raises `CavernsError` naming the lock, with the transaction rolled back
 and nothing written. Once the run has committed a step, its later waits for Caverns' lock, and the one that
