@@ -22,6 +22,7 @@ from caverns_of_time._connection import (
     Connection,
     Cursor,
     check_connection,
+    check_writable,
     lock,
     pin_output_settings,
     pin_search_path,
@@ -373,9 +374,11 @@ def register(connection: Connection, schema: str, table: str, *, key: Sequence[s
     The names are exact PostgreSQL names, case-sensitive. The same key again writes nothing; another key
     replaces the stored one and logs a warning. Raises `ChangesetError` for a bad *schema*, *table* or *key*,
     `LedgerNotInstalled` before `install()` and `EpochRefused` for a table that does not exist or is not a table,
-    a key column it lacks, or no *key* on a table without a primary key.
+    a key column it lacks, or no *key* on a table without a primary key. A standby or a read-only session is
+    refused with `CavernsError`.
     """
     check_connection(connection)
+    check_writable(connection)
     _validate_table(schema, table)
     columns = _validate_key(key)
     with transaction(connection) as cursor:
@@ -401,9 +404,11 @@ def unregister(connection: Connection, schema: str, table: str) -> None:
     """Opt *table* of *schema* out of later epochs; the epochs already taken keep its rows.
 
     Raises `ChangesetError` for a bad *schema* or *table*, `LedgerNotInstalled` before `install()` and
-    `EpochRefused` for a table that is not registered.
+    `EpochRefused` for a table that is not registered. A standby or a read-only session is refused with
+    `CavernsError`.
     """
     check_connection(connection)
+    check_writable(connection)
     _validate_table(schema, table)
     with transaction(connection) as cursor:
         lock(cursor)
@@ -484,12 +489,17 @@ def snapshot(connection: Connection, name: str, *, lock_timeout: float | None = 
     *lock_timeout* is the seconds the call waits for Caverns' advisory lock (a timeout raises `CavernsError`) and,
     in the copying transaction, for the lock on each source table (a timeout there raises the driver's error, after
     the rollback); None keeps the session's own `lock_timeout`, a number must be positive.
+
+    A standby or a read-only session is refused with `CavernsError`. When the epoch is committed but releasing the
+    session-level advisory lock fails (or the lock was not held: a transaction-mode pooler), `CavernsError` says so;
+    the epoch stands.
     """
     check_connection(connection)
+    check_writable(connection)
     validate_name("epoch name", name)
     validate_lock_timeout(lock_timeout)
     with (
-        session_lock(connection, lock_timeout=lock_timeout),
+        session_lock(connection, committed=f"epoch {name!r} is taken", lock_timeout=lock_timeout),
         transaction(connection, repeatable_read=True) as cursor,
     ):
         set_lock_timeout(cursor, lock_timeout)
@@ -699,9 +709,12 @@ def delete(connection: Connection, names: Collection[str], *, dry_run: bool = Fa
     validated and resolved the same way, in one read-only transaction without the lock, and the epochs that would
     be deleted are returned (`deleted_at` None); nothing is written. Raises `ChangesetError` for *names* that is not
     a non-empty collection of valid names (a bare string or None included), `LedgerNotInstalled` before
-    `install()`, `EpochNotFound` for an unknown epoch and `EpochRefused` for an epoch that is already deleted.
+    `install()`, `EpochNotFound` for an unknown epoch and `EpochRefused` for an epoch that is already deleted. Without
+    *dry_run* a standby or a read-only session is refused with `CavernsError`.
     """
     check_connection(connection)
+    if not dry_run:
+        check_writable(connection)
     wanted = _connection.names("names", names)
     if not wanted:
         raise ChangesetError("names is empty")

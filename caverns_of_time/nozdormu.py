@@ -25,6 +25,7 @@ from caverns_of_time._connection import (
     Connection,
     Cursor,
     check_connection,
+    check_writable,
     lock,
     names,
     read_only,
@@ -779,10 +780,11 @@ def _require_owned(cursor: Cursor) -> None:
 def install(connection: Connection) -> list[LedgerEntry]:
     """Create the ledger by applying Caverns' own changeset; the rows written ([] when installed).
 
-    Refuses (`CavernsError`, nothing written) a `caverns` schema or a relation in it owned by a role the current
-    role is not a member of.
+    Refuses (`CavernsError`, nothing written) a standby or a read-only session, and a `caverns` schema or a
+    relation in it owned by a role the current role is not a member of.
     """
     check_connection(connection)
+    check_writable(connection)
     with read_only(connection) as cursor:
         _require_owned(cursor)
         statuses = _statuses(cursor, _OWN_CHANGESET)
@@ -817,10 +819,13 @@ def apply(
     locks the step's SQL needs alike (None keeps the session's own `lock_timeout`; a number must be positive).
     A wait for Caverns' lock that times out raises `CavernsError`, nothing written; one inside a step fails the
     step like any other error (`failed` row `55P03: ...`, `StepFailed`).
+
+    A standby or a read-only session is refused with `CavernsError`, nothing written.
     """
     validate_lock_timeout(lock_timeout)
     reapply_names, accept_names = names("reapply", reapply), names("accept", accept)
     statuses = preflight(connection, changeset)
+    check_writable(connection)
     return _apply_statuses(
         connection,
         changeset,
@@ -857,9 +862,11 @@ def baseline(
     `caverns.fingerprint`, at the last row's version, in the same transaction. Returns the *through* step's row.
     The schemas of the latest baseline are the watched schemas of later runs. Afterwards every step up to
     *through* is `applied`; a step added before it later is `before_baseline`. Refused (`BaselineRefused`)
-    when the changeset already has ledger rows or a named schema does not exist.
+    when the changeset already has ledger rows or a named schema does not exist, and with `CavernsError` on a
+    standby or a read-only session.
     """
     check_connection(connection)
+    check_writable(connection)
     _reject_reserved(changeset)
     steps = _baseline_steps(changeset, through)
     named = named_schemas(schemas)

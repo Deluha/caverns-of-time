@@ -14,7 +14,7 @@ difference of two epochs and their deletion).
 |---|---|
 | `__init__.py` | `__version__`, read from the installed distribution's metadata |
 | `errors.py` | The exception types, all in one module |
-| `_connection.py` | Shared private plumbing, not a component: the `Connection` and `Cursor` protocols, the connection guard, the transaction helpers, the advisory lock every Caverns write takes (`ADVISORY_LOCK_KEY`, `lock`; `session_lock` for a REPEATABLE READ `transaction`) and its lock timeout (`DEFAULT_LOCK_TIMEOUT`, `set_lock_timeout`), the SQLSTATE reader `sqlstate`, the name, limit and lock timeout validation (`validate_name`, `validate_limit`, `validate_lock_timeout`), the pinned search path (`pin_search_path`), the one-statement check runner and the collection-of-names guard |
+| `_connection.py` | Shared private plumbing, not a component: the `Connection` and `Cursor` protocols, the connection guard and the writable check (`check_connection`, `check_writable`), the transaction helpers, the advisory lock every Caverns write takes (`ADVISORY_LOCK_KEY`, `lock`; `session_lock` for a REPEATABLE READ `transaction`, whose failed release is a `CavernsError`) and its lock timeout (`DEFAULT_LOCK_TIMEOUT`, `set_lock_timeout`), the SQLSTATE reader `sqlstate`, the name, limit and lock timeout validation (`validate_name`, `validate_limit`, `validate_lock_timeout`), the pinned search path (`pin_search_path`), the one-statement check runner and the collection-of-names guard |
 | `_fingerprint.py` | Shared private fingerprint machinery, not a component: `Fingerprint`, the catalog queries, the document and its hash, the default, watched and missing schemas, `Difference`, `restrict` and `compare`, and the storage of fingerprints in `caverns.fingerprint` (`record`, `latest`) |
 | `console.py` | The console helpers: status lines with their icons, tables and JSON, the confirmation prompt (`confirm`, `interactive`); the only module that prints or reads |
 | `chromie.py` | Chromie: the `chromie` command's parsing, connection configuration and dispatch (command flow only) |
@@ -246,8 +246,11 @@ pinned to `pg_catalog`, so a user type is schema-qualified). The values are prin
 pins for its transaction, so an epoch does not depend on the session that took it: `TimeZone` `UTC` (a timestamptz
 ends `+00:00`), `IntervalStyle` `postgres`, `extra_float_digits` 1, `bytea_output` `hex`, `DateStyle` `ISO, MDY` and
 `lc_monetary` `C`; the caller's own settings are untouched afterwards. If releasing the advisory lock fails
-after the epoch is committed, the snapshot still returns, with a warning (`could not release Caverns' advisory lock: <error>`) through the
-`caverns_of_time._connection` logger. `lock_timeout` (as for `apply`: seconds, default `5.0`, `None` keeps the
+after the epoch is committed (an error, or `pg_advisory_unlock` returns false because the session did not hold the
+lock), `snapshot` raises a `CavernsError` instead of returning: "epoch 'nightly' is taken, but releasing Caverns'
+advisory lock failed (<reason>): Caverns needs a direct connection or a session-mode pooler, not a transaction-mode
+one". The epoch is committed and stands. The session-level lock needs a connection that stays one session: connect
+directly or through a session-mode pooler. `lock_timeout` (as for `apply`: seconds, default `5.0`, `None` keeps the
 session's own) bounds the wait for Caverns' advisory lock, where a timeout raises `CavernsError`, and, set at the
 start of the REPEATABLE READ transaction, the wait for each source table's lock: a timeout there rolls the copy
 back and raises the driver's own error (SQLSTATE `55P03`), untranslated. `catalog(connection, *, limit=None)` lists the epochs
@@ -460,6 +463,13 @@ With nothing found: `✅ No drift — the live schema matches the fingerprint at
   `SET`, transaction-level locks). A psycopg 3 connection inside `with conn.transaction():` is unsupported,
   because Caverns must commit and roll back itself. A step's SQL and check run exactly as written, with no parameters, so a
   `%` in them is literal.
+- Every write (`install`, `apply`, `baseline`, `register`, `unregister`, `snapshot` and `delete` without `dry_run`)
+  also refuses, with a `CavernsError` and before it writes anything, a database that is a standby
+  (`pg_is_in_recovery()`: "the database is a standby (in recovery): Caverns writes only to a primary") and a
+  session that cannot write (`transaction_read_only` is `on`, as when `default_transaction_read_only` is set:
+  "the session is read-only (default_transaction_read_only is on): Caverns needs a session that can write"). The
+  read-only functions (`preflight`, `history`, `drift`, `fingerprint`, `tracked`, `catalog`, `as_of`, `diff`
+  and `delete` with `dry_run`) are not checked.
 - `install(connection) -> list[LedgerEntry]`: the rows written, one per own step not yet applied, `[]` when
   Caverns is already installed; an `accepted` row for an own step whose table exists without its row. Raises
   `CavernsError` for a `caverns` schema or relation owned by a role the current role is not a member of.
@@ -576,6 +586,12 @@ With nothing found: `✅ No drift — the live schema matches the fingerprint at
   tables is a new own step (hard rule 6). The DDL of each step is idempotent, and `caverns` is a reserved changeset name.
 - No runtime dependency for the library; the CLI's driver (psycopg 3) is the optional `cli` extra. Adding
   a dependency is an ask-first decision.
+
+## Known limitations
+
+- Caverns writes only to a primary: a standby (in recovery) and a read-only session are refused.
+- Logical replication of the `caverns` schema is unsupported: the ledger, fingerprint and epoch tables are not
+  designed to be replicated, and a subscriber's copy is not a ledger Caverns can write.
 
 ## Extending
 

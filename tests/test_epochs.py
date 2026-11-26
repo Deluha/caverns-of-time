@@ -1,10 +1,15 @@
-"""Epochs against PostgreSQL 18, on both supported drivers: the epoch tables and the registry of tracked tables."""
+"""Epochs against PostgreSQL 18, on both supported drivers: the epoch tables and the registry of tracked tables.
+
+Also the writable check every write makes (a read-only session is tested for real; the standby branch of
+`check_writable` shares its code path and cannot be reached without a replica, so it is not tested here) and the
+session lock's failed release.
+"""
 
 from __future__ import annotations
 
 import logging
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import replace
 from typing import Any
 
@@ -957,30 +962,140 @@ def test_snapshot_refuses_a_lock_timeout_that_is_not_valid(ledger_conn: Any) -> 
 
 
 def test_session_lock_is_held_in_the_block_and_released_after_it(ledger_conn: Any) -> None:
-    with _connection.session_lock(ledger_conn):
+    with _connection.session_lock(ledger_conn, committed="the work is done"):
         assert _query(ledger_conn, ADVISORY_LOCKS) == [(1,)]
     assert _query(ledger_conn, ADVISORY_LOCKS) == [(0,)]
 
 
 def test_session_lock_is_released_when_the_block_raises(ledger_conn: Any) -> None:
-    with pytest.raises(ZeroDivisionError), _connection.session_lock(ledger_conn):
+    with pytest.raises(ZeroDivisionError), _connection.session_lock(ledger_conn, committed="the work is done"):
         raise ZeroDivisionError
     assert _query(ledger_conn, ADVISORY_LOCKS) == [(0,)]
 
 
 def test_session_lock_that_cannot_be_taken_raises_the_drivers_error(second_conn: Any) -> None:
     second_conn.close()  # the lock statement fails; the best-effort release fails too, and is not what is raised
-    with pytest.raises(DRIVER_ERRORS), _connection.session_lock(second_conn):
+    with pytest.raises(DRIVER_ERRORS), _connection.session_lock(second_conn, committed="the work is done"):
         pytest.fail("the block must not run")
 
 
-def test_session_lock_that_cannot_be_released_after_the_block_warns_and_returns(
-    ledger_conn: Any, second_conn: Any, caplog: pytest.LogCaptureFixture
+def test_session_lock_that_cannot_be_released_after_the_block_raises_a_caverns_error(
+    ledger_conn: Any, second_conn: Any
 ) -> None:
-    with caplog.at_level(logging.WARNING, logger=_connection.__name__), _connection.session_lock(second_conn):
+    with (
+        pytest.raises(
+            CavernsError, match=r"^epoch 'x' is taken, but releasing Caverns' advisory lock failed \(.+\): "
+        ) as failed,
+        _connection.session_lock(second_conn, committed="epoch 'x' is taken"),
+    ):
         second_conn.close()  # the block's work is done; releasing the lock now fails (the server frees it)
-    assert [r.getMessage().split(":")[0] for r in caplog.records] == ["could not release Caverns' advisory lock"]
+    assert isinstance(failed.value.__cause__, DRIVER_ERRORS)  # chained from the driver's error
+    assert str(failed.value).endswith(
+        "Caverns needs a direct connection or a session-mode pooler, not a transaction-mode one"
+    )
     assert _query(ledger_conn, ADVISORY_LOCKS) == [(0,)]
+
+
+def test_session_lock_that_was_not_held_at_release_raises_a_caverns_error(ledger_conn: Any) -> None:
+    """What a transaction-mode pooler does: the unlock reaches a session that never held the lock."""
+    with (
+        pytest.raises(CavernsError, match="the lock was not held") as failed,
+        _connection.session_lock(ledger_conn, committed="epoch 'x' is taken"),
+    ):
+        assert _query(ledger_conn, "SELECT pg_advisory_unlock(%s::bigint)", (_connection.ADVISORY_LOCK_KEY,)) == [
+            (True,)
+        ]
+    assert str(failed.value) == (
+        "epoch 'x' is taken, but releasing Caverns' advisory lock failed (the lock was not held): "
+        "Caverns needs a direct connection or a session-mode pooler, not a transaction-mode one"
+    )
+    assert _query(ledger_conn, ADVISORY_LOCKS) == [(0,)]
+
+
+def test_session_lock_whose_block_raised_stays_quiet_when_the_lock_was_not_held(ledger_conn: Any) -> None:
+    with pytest.raises(ZeroDivisionError), _connection.session_lock(ledger_conn, committed="the work is done"):
+        _query(ledger_conn, "SELECT pg_advisory_unlock(%s::bigint)", (_connection.ADVISORY_LOCK_KEY,))
+        raise ZeroDivisionError
+
+
+def test_a_successful_snapshot_returns_and_holds_no_lock(ledger_conn: Any) -> None:
+    _installed_with_tables(ledger_conn, f"CREATE TABLE {SCHEMA}.one (id int PRIMARY KEY)")
+    register(ledger_conn, SCHEMA, "one")
+    assert snapshot(ledger_conn, "nightly").name == "nightly"
+    assert _query(ledger_conn, ADVISORY_LOCKS) == [(0,)]
+
+
+# --- the writable check ---------------------------------------------------------------------
+
+READ_ONLY_MESSAGE = (
+    r"the session is read-only \(default_transaction_read_only is on\): Caverns needs a session that can write"
+)
+WRITE_COUNTS = (
+    "SELECT (SELECT count(*) FROM caverns.ledger), (SELECT count(*) FROM caverns.epoch_table),"
+    " (SELECT count(*) FROM caverns.epoch), (SELECT count(*) FROM caverns.epoch_deletion),"
+    " (SELECT count(*) FROM caverns.epoch_row), (SELECT count(*) FROM caverns.fingerprint)"
+)
+
+
+@pytest.fixture
+def read_only_session(ledger_conn: Any) -> Iterator[Callable[[], None]]:
+    """A function that turns `default_transaction_read_only` on for the session; it is reset after the test."""
+
+    def turn_on() -> None:
+        _execute(ledger_conn, "SET default_transaction_read_only = on")
+
+    try:
+        yield turn_on
+    finally:
+        ledger_conn.rollback()
+        _execute(ledger_conn, "RESET default_transaction_read_only")  # the fixture's teardown drops schemas
+
+
+def test_check_writable_passes_on_a_primary_with_a_session_that_can_write(ledger_conn: Any) -> None:
+    # The standby branch reads the same statement and refuses the same way; a test would need a replica.
+    _connection.check_writable(ledger_conn)
+    _assert_idle(ledger_conn)
+
+
+def test_install_refuses_a_read_only_session_and_writes_nothing(
+    ledger_conn: Any, read_only_session: Callable[[], None]
+) -> None:
+    read_only_session()
+    with pytest.raises(CavernsError, match=READ_ONLY_MESSAGE):
+        install(ledger_conn)
+    _assert_idle(ledger_conn)
+    assert _query(ledger_conn, "SELECT to_regnamespace('caverns') IS NULL") == [(True,)]
+
+
+def test_every_other_write_refuses_a_read_only_session_and_writes_nothing(
+    ledger_conn: Any, read_only_session: Callable[[], None]
+) -> None:
+    _installed_with_tables(ledger_conn, f"CREATE TABLE {SCHEMA}.one (id int PRIMARY KEY)")
+    register(ledger_conn, SCHEMA, "one")
+    snapshot(ledger_conn, "kept")
+    before = _query(ledger_conn, WRITE_COUNTS)
+    read_only_session()
+    writes: list[Callable[[], object]] = [
+        lambda: nozdormu.apply(ledger_conn, APP),
+        lambda: nozdormu.baseline(ledger_conn, APP),
+        lambda: register(ledger_conn, SCHEMA, "one"),
+        lambda: unregister(ledger_conn, SCHEMA, "one"),
+        lambda: snapshot(ledger_conn, "refused"),
+        lambda: delete(ledger_conn, ["kept"]),
+    ]
+    for write in writes:
+        with pytest.raises(CavernsError, match=READ_ONLY_MESSAGE):
+            write()
+        _assert_idle(ledger_conn)
+    assert _query(ledger_conn, WRITE_COUNTS) == before
+    assert _query(ledger_conn, ADVISORY_LOCKS) == [(0,)]
+    # What only reads still works.
+    assert [s.step.label for s in preflight(ledger_conn, APP)] == ["one"]
+    assert [e.label for e in nozdormu.history(ledger_conn, changeset="caverns")][-1] == "ledger"
+    assert [e.name for e in catalog(ledger_conn)] == ["kept"]
+    assert [t.table for t in tracked(ledger_conn)] == ["one"]
+    assert [e.name for e in delete(ledger_conn, ["kept"], dry_run=True)] == ["kept"]
+    assert _query(ledger_conn, WRITE_COUNTS) == before
 
 
 # --- catalog --------------------------------------------------------------------------------

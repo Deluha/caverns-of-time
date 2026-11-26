@@ -8,7 +8,6 @@ validation and catalog helpers the components share (names, limits, the pinned s
 
 from __future__ import annotations
 
-import logging
 import math
 from collections.abc import Collection, Iterator, Sequence
 from contextlib import contextmanager
@@ -23,6 +22,7 @@ __all__ = [
     "Connection",
     "Cursor",
     "check_connection",
+    "check_writable",
     "lock",
     "names",
     "pin_output_settings",
@@ -68,6 +68,8 @@ class Connection(Protocol):
     def rollback(self) -> object: ...
 
 
+# What a write needs of the session: a primary (not in recovery) whose transactions may write.
+_WRITABLE_SQL = "SELECT pg_is_in_recovery(), current_setting('transaction_read_only')"
 # False when the connection's open transaction has written something (it holds a transaction id).
 _CLEAN_TRANSACTION_SQL = "SELECT pg_current_xact_id_if_assigned() IS NULL"
 # Under REPEATABLE READ or SERIALIZABLE the lock statement would take the snapshot before it waits.
@@ -103,7 +105,6 @@ EPOCHS_EXISTS_SQL = (
     " AND to_regclass('caverns.epoch_source') IS NOT NULL AND to_regclass('caverns.epoch_row') IS NOT NULL"
     " AND to_regclass('caverns.epoch_deletion') IS NOT NULL"
 )
-_log = logging.getLogger(__name__)
 
 
 def check_connection(connection: Connection) -> None:
@@ -127,6 +128,27 @@ def check_connection(connection: Connection) -> None:
         # No rollback: the caller's work must survive the refusal.
         raise CavernsError("the connection has uncommitted work; commit or roll it back before calling Caverns")
     connection.rollback()  # only reads so far: nothing is lost
+
+
+def check_writable(connection: Connection) -> None:
+    """Refuse a connection to a standby or to a session that cannot write; leave no open transaction.
+
+    Read in a plain transaction, never `read_only`, which would make the read itself read-only. Called by every
+    write after `check_connection`, so nothing is read or written first.
+    """
+    with cursor(connection) as cur:
+        cur.execute(_WRITABLE_SQL)
+        row = cur.fetchone()
+    connection.rollback()
+    if row is None:
+        raise CavernsError("the connection cannot tell whether the database is writable")
+    in_recovery, read_only_setting = row
+    if in_recovery:
+        raise CavernsError("the database is a standby (in recovery): Caverns writes only to a primary")
+    if read_only_setting == "on":
+        raise CavernsError(
+            "the session is read-only (default_transaction_read_only is on): Caverns needs a session that can write"
+        )
 
 
 @contextmanager
@@ -211,7 +233,9 @@ def lock(cursor: Cursor, *, lock_timeout: float | None = DEFAULT_LOCK_TIMEOUT) -
 
 
 @contextmanager
-def session_lock(connection: Connection, *, lock_timeout: float | None = DEFAULT_LOCK_TIMEOUT) -> Iterator[None]:
+def session_lock(
+    connection: Connection, *, committed: str, lock_timeout: float | None = DEFAULT_LOCK_TIMEOUT
+) -> Iterator[None]:
     """Hold Caverns' advisory lock for the session, taken and committed before the block begins.
 
     For a block that runs a REPEATABLE READ `transaction`: the transaction-level `lock` statement would take
@@ -219,8 +243,9 @@ def session_lock(connection: Connection, *, lock_timeout: float | None = DEFAULT
     the snapshot comes after the lock is held. *lock_timeout* bounds the wait as for `lock`. The lock is
     released when the block ends. A session lock survives a rollback, so a failure while taking it (the server
     may have granted it) and a block that raised release it best-effort and let the error propagate (a lost
-    connection frees the lock); a release that fails after the block succeeded is logged as a warning, never
-    raised: the block's work is committed.
+    connection frees the lock). A release that fails after the block succeeded (an error, or `false` from
+    `pg_advisory_unlock`: the lock was not held, as behind a transaction-mode pooler) raises `CavernsError`
+    that names *committed*, the block's work, which stands, and the cause.
     """
     try:
         with cursor(connection) as cur:
@@ -235,16 +260,28 @@ def session_lock(connection: Connection, *, lock_timeout: float | None = DEFAULT
         _release_session_lock_quietly(connection)
         raise
     try:
-        _release_session_lock(connection)
+        held = _release_session_lock(connection)
     except Exception as error:
-        _log.warning("could not release Caverns' advisory lock: %s", error)
+        raise CavernsError(_release_failure(committed, str(error).strip())) from error
+    if not held:
+        raise CavernsError(_release_failure(committed, "the lock was not held"))
 
 
-def _release_session_lock(connection: Connection) -> None:
+def _release_failure(committed: str, reason: str) -> str:
+    return (
+        f"{committed}, but releasing Caverns' advisory lock failed ({reason}): "
+        "Caverns needs a direct connection or a session-mode pooler, not a transaction-mode one"
+    )
+
+
+def _release_session_lock(connection: Connection) -> bool:
+    """Release the session lock; whether it was held (`pg_advisory_unlock` returns false when it was not)."""
     connection.rollback()
     with cursor(connection) as cur:
         cur.execute(_SESSION_UNLOCK_SQL, (ADVISORY_LOCK_KEY,))
+        row = cur.fetchone()
     connection.commit()
+    return bool(row and row[0])
 
 
 def _release_session_lock_quietly(connection: Connection) -> None:

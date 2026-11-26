@@ -765,8 +765,8 @@ def test_apply_refuses_a_bad_acknowledgement(ledger_conn: Any, kwargs: dict[str,
     assert _query(ledger_conn, APP_ROWS) == [("schema", "applied"), ("table", "applied")]
 
 
-READ_ONLY_SESSION_SQL = "SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY"
-READ_WRITE_SESSION_SQL = "SET SESSION CHARACTERISTICS AS TRANSACTION READ WRITE"
+READ_ONLY_GRANTS = ("GRANT USAGE ON SCHEMA caverns TO {role}", "GRANT SELECT ON ALL TABLES IN SCHEMA caverns TO {role}")
+UNRECORDABLE = Changeset("app", [Step("boom", "SELECT 1 / 0")])
 BAD = Step(
     "bad",
     "CREATE TABLE nozdormu_test.bad (id int); SELECT 1 / 0",
@@ -834,20 +834,23 @@ def test_a_failing_own_step_raises_a_caverns_error_and_records_nothing(
     assert not _exists(ledger_conn, "caverns.ledger")  # the connection is usable and nothing was written
 
 
-def test_a_failure_that_cannot_be_recorded_raises_a_caverns_error(ledger_conn: Any) -> None:
-    install(ledger_conn)
-    _execute(ledger_conn, "CREATE SCHEMA nozdormu_test")
-    _execute(ledger_conn, READ_ONLY_SESSION_SQL)
-    try:
-        with pytest.raises(CavernsError, match="could not be recorded") as refused:
-            apply(ledger_conn, Changeset("app", [Step("ro", "CREATE TABLE nozdormu_test.ro_t ()")]))
-    finally:
-        _execute(ledger_conn, READ_WRITE_SESSION_SQL)
+def _as_a_role_that_cannot_write_the_ledger(conn: Any, role: str) -> None:
+    """Install, then become *role*, which may read the ledger but not append to it: a failed row cannot be recorded."""
+    install(conn)
+    _run(conn, *(grant.format(role=role) for grant in READ_ONLY_GRANTS), f"SET ROLE {role}")
+
+
+def test_a_failure_that_cannot_be_recorded_raises_a_caverns_error(
+    ledger_conn: Any, roles: tuple[str, str, str]
+) -> None:
+    _as_a_role_that_cannot_write_the_ledger(ledger_conn, roles[2])
+    with pytest.raises(CavernsError, match="could not be recorded") as refused:
+        apply(ledger_conn, UNRECORDABLE)
     _assert_idle(ledger_conn)
     assert not isinstance(refused.value, StepFailed)
     assert isinstance(refused.value.__cause__, DRIVER_ERRORS)
+    _run(ledger_conn, "RESET ROLE")
     assert _query(ledger_conn, APP_ROWS) == []
-    assert not _exists(ledger_conn, "nozdormu_test.ro_t")
 
 
 def test_apply_skips_a_step_another_runner_applied_after_preflight(ledger_conn: Any) -> None:
@@ -1297,15 +1300,13 @@ def test_a_failing_step_records_the_fingerprint_with_its_failed_row(ledger_conn:
     assert "nozdormu_test" in live.schemas and live.document["nozdormu_test"]["table"] == {}
 
 
-def test_a_failure_that_cannot_be_recorded_records_no_fingerprint(ledger_conn: Any) -> None:
-    install(ledger_conn)
-    _execute(ledger_conn, "CREATE SCHEMA nozdormu_test")
-    _execute(ledger_conn, READ_ONLY_SESSION_SQL)
-    try:
-        with pytest.raises(CavernsError, match="could not be recorded"):
-            apply(ledger_conn, Changeset("app", [Step("ro", "CREATE TABLE nozdormu_test.ro_t ()")]))
-    finally:
-        _execute(ledger_conn, READ_WRITE_SESSION_SQL)
+def test_a_failure_that_cannot_be_recorded_records_no_fingerprint(
+    ledger_conn: Any, roles: tuple[str, str, str]
+) -> None:
+    _as_a_role_that_cannot_write_the_ledger(ledger_conn, roles[2])
+    with pytest.raises(CavernsError, match="could not be recorded"):
+        apply(ledger_conn, UNRECORDABLE)
+    _run(ledger_conn, "RESET ROLE")
     assert _query(ledger_conn, FINGERPRINT_ROWS) == []
 
 
