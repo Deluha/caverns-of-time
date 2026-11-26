@@ -265,7 +265,9 @@ The estimate is the tables' size on disk, not the size of the copy, which `jsonb
 **Key size:** the largest `epoch_row` primary-key entry a table would need (its key as stored, the schema and table
 names, the epoch, an index entry header and an alignment allowance) must fit the btree entry limit derived from the
 server's `block_size` (2,704 bytes on 8 kB pages); a longer key is refused with the table named, where the copy would
-otherwise fail with the driver's own error. Declare a shorter key. Checking it reads each table once more. The copy of a table is one statement PostgreSQL composes (hard rule 3):
+otherwise fail with the driver's own error. The size is measured uncompressed, so the check is conservative: a long
+but compressible key that an index could have stored compressed is refused too. Declare a shorter key. Checking it
+reads each table once more, streaming (it does not hold the rows). The copy of a table is one statement PostgreSQL composes (hard rule 3):
 `format` quotes the schema and table names and the key as literals from a template bound as a value, never built in
 Python. A value's type is not in the row: JSON holds numbers, strings, booleans, nulls, arrays and objects, so
 read a value's type from the epoch's `columns` (`Column.type`, printed by `format_type` with the search path
@@ -274,7 +276,7 @@ pins for its transaction, so an epoch does not depend on the session that took i
 ends `+00:00`), `IntervalStyle` `postgres`, `extra_float_digits` 1, `bytea_output` `hex`, `DateStyle` `ISO, MDY` and
 `lc_monetary` `C`; the caller's own settings are untouched afterwards. If releasing the advisory lock fails
 after the epoch is committed (an error, or `pg_advisory_unlock` returns false because the session did not hold the
-lock), `snapshot` raises a `CavernsError` instead of returning: "epoch 'nightly' is taken, but releasing Caverns'
+lock), `snapshot` raises a `CavernsError` instead of returning: "epoch 'nightly' was committed, but releasing Caverns'
 advisory lock failed (<reason>): Caverns needs a direct connection or a session-mode pooler, not a transaction-mode
 one". The epoch is committed and stands. The session-level lock needs a connection that stays one session: connect
 directly or through a session-mode pooler. `lock_timeout` (as for `apply`: seconds, default `5.0`, `None` keeps the

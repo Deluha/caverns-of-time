@@ -29,8 +29,9 @@ What a second review found in Phases 1–3, fixed before new components:
   recorded under default settings is unchanged.
 - `epochs.snapshot` refuses, before copying a row, a table with row-level security the role does not bypass (a
   superuser, `BYPASSRLS`, or the owner without `FORCE`), estimates the registered tables' size, logs it and refuses
-  above `max_bytes` (default 1 GiB, `None` for no limit), and refuses a key too large for an index entry; the
-  README states the cost of its long REPEATABLE READ transaction.
+  above `max_bytes` (default 1 GiB, `None` for no limit), and refuses a key too large for an index entry (measured
+  uncompressed, so a long but compressible key is refused too); the README states the cost of its long REPEATABLE
+  READ transaction.
 - Steps and checks run under the caller's `search_path`, which is not pinned: schema-qualify them.
 - Known limitations: Caverns writes only to a primary, logical replication of the `caverns` schema is unsupported,
   and the snapshot's session lock needs a direct or session-mode connection.

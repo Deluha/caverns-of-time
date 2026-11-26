@@ -111,10 +111,11 @@ _INSERT_EPOCH_SQL = (
 )
 # NOTE: hard rule 3 forbids composing a statement in Python, so PostgreSQL composes the copy and the key-size read:
 # each template is bound as a value to `format`, which quotes the identifiers (%I) and the literals (%L). Their shared
-# first part reads the source rows once (MATERIALIZED), each with its key (a jsonb object of the key columns' values)
-# computed once; its arguments are, in order: 1 schema, 2 table, 3 key columns. `t.*` is the whole row even when the
-# table has a column named `t` (a bare `t` would be that column).
-_SOURCE_CTE = """source AS MATERIALIZED (
+# `source` reads the source rows, each with its key (a jsonb object of the key columns' values) computed once; its
+# arguments are, in order: 1 schema, 2 table, 3 key columns. `t.*` is the whole row even when the table has a column
+# named `t` (a bare `t` would be that column). The copy reads `source` three times, so it MATERIALIZEs it; the
+# key-size read reads it once, and NOT MATERIALIZED lets it stream instead of holding every row's jsonb.
+_SOURCE_QUERY = """(
     SELECT r.row, (SELECT jsonb_object_agg(k, r.row -> k) FROM unnest(%3$L::text[]) AS k) AS key
     FROM %1$I.%2$I t CROSS JOIN LATERAL (SELECT to_jsonb(t.*) AS row) r
 )"""
@@ -122,8 +123,8 @@ _SOURCE_CTE = """source AS MATERIALIZED (
 # A key with a JSON null value is counted over the source, so a repeated null key is a null key, not a duplicate;
 # `e.value = 'null'::jsonb` is an exact test (an array holding a null is not a null).
 _COPY_TEMPLATE = (
-    "WITH "
-    + _SOURCE_CTE
+    "WITH source AS MATERIALIZED "
+    + _SOURCE_QUERY
     + """,
 inserted AS (
     INSERT INTO caverns.epoch_row (epoch, schema_name, table_name, key, row)
@@ -139,8 +140,8 @@ _COMPOSE_COPY_SQL = "SELECT format(%s::text, %s::text, %s::text, %s::text[], %s:
 # What an `epoch_row` primary-key entry holds besides the epoch and the key's jsonb: the two names, as stored.
 # NULL for a table without rows.
 _KEY_SIZE_TEMPLATE = (
-    "WITH "
-    + _SOURCE_CTE
+    "WITH source AS NOT MATERIALIZED "
+    + _SOURCE_QUERY
     + """
 SELECT max(pg_column_size(s.key)) + pg_column_size(%1$L::text) + pg_column_size(%2$L::text) FROM source s
 """
@@ -616,7 +617,7 @@ def snapshot(
     validate_lock_timeout(lock_timeout)
     _validate_max_bytes(max_bytes)
     with (
-        session_lock(connection, committed=f"epoch {name!r} is taken", lock_timeout=lock_timeout),
+        session_lock(connection, committed=f"epoch {name!r} was committed", lock_timeout=lock_timeout),
         transaction(connection, repeatable_read=True) as cursor,
     ):
         set_lock_timeout(cursor, lock_timeout)

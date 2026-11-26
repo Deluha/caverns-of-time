@@ -972,6 +972,21 @@ def test_snapshot_refuses_a_key_too_large_for_an_index_entry_before_writing_a_ro
     assert [t.row_count for t in snapshot(ledger_conn, "wide").tables] == [1, 1]
 
 
+def test_the_key_size_read_streams_the_rows_and_the_copy_materializes_its_source(ledger_conn: Any) -> None:
+    """The key-size read must not hold every row's jsonb: its plan has no CTE; the copy reads its source thrice."""
+    _installed_with_tables(ledger_conn, ONE)
+
+    def plan(template: str, *arguments: Any) -> str:
+        placeholders = ", ".join(["%s::text"] * 3 + ["%s::text[]"] + ["%s::bigint"] * len(arguments))
+        (composed,) = _query(
+            ledger_conn, f"SELECT format({placeholders})", (template, SCHEMA, "one", ["id"], *arguments)
+        )[0]
+        return "\n".join(row[0] for row in _query(ledger_conn, f"EXPLAIN {composed}"))
+
+    assert "CTE" not in plan(epochs._KEY_SIZE_TEMPLATE)
+    assert "CTE source" in plan(epochs._COPY_TEMPLATE, 1)
+
+
 VALUES = (
     f"CREATE TABLE {SCHEMA}.vals (ts timestamptz PRIMARY KEY, iv interval, f float8, bt bytea, tr tstzrange, m money)",
     f"INSERT INTO {SCHEMA}.vals VALUES ('2026-11-22 17:06:45+01', '1 day 02:03:04', 0.1::float8 + 0.2::float8,"
@@ -1149,9 +1164,9 @@ def test_session_lock_that_cannot_be_released_after_the_block_raises_a_caverns_e
 ) -> None:
     with (
         pytest.raises(
-            CavernsError, match=r"^epoch 'x' is taken, but releasing Caverns' advisory lock failed \(.+\): "
+            CavernsError, match=r"^epoch 'x' was committed, but releasing Caverns' advisory lock failed \(.+\): "
         ) as failed,
-        _connection.session_lock(second_conn, committed="epoch 'x' is taken"),
+        _connection.session_lock(second_conn, committed="epoch 'x' was committed"),
     ):
         second_conn.close()  # the block's work is done; releasing the lock now fails (the server frees it)
     assert isinstance(failed.value.__cause__, DRIVER_ERRORS)  # chained from the driver's error
@@ -1165,13 +1180,13 @@ def test_session_lock_that_was_not_held_at_release_raises_a_caverns_error(ledger
     """What a transaction-mode pooler does: the unlock reaches a session that never held the lock."""
     with (
         pytest.raises(CavernsError, match="the lock was not held") as failed,
-        _connection.session_lock(ledger_conn, committed="epoch 'x' is taken"),
+        _connection.session_lock(ledger_conn, committed="epoch 'x' was committed"),
     ):
         assert _query(ledger_conn, "SELECT pg_advisory_unlock(%s::bigint)", (_connection.ADVISORY_LOCK_KEY,)) == [
             (True,)
         ]
     assert str(failed.value) == (
-        "epoch 'x' is taken, but releasing Caverns' advisory lock failed (the lock was not held): "
+        "epoch 'x' was committed, but releasing Caverns' advisory lock failed (the lock was not held): "
         "Caverns needs a direct connection or a session-mode pooler, not a transaction-mode one"
     )
     assert _query(ledger_conn, ADVISORY_LOCKS) == [(0,)]
