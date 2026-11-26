@@ -2,14 +2,16 @@
 
 Input: a DB-API 2.0 connection (autocommit off) and `Step` / `Changeset` values built from SQL text,
 a list or a directory of `.sql` files. Output: validated, immutable values, and ledger rows in the
-`caverns.ledger` table of the connected database, written by Caverns itself. The module imports no
-database driver. Contract and behaviour: `caverns_of_time/README.md`.
+`caverns.ledger` table of the connected database, written by Caverns itself, plus the
+`caverns.acknowledgement` rows of the risky steps `apply` was told to run (Murozond guards `apply`).
+The module imports no database driver. Contract and behaviour: `caverns_of_time/README.md`.
 """
 
 from __future__ import annotations
 
 import enum
 import hashlib
+import json
 import logging
 import os
 import time
@@ -56,10 +58,12 @@ from caverns_of_time.errors import (
     BaselineRefused,
     CavernsError,
     ChangesetError,
+    GuardRefused,
     LedgerNotInstalled,
     PreflightRefused,
     StepFailed,
 )
+from caverns_of_time.murozond import Classification, Risk, classify
 
 __all__ = [
     "Changeset",
@@ -388,6 +392,28 @@ LIMIT 1
 _FINGERPRINT_SERVER_DDL_SQL = (
     "ALTER TABLE caverns.fingerprint ADD COLUMN IF NOT EXISTS server_version integer CHECK (server_version > 0);"
 )
+# WARNING: this statement ships with the release: never edit it once released; its checksum is recorded
+# in every consumer's ledger. A change to the acknowledgements is a new step of the own changeset (hard rule 6).
+_ACKNOWLEDGEMENT_DDL_SQL = """
+CREATE TABLE IF NOT EXISTS caverns.acknowledgement (
+    version     bigint      PRIMARY KEY REFERENCES caverns.ledger (version),
+    risk        text        NOT NULL CHECK (risk IN ('destructive', 'lock_hazard', 'unknown')),
+    findings    jsonb       NOT NULL CHECK (jsonb_typeof(findings) = 'array' AND jsonb_array_length(findings) > 0),
+    recorded_at timestamptz NOT NULL DEFAULT clock_timestamp()
+);
+REVOKE ALL ON caverns.acknowledgement FROM PUBLIC;
+CREATE OR REPLACE FUNCTION caverns.append_only() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    RAISE EXCEPTION 'caverns.% is append-only: % refused', TG_TABLE_NAME, TG_OP;
+END
+$$;
+REVOKE ALL ON FUNCTION caverns.append_only() FROM PUBLIC;
+CREATE OR REPLACE TRIGGER acknowledgement_no_update_delete BEFORE UPDATE OR DELETE ON caverns.acknowledgement
+    FOR EACH ROW EXECUTE FUNCTION caverns.append_only();
+CREATE OR REPLACE TRIGGER acknowledgement_no_truncate BEFORE TRUNCATE ON caverns.acknowledgement
+    FOR EACH STATEMENT EXECUTE FUNCTION caverns.append_only();
+"""
+_ACKNOWLEDGEMENT_EXISTS_SQL = "SELECT to_regclass('caverns.acknowledgement') IS NOT NULL"
 _OWN_CHANGESET = Changeset(
     _OWN_CHANGESET_NAME,
     [
@@ -396,6 +422,7 @@ _OWN_CHANGESET = Changeset(
         Step("epochs", _EPOCHS_DDL_SQL, check=EPOCHS_EXISTS_SQL),
         Step("privileges", _PRIVILEGES_DDL_SQL, check=_PRIVILEGES_REVOKED_SQL),
         Step("fingerprint_server", _FINGERPRINT_SERVER_DDL_SQL, check=FINGERPRINT_SERVER_SQL),
+        Step("acknowledgement", _ACKNOWLEDGEMENT_DDL_SQL, check=_ACKNOWLEDGEMENT_EXISTS_SQL),
     ],
 )
 
@@ -416,6 +443,7 @@ _INSERT_ENTRY_SQL = (
     " VALUES (%s, %s, %s, %s, %s, %s, %s, %s) RETURNING version, changeset, label, checksum, outcome,"
     " fingerprint, error, duration_ms, recorded_at, recorded_by, caverns_version"
 )
+_INSERT_ACKNOWLEDGEMENT_SQL = "INSERT INTO caverns.acknowledgement (version, risk, findings) VALUES (%s, %s, %s::jsonb)"
 
 
 def _reject_reserved(changeset: Changeset) -> None:
@@ -587,6 +615,32 @@ def _plan(
     return plan
 
 
+def _guard(
+    changeset: Changeset, plan: Sequence[tuple[StepStatus, str]], acknowledge: frozenset[str]
+) -> dict[str, Classification]:
+    """Murozond's guard over the steps of *plan* that run SQL; the classifications of the acknowledged ones.
+
+    Refuses before anything is written: `ChangesetError` for an *acknowledge* label the changeset lacks, whose step
+    does not run in this apply or is safe (checked in that order, the first sorted label reported), then
+    `GuardRefused` for a step that is not safe and not named in *acknowledge*.
+    """
+    running = {status.step.label: status for status, outcome in plan if outcome == _OUTCOME_APPLIED}
+    missing = sorted(acknowledge - {step.label for step in changeset.steps})
+    if missing:
+        raise ChangesetError(f"changeset {changeset.name!r} has no step {missing[0]!r} to acknowledge")
+    idle = sorted(acknowledge - running.keys())
+    if idle:
+        raise ChangesetError(f"step {idle[0]!r} does not run in this apply: nothing to acknowledge")
+    classified = {label: classify(status.step.sql) for label, status in running.items()}
+    safe = sorted(label for label in acknowledge if classified[label].risk is Risk.SAFE)
+    if safe:
+        raise ChangesetError(f"step {safe[0]!r} is safe: nothing to acknowledge")
+    refused = [label for label, found in classified.items() if found.risk is not Risk.SAFE and label not in acknowledge]
+    if refused:
+        raise GuardRefused([running[label] for label in refused], [classified[label] for label in refused])
+    return {label: classified[label] for label in acknowledge}
+
+
 def _recheck(changeset: Changeset, status: StepStatus, entries: Sequence[LedgerEntry]) -> StepStatus:
     """The step's status as the ledger says it now; where the ledger is silent the earlier status stands."""
     index = changeset.steps.index(status.step)
@@ -617,6 +671,7 @@ def _record_failure(
     *,
     record_fingerprint: bool,
     lock_timeout: float | None,
+    acknowledgement: Classification | None = None,
 ) -> StepFailed:
     """Record a failed step in a transaction of its own; the error to raise.
 
@@ -624,7 +679,8 @@ def _record_failure(
     the ledger silent about it. *lock_timeout* bounds the waits after it.
 
     With *record_fingerprint* the transaction also stores the fingerprint of the database as the steps
-    before the failed one left it. Raises `CavernsError` from *error* when the failure cannot be recorded:
+    before the failed one left it, and with an *acknowledgement* (the step ran acknowledged) the acknowledgement
+    row. Raises `CavernsError` from *error* when the failure cannot be recorded:
     the ledger does not exist (the failed step was its own) or writing the row fails (a read-only
     session). The transaction is rolled back either way, so no fingerprint is recorded then.
     """
@@ -636,6 +692,8 @@ def _record_failure(
             entry = _insert(
                 cursor, changeset.name, step, _OUTCOME_FAILED, error=_recorded_error(error), duration_ms=duration_ms
             )
+            if acknowledgement is not None:
+                _record_acknowledgement(cursor, entry, acknowledgement)
             if record_fingerprint:
                 _record_fingerprint(cursor, entry)
     except Exception as record_error:
@@ -649,6 +707,15 @@ def _record_failure(
 def _record_fingerprint(cursor: Cursor, entry: LedgerEntry) -> None:
     """Store the fingerprint of the watched schemas, as this transaction sees them, at *entry*'s version."""
     record(cursor, entry.version, capture(cursor, watched_schemas(cursor)))
+
+
+def _record_acknowledgement(cursor: Cursor, entry: LedgerEntry, classification: Classification) -> None:
+    """Store what the caller acknowledged for *entry*'s step: its risk and findings, at *entry*'s version."""
+    findings = [
+        {"risk": finding.risk.value, "statement": finding.statement, "reason": finding.reason}
+        for finding in classification.findings
+    ]
+    cursor.execute(_INSERT_ACKNOWLEDGEMENT_SQL, (entry.version, classification.risk.value, json.dumps(findings)))
 
 
 def _warn_of_drift(connection: Connection, changeset: Changeset) -> None:
@@ -680,6 +747,7 @@ def _execute_step(
     *,
     record_fingerprint: bool,
     lock_timeout: float | None,
+    acknowledgement: Classification | None,
 ) -> int:
     """Run the step's SQL as written; its duration in milliseconds.
 
@@ -699,6 +767,7 @@ def _execute_step(
             _elapsed_ms(started),
             record_fingerprint=record_fingerprint,
             lock_timeout=lock_timeout,
+            acknowledgement=acknowledgement,
         ) from error
     return _elapsed_ms(started)
 
@@ -713,6 +782,7 @@ def _write_step(
     first: bool,
     last: bool,
     lock_timeout: float | None,
+    acknowledgement: Classification | None = None,
 ) -> LedgerEntry | None:
     """Run or accept one step in one transaction; None when another runner applied it first.
 
@@ -723,7 +793,8 @@ def _write_step(
     The ledger is read again under the lock: a status that changed since preflight (an `applied`
     one means the work is done) must not be acted on. With *record_fingerprint* a failure of the step
     records a fingerprint with its `failed` row, and, when the step is the *last* of the run, so does
-    its own row.
+    its own row. A step run with an *acknowledgement* (its Murozond classification) writes the acknowledgement
+    row in the same transaction as its `applied` or `failed` row; a step another runner applied first writes none.
     """
     step = status.step
     with transaction(connection) as cursor:
@@ -735,10 +806,22 @@ def _write_step(
             raise PreflightRefused([current])
         duration = None
         if outcome == _OUTCOME_APPLIED:
+            if acknowledgement is not None:
+                _log.warning(
+                    "step %s of changeset %s runs acknowledged as %s", step.label, changeset.name, acknowledgement.risk
+                )
             duration = _execute_step(
-                connection, changeset, cursor, step, record_fingerprint=record_fingerprint, lock_timeout=lock_timeout
+                connection,
+                changeset,
+                cursor,
+                step,
+                record_fingerprint=record_fingerprint,
+                lock_timeout=lock_timeout,
+                acknowledgement=acknowledgement,
             )
         entry = _insert(cursor, changeset.name, step, outcome, duration_ms=duration)
+        if acknowledgement is not None:
+            _record_acknowledgement(cursor, entry, acknowledgement)
         if record_fingerprint and last:
             _record_fingerprint(cursor, entry)
         return entry
@@ -752,14 +835,18 @@ def _apply_statuses(
     accept: frozenset[str],
     *,
     record_fingerprint: bool,
+    acknowledge: frozenset[str] = frozenset(),
     lock_timeout: float | None = DEFAULT_LOCK_TIMEOUT,
 ) -> list[LedgerEntry]:
     """Walk the planned steps in order, each in its own transaction; the rows written.
 
-    With *record_fingerprint* (a consumer's changeset, never Caverns' own) a run that has steps to write
-    first warns of drift, then stores one fingerprint, in the transaction of its last ledger row.
+    With *record_fingerprint* (a consumer's changeset, never Caverns' own) the run is also guarded (`_guard`, after
+    the status refusal and before anything is written; *acknowledge* names the risky steps it may run), and a run
+    that has steps to write first warns of drift, then stores one fingerprint, in the transaction of its last
+    ledger row.
     """
     plan = _plan(changeset, statuses, reapply, accept)
+    acknowledgements = _guard(changeset, plan, acknowledge) if record_fingerprint else {}
     if record_fingerprint and plan:
         _warn_of_drift(connection, changeset)
     written: list[LedgerEntry] = []
@@ -773,6 +860,7 @@ def _apply_statuses(
             first=not written,
             last=position == len(plan),
             lock_timeout=lock_timeout,
+            acknowledgement=acknowledgements.get(status.step.label),
         )
         if entry is not None:
             _log.info(
@@ -822,6 +910,7 @@ def apply(
     *,
     reapply: Collection[str] = (),
     accept: Collection[str] = (),
+    acknowledge: Collection[str] = (),
     lock_timeout: float | None = DEFAULT_LOCK_TIMEOUT,
 ) -> list[LedgerEntry]:
     """Apply the steps of *changeset* that are pending, one transaction and one ledger row each.
@@ -831,6 +920,13 @@ def apply(
     run the SQL, record a new `applied` row) or *accept* (any of the three: record `accepted` without
     running). A step that fails is rolled back, recorded as `failed` and raised as `StepFailed`;
     later steps do not run. Returns the rows written, in order.
+
+    Murozond guards the SQL that runs (a pending step, or one in *reapply*; an *accept*ed step runs none): a step
+    that `murozond.classify` does not call safe refuses the run (`GuardRefused`, a `PreflightRefused`, nothing
+    written) unless its label is in *acknowledge*; an acknowledged step is logged as a warning and recorded in
+    `caverns.acknowledgement`, in the transaction of its `applied` or `failed` row. Caverns' own changeset is not
+    guarded. The refusals, all before anything is written, come in this order: the status refusal, an *acknowledge*
+    label the changeset lacks, whose step does not run in this apply or is safe (`ChangesetError`), the guard.
 
     A run that writes ledger rows stores one fingerprint of the watched schemas, in the transaction of its
     last row (a failed step's `failed` row included); before its first step it logs a warning per difference
@@ -847,6 +943,7 @@ def apply(
     """
     validate_lock_timeout(lock_timeout)
     reapply_names, accept_names = names("reapply", reapply), names("accept", accept)
+    acknowledge_names = names("acknowledge", acknowledge)
     statuses = preflight(connection, changeset)
     check_writable(connection)
     return _apply_statuses(
@@ -856,6 +953,7 @@ def apply(
         reapply_names,
         accept_names,
         record_fingerprint=True,
+        acknowledge=acknowledge_names,
         lock_timeout=lock_timeout,
     )
 

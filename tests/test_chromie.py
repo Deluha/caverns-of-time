@@ -243,15 +243,16 @@ def test_log_shows_the_ledger_newest_first(
     lines = out.splitlines()
     assert lines[0].split() == ["VERSION", "CHANGESET", "LABEL", "OUTCOME", "RECORDED_AT", "(UTC)", "BY"]
     assert [line.split()[:4] for line in lines[1:]] == [
-        ["7", "app", "2_table", "applied"],
-        ["6", "app", "1_schema", "applied"],
+        ["8", "app", "2_table", "applied"],
+        ["7", "app", "1_schema", "applied"],
+        ["6", "caverns", "acknowledgement", "applied"],
         ["5", "caverns", "fingerprint_server", "applied"],
         ["4", "caverns", "privileges", "applied"],
         ["3", "caverns", "epochs", "applied"],
         ["2", "caverns", "fingerprint", "applied"],
         ["1", "caverns", "ledger", "applied"],
     ]
-    assert re.fullmatch(r"\s*7\s+app\s+2_table\s+applied\s+\d{4}-\d\d-\d\d \d\d:\d\d:\d\d\s+\S+", lines[1])
+    assert re.fullmatch(r"\s*8\s+app\s+2_table\s+applied\s+\d{4}-\d\d-\d\d \d\d:\d\d:\d\d\s+\S+", lines[1])
 
 
 def test_log_limit_and_changeset(
@@ -259,11 +260,11 @@ def test_log_limit_and_changeset(
 ) -> None:
     _installed_and_applied(ledger_conn, _changeset_directory(tmp_path))
     _, out, _ = _run(capsys, "log", "--dsn", db_dsn, "--limit", "1")
-    assert [line.split()[0] for line in out.splitlines()[1:]] == ["7"]
+    assert [line.split()[0] for line in out.splitlines()[1:]] == ["8"]
     _, out, _ = _run(capsys, "log", "--dsn", db_dsn, "--limit", "0")
-    assert len(out.splitlines()) == 8
+    assert len(out.splitlines()) == 9
     _, out, _ = _run(capsys, "log", "--dsn", db_dsn, "--changeset", "caverns")
-    assert [line.split()[0] for line in out.splitlines()[1:]] == ["5", "4", "3", "2", "1"]
+    assert [line.split()[0] for line in out.splitlines()[1:]] == ["6", "5", "4", "3", "2", "1"]
     code, out, _ = _run(capsys, "log", "--dsn", db_dsn, "--changeset", "nobody")
     assert (code, out) == (0, "ℹ️ Nothing to show — changeset nobody has no ledger rows.\n")
 
@@ -275,7 +276,7 @@ def test_log_json_has_every_ledger_field(
     code, out, err = _run(capsys, "log", "--dsn", db_dsn, "--format", "json", "--limit", "2")
     rows = json.loads(out)
     assert (code, err) == (0, "")
-    assert [row["version"] for row in rows] == [7, 6]
+    assert [row["version"] for row in rows] == [8, 7]
     assert set(rows[0]) == {
         "version", "changeset", "label", "checksum", "outcome", "fingerprint", "error",
         "duration_ms", "recorded_at", "recorded_by", "caverns_version",
@@ -293,8 +294,8 @@ def test_status_of_applied_steps_succeeds(
     assert (code, err) == (0, "")
     assert [line.split() for line in out.splitlines()] == [
         ["LABEL", "STATUS", "VERSION"],
-        ["1_schema", "applied", "6"],
-        ["2_table", "applied", "7"],
+        ["1_schema", "applied", "7"],
+        ["2_table", "applied", "8"],
         ["✅", "All", "2", "steps", "of", "changeset", "app", "applied."],
     ]
 
@@ -333,8 +334,8 @@ def test_status_json_shape(ledger_conn: Any, db_dsn: str, tmp_path: Path, capsys
     assert json.loads(out) == {
         "changeset": "app",
         "steps": [
-            {"label": "1_schema", "status": "applied", "version": 6},
-            {"label": "2_table", "status": "applied", "version": 7},
+            {"label": "1_schema", "status": "applied", "version": 7},
+            {"label": "2_table", "status": "applied", "version": 8},
             {"label": "3_later", "status": "pending", "version": None},
         ],
     }
@@ -351,9 +352,9 @@ def test_status_of_a_step_before_the_baseline_is_a_finding(
     assert code == chromie.EXIT_FINDING
     assert [line.split() for line in out.splitlines()] == [
         ["LABEL", "STATUS", "VERSION"],
-        ["0_early", "before_baseline", "7"],
-        ["1_schema", "applied", "6"],
-        ["2_table", "applied", "7"],
+        ["0_early", "before_baseline", "8"],
+        ["1_schema", "applied", "7"],
+        ["2_table", "applied", "8"],
     ]
     assert err == "❌ 1 of 3 steps of changeset app not applied: 0_early (before_baseline).\n"
 
@@ -408,8 +409,8 @@ def test_drift_of_an_unchanged_database_is_clean(
     code, out, err = _run(capsys, "drift", str(directory), "--dsn", db_dsn)
     assert (code, err) == (0, "")
     first, last = out.splitlines()
-    assert re.fullmatch(r"ℹ️ Comparing with the fingerprint at ledger version 7 \(schemas: .*nozdormu_test.*\)\.", first)
-    assert last == "✅ No drift — the live schema matches the fingerprint at ledger version 7."
+    assert re.fullmatch(r"ℹ️ Comparing with the fingerprint at ledger version 8 \(schemas: .*nozdormu_test.*\)\.", first)
+    assert last == "✅ No drift — the live schema matches the fingerprint at ledger version 8."
 
 
 def test_drift_lists_each_difference_and_exits_1(
@@ -420,7 +421,7 @@ def test_drift_lists_each_difference_and_exits_1(
     code, out, err = _run(capsys, "drift", "--dsn", db_dsn, "--schema", "nozdormu_test")
     assert code == chromie.EXIT_FINDING
     assert out.splitlines() == [
-        "ℹ️ Comparing with the fingerprint at ledger version 7 (schemas: nozdormu_test).",
+        "ℹ️ Comparing with the fingerprint at ledger version 8 (schemas: nozdormu_test).",
         "-  table   nozdormu_test.t",
         "+  table   nozdormu_test.u",
         "-  column  nozdormu_test.t.id",
@@ -476,7 +477,7 @@ def test_drift_json_of_a_clean_database(
     code, out, err = _run(capsys, "drift", "--dsn", db_dsn, "--format", "json", "--schema", "nozdormu_test")
     assert (code, err) == (0, "")
     assert json.loads(out) == {
-        "fingerprint_version": 7,
+        "fingerprint_version": 8,
         "schemas": ["nozdormu_test"],
         "differences": [],
         "disagreements": [],
@@ -495,13 +496,13 @@ def test_drift_json_of_a_drifted_database(
     )
     assert (code, err) == (chromie.EXIT_FINDING, "")
     assert json.loads(out) == {
-        "fingerprint_version": 7,
+        "fingerprint_version": 8,
         "schemas": ["nozdormu_test"],
         "differences": [
             {"kind": "table", "name": "nozdormu_test.t", "change": "removed"},
             {"kind": "column", "name": "nozdormu_test.t.id", "change": "removed"},
         ],
-        "disagreements": [{"changeset": "app", "label": "2_table", "version": 7}],
+        "disagreements": [{"changeset": "app", "label": "2_table", "version": 8}],
     }
 
 

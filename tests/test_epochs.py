@@ -53,6 +53,7 @@ OWN_ROWS = [
     (3, "epochs", "applied"),
     (4, "privileges", "applied"),
     (5, "fingerprint_server", "applied"),
+    (6, "acknowledgement", "applied"),
 ]
 APP = Changeset("app", [nozdormu.Step("one", "SELECT 1")])
 
@@ -140,6 +141,7 @@ def test_a_database_installed_before_epochs_gets_the_step_with_install(
         (3, "epochs", "applied"),
         (4, "privileges", "applied"),
         (5, "fingerprint_server", "applied"),
+        (6, "acknowledgement", "applied"),
     ]
     assert _query(ledger_conn, LEDGER_ROWS) == OWN_ROWS
     assert _tables_exist(ledger_conn) == EPOCH_TABLES

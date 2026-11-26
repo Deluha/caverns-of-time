@@ -6,7 +6,7 @@ The importable package. It is generic: nothing here names a consumer or assumes 
 (hard rule 1). It holds the version, the shared exceptions, the console helpers and, so far, five
 components: Nozdormu, the migration ledger, Chromie, the command line, Infinite, the schema fingerprint,
 Epochs, the snapshots of opted-in tables (their registry, the snapshot, the catalog, a table as of an epoch, the
-difference of two epochs and their deletion), and Murozond, the classifier of destructive SQL.
+difference of two epochs and their deletion), and Murozond, the classifier of destructive SQL, which guards `apply`.
 
 ## Files & entry points
 
@@ -19,7 +19,7 @@ difference of two epochs and their deletion), and Murozond, the classifier of de
 | `_sql.py` | Shared private SQL reading, not a component: the lexer and the splitter of SQL text into statements of tokens (`split`, `Statement`, `Token`, `Kind`); no database access |
 | `console.py` | The console helpers: status lines with their icons, tables and JSON, the confirmation prompt (`confirm`, `interactive`); the only module that prints or reads |
 | `chromie.py` | Chromie: the `chromie` command's parsing, connection configuration and dispatch (command flow only) |
-| `nozdormu.py` | Nozdormu: the `Step` and `Changeset` model, the checksum, the loaders, the ledger, `install`, `preflight`, `history`, `apply` and `baseline`; it re-exports `Connection`, whose contract lives in `_connection.py` |
+| `nozdormu.py` | Nozdormu: the `Step` and `Changeset` model, the checksum, the loaders, the ledger, `install`, `preflight`, `history`, `apply` (with Murozond's guard and the acknowledgement record) and `baseline`; it re-exports `Connection`, whose contract lives in `_connection.py` |
 | `infinite.py` | Infinite: `fingerprint` and the `Fingerprint` it returns, `drift` and the `Drift` and `Difference` it returns |
 | `murozond.py` | Murozond: `classify` and the `Classification`, `Finding` and `Risk` it returns; pure, no database and no Nozdormu import |
 | `epochs.py` | Epochs: the registry of tracked tables (`register`, `unregister`, `tracked`, `TrackedTable`) in `caverns.epoch_table`, `snapshot`, `catalog`, `as_of`, `diff`, `delete` and the `Epoch`, `EpochTable`, `Column`, `TableAt` and `EpochDiff` (with `TableDiff`, `ColumnChange`, `RowChange`) they return |
@@ -37,12 +37,12 @@ sub-directories, is a step in file-name order, labelled with the file name minus
 readable from one file (`Step.from_file`).
 
 **Nozdormu, the ledger.** Every recorded change is a row of `caverns.ledger`. Caverns creates it itself:
-`install(connection)` applies Caverns' own changeset (named `caverns`, five steps: `ledger`, then `fingerprint`,
+`install(connection)` applies Caverns' own changeset (named `caverns`, six steps: `ledger`, then `fingerprint`,
 the table of recorded fingerprints, then `epochs`, the epoch tables, then `privileges`, below, then `fingerprint_server`,
-the fingerprint table's `server_version` column) and records each step as a ledger row, in the same transaction as its DDL.
+the fingerprint table's `server_version` column, then `acknowledgement`, the table of acknowledged risky steps) and records each step as a ledger row, in the same transaction as its DDL.
 Installing again writes nothing and returns `[]`. Until the ledger exists, reading it behaves as an empty
 ledger; that is how the own changeset bootstraps. A database installed before the `fingerprint`, the `epochs`, the
-`privileges` or the `fingerprint_server` step existed lacks its row: call `install()` again after upgrading, which applies each missing step
+`privileges`, the `fingerprint_server` or the `acknowledgement` step existed lacks its row: call `install()` again after upgrading, which applies each missing step
 as a pending step; until then `preflight`, `apply` and `baseline` raise `LedgerNotInstalled` (`history` needs only
 the ledger table and keeps working), and so do the epoch functions until `epochs` is applied. `drift` raises it before
 the `fingerprint` step; before the `epochs` step it does so only given a changeset (its `preflight` runs first):
@@ -63,7 +63,7 @@ that inherits its privileges is accepted. The grants a role needs to run `apply`
 ```sql
 GRANT USAGE ON SCHEMA caverns TO runner;
 GRANT SELECT, INSERT ON caverns.ledger, caverns.fingerprint, caverns.epoch, caverns.epoch_source,
-    caverns.epoch_row, caverns.epoch_deletion TO runner;
+    caverns.epoch_row, caverns.epoch_deletion, caverns.acknowledgement TO runner;
 GRANT SELECT, INSERT, UPDATE, DELETE ON caverns.epoch_table TO runner;  -- the mutable registry
 GRANT DELETE ON caverns.epoch_row TO runner;                           -- `delete` removes a deleted epoch's rows
 ```
@@ -95,7 +95,7 @@ step is acknowledged (below); add new steps after the baseline's step to avoid i
 `baseline` row whose step the changeset no longer has makes preflight and apply refuse (`ChangesetError`);
 because the ledger is append-only, the way out is a new changeset name. Keep the baseline's step in the changeset.
 
-**Nozdormu, apply.** `apply(connection, changeset, *, reapply=(), accept=(), lock_timeout=5.0)` runs preflight, then walks the
+**Nozdormu, apply.** `apply(connection, changeset, *, reapply=(), accept=(), acknowledge=(), lock_timeout=5.0)` runs preflight, then walks the
 steps in changeset order: `applied` is skipped, `pending` runs. Each write transaction starts at READ
 COMMITTED whatever the session's isolation level, so that what is read under the lock is current. Each step
 is its own transaction: take the ledger's advisory lock, read the ledger again (a step another runner
@@ -153,7 +153,48 @@ A `conflict`, `unknown` or `before_baseline` step refuses the whole run before a
 
 Naming a step in any other status is a `PreflightRefused`; naming a label the changeset lacks, or one
 label in both, is a `ChangesetError`. Preferred practice: add a new step rather than edit one that has
-been applied. Statements that cannot run inside a transaction (`CREATE INDEX CONCURRENTLY`) are
+been applied.
+
+**Nozdormu, the guard.** Murozond (below) guards the SQL that `apply` is about to run. Every planned step whose SQL
+runs, that is a `pending` step or one named in `reapply` (an `accept`ed step runs nothing and needs nothing), is
+classified with `murozond.classify(step.sql)`; one that is not `safe` (`destructive`, `lock_hazard` or `unknown`)
+refuses the whole run unless its label is in `acknowledge`, a collection of labels (a bare string is a
+`ChangesetError`). The refusal is `GuardRefused`, a `PreflightRefused`, raised before anything is written or run:
+`.statuses` and `.classifications` are parallel tuples, one entry per refused step, and the message lists each with
+its risk and its findings' distinct reasons, `Murozond refuses the run for: 002_drop (destructive: DROP TABLE),
+003_idx (lock_hazard: CREATE INDEX without CONCURRENTLY): name each in acknowledge to run it`. Caverns' own
+changeset (`install`) is exempt, and `preflight` is unchanged: it takes no `acknowledge`, never refuses on risk and
+returns the same `StepStatus`. The refusals come in this order, all before anything is written:
+
+1. the status refusal: a `conflict`, `unknown` or `before_baseline` step not named in `reapply` or `accept`
+   (`PreflightRefused`, exactly that type), and the `reapply` and `accept` argument errors;
+2. an invalid `acknowledge` (`ChangesetError`; with several bad labels, the first of each kind in sorted label order,
+   kinds in the order below): a label the changeset lacks (`changeset 'app' has no step 'x' to acknowledge`), a label
+   whose step does not run in this apply, because it is `applied`, `accept`ed or otherwise not planned to run (`step
+   'x' does not run in this apply: nothing to acknowledge`), and a label whose step is safe (`step 'x' is safe: nothing
+   to acknowledge`). The check is strict, so a run that repeats an `acknowledge` after the step was applied is refused
+   with the second message: pass only what the run needs;
+3. Murozond's guard: `GuardRefused`.
+
+An acknowledged step is logged as a warning (`step <label> of changeset <name> runs acknowledged as <risk>`) before it
+runs and recorded in `caverns.acknowledgement`: one row, in the transaction of the step's own ledger row, whether that
+is its `applied` row or, when the step fails, its `failed` row (the failed attempt is acknowledged too). A step that another runner applied first is skipped and writes no acknowledgement.
+
+**The acknowledgement table.** `caverns.acknowledgement`, created by the own step `acknowledgement`, holds one row per
+acknowledged step that ran:
+
+| Column | Holds |
+|---|---|
+| `version` | primary key; the ledger version of the step's `applied` or `failed` row (a foreign key to `caverns.ledger`) |
+| `risk` | the step's risk: `destructive`, `lock_hazard` or `unknown` (a check; never `safe`) |
+| `findings` | a non-empty JSON array of `{"risk", "statement", "reason"}`, one per Murozond finding of the step (a check) |
+| `recorded_at` | `timestamptz`, default `clock_timestamp()` |
+
+It is append-only like the ledger: triggers reject UPDATE, DELETE and TRUNCATE (through `caverns.append_only()`, the
+generic trigger function the step creates and revokes from `PUBLIC` itself). It holds the classification, never the SQL.
+**Upgrade:** run `install()` once after upgrading, as the schema's owner; it applies `acknowledgement`. Until then
+`preflight`, `apply` and `baseline` raise `LedgerNotInstalled` (the own changeset is not fully applied), so a runner
+role cannot apply either: grant it the privilege above on `caverns.acknowledgement` after `install`. Statements that cannot run inside a transaction (`CREATE INDEX CONCURRENTLY`) are
 unsupported in v0.1: such a step fails and is recorded as a failed step.
 
 **Nozdormu, baseline.** `baseline(connection, changeset, *, through=None, schemas=None)` adopts a database
@@ -252,6 +293,8 @@ splits `ALTER TABLE` actions on the commas outside parentheses. A string is read
 A table created earlier in the same SQL (`CREATE [TEMP|UNLOGGED|FOREIGN] TABLE`) is new and empty, so a later
 `CREATE INDEX` on it and any later `ALTER TABLE` of it are `safe`. Names are compared as written, an unquoted name
 folded to lower case: `t` and `public.t` are different tables, so `public.t` after `CREATE TABLE t` is flagged.
+
+`apply` uses `classify` as its guard (see "Nozdormu, the guard" above); the classifier itself never refuses anything.
 
 **Epochs, the registry.** Epochs are snapshots of opted-in tables, taken under a name and tagged with the ledger
 version; the opt-in registry is `caverns.epoch_table`. `register(connection, schema, table, *,
@@ -563,10 +606,10 @@ With nothing found: `✅ No drift — the live schema matches the fingerprint at
   `LedgerNotInstalled` when the ledger table does not exist, and `ChangesetError` for an invalid changeset name or a
   *limit* that is not an integer from 1 to 9223372036854775807, the bigint maximum (a `bool` is not one).
   `chromie log --limit` takes 0 to the same maximum.
-- `apply(connection, changeset, *, reapply=(), accept=(), lock_timeout=5.0) -> list[LedgerEntry]`: the rows written, in order
-  (`[]` when nothing is to do). A bare string for `reapply` or `accept`, a label in both, or a `lock_timeout` that is not
+- `apply(connection, changeset, *, reapply=(), accept=(), acknowledge=(), lock_timeout=5.0) -> list[LedgerEntry]`: the rows written, in order
+  (`[]` when nothing is to do). A bare string for `reapply`, `accept` or `acknowledge`, a label in both `reapply` and `accept`, an `acknowledge` label the changeset lacks or whose step does not run or is safe (see the guard), or a `lock_timeout` that is not
   `None` or a number from 0.001 to 2147483.647 (a `bool` is not one) is a `ChangesetError`; a wait for Caverns' lock that times out before the run wrote a row is a `CavernsError`, nothing written.
-  Raises `PreflightRefused` (attribute `statuses`, the offending steps), `StepFailed` (attributes `label`
+  Raises `PreflightRefused` (attribute `statuses`, the offending steps), its subclass `GuardRefused` (attributes `statuses` and `classifications`, parallel tuples: a step that is not safe and not named in `acknowledge`), `StepFailed` (attributes `label`
   and `version`, the failed row's ledger version; its `__cause__` is the driver's error), a plain
   `CavernsError` (its `__cause__` is the step's error) when a failed step cannot be recorded, and the
   errors of `preflight`. A run that writes rows stores a fingerprint and may log drift warnings (see apply).
@@ -646,7 +689,7 @@ With nothing found: `✅ No drift — the live schema matches the fingerprint at
   text), in statement order and then action order. It raises nothing for any text, runs no SQL and reads no database.
 - The public names are `Connection`, `LedgerEntry`, `Status`, `StepStatus`, `Step`, `Changeset`, `Fingerprint`,
   `Difference`, `Drift`, `Classification`, `Finding`, `Risk`, `TrackedTable`, `Epoch`, `EpochTable`, `Column`, `TableAt`, `EpochDiff`, `TableDiff`, `ColumnChange`, `RowChange` and the functions above; the exceptions, all in `caverns_of_time.errors`, are
-  `CavernsError` (the base), `ChangesetError`, `LedgerNotInstalled`, `PreflightRefused`, `StepFailed`,
+  `CavernsError` (the base), `ChangesetError`, `LedgerNotInstalled`, `PreflightRefused`, `GuardRefused`, `StepFailed`,
   `BaselineRefused`, `NoFingerprint`, `EpochRefused` and `EpochNotFound`.
 - The own changeset is never edited once released: a change to the ledger, the fingerprint table or the epoch
   tables is a new own step (hard rule 6). The DDL of each step is idempotent, and `caverns` is a reserved changeset name.

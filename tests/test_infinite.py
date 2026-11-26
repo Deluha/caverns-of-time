@@ -26,6 +26,7 @@ TEST_DROPS = (
     "DROP FOREIGN DATA WRAPPER IF EXISTS infinite_fdw CASCADE",
 )
 TABLE = f"CREATE TABLE {SCHEMA}.t (id integer NOT NULL, note text DEFAULT 'a')"
+NOOP = "SET LOCAL application_name = 'noop'"  # a step Murozond calls safe that changes nothing
 
 
 def _run(conn: Any, *statements: str) -> None:
@@ -441,7 +442,7 @@ def test_without_a_baseline_a_schema_created_later_is_watched(conn: Any, caplog:
     assert EXT_SCHEMA in result.schemas  # read live: the new schema is watched at once
     assert [(d.change, d.kind, d.name) for d in result.differences] == [("added", "table", f"{EXT_SCHEMA}.u")]
     with caplog.at_level("WARNING"):
-        apply(conn, Changeset("app", [*STEPS, Step("later", "SELECT 1")]))
+        apply(conn, Changeset("app", [*STEPS, Step("later", NOOP)]))
     assert f"added table {EXT_SCHEMA}.u" in caplog.text  # the warning compares the watched schemas too
     assert EXT_SCHEMA in _latest_schemas(conn)
     assert drift(conn).differences == ()
@@ -464,7 +465,7 @@ def test_without_a_baseline_a_dropped_schema_is_drift_and_is_warned_of(
     assert narrowed.schemas == (SCHEMA,)
     assert [(d.change, d.kind, d.name) for d in narrowed.differences] == expected
     with caplog.at_level("WARNING"):
-        apply(conn, Changeset("app", [*STEPS, Step("later", "SELECT 1")]))
+        apply(conn, Changeset("app", [*STEPS, Step("later", NOOP)]))
     assert f"removed table {SCHEMA}.t" in caplog.text  # the pre-apply warning compares the same schemas
     assert SCHEMA not in _latest_schemas(conn)  # the recorded fingerprint describes the database as it now is
     assert drift(conn).differences == ()
@@ -546,7 +547,7 @@ def test_compare_reads_a_schema_in_one_document_only_as_all_added_or_all_removed
 STEPS = [
     Step("schema", f"CREATE SCHEMA {SCHEMA}", check=f"SELECT to_regnamespace('{SCHEMA}') IS NOT NULL"),
     Step("table", TABLE, check=f"SELECT to_regclass('{SCHEMA}.t') IS NOT NULL"),
-    Step("note", "SELECT 1"),  # no check: it can never disagree
+    Step("note", NOOP),  # no check: it can never disagree
 ]
 APP = Changeset("app", STEPS)
 FUNCTION = f"CREATE FUNCTION {SCHEMA}.f(a integer) RETURNS integer LANGUAGE sql AS 'SELECT 1'"
@@ -708,7 +709,7 @@ def test_drift_does_not_call_an_unknown_step_a_disagreement(conn: Any) -> None:
 def test_drift_runs_the_checks_with_the_sessions_search_path(conn: Any) -> None:
     pinned = Step(
         "pinned",
-        "SELECT 1",
+        NOOP,
         check=f"SELECT current_setting('search_path') <> 'pg_catalog' AND to_regclass('{SCHEMA}.t') IS NOT NULL",
     )
     changeset = Changeset("app", [*STEPS, pinned])

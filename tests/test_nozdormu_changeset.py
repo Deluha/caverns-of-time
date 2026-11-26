@@ -235,7 +235,7 @@ def test_the_fingerprint_column_lists_are_the_version_and_the_fingerprint_fields
 
 
 @pytest.mark.parametrize(
-    "table", ["ledger", "fingerprint", "epoch_table", "epoch_source", "epoch_row", "epoch_deletion"]
+    "table", ["ledger", "fingerprint", "epoch_table", "epoch_source", "epoch_row", "epoch_deletion", "acknowledgement"]
 )
 def test_every_sql_constant_names_the_own_tables_in_the_own_schema(table: str) -> None:
     constants = {
@@ -251,9 +251,9 @@ def test_every_sql_constant_names_the_own_tables_in_the_own_schema(table: str) -
             assert qualifier == nozdormu._OWN_CHANGESET_NAME, name
 
 
-def test_the_own_changeset_is_the_ledger_fingerprint_epochs_privileges_and_fingerprint_server_steps() -> None:
+def test_the_own_changeset_is_the_ledger_fingerprint_epochs_privileges_fingerprint_server_and_acknowledgement() -> None:
     labels = [step.label for step in nozdormu._OWN_CHANGESET.steps]
-    assert labels == ["ledger", "fingerprint", "epochs", "privileges", "fingerprint_server"]
+    assert labels == ["ledger", "fingerprint", "epochs", "privileges", "fingerprint_server", "acknowledgement"]
     assert all(step.check for step in nozdormu._OWN_CHANGESET.steps)
 
 
@@ -265,6 +265,7 @@ _OWN_STEP_CHECKSUMS = {
     "epochs": "d35779e89163f27f628f153510a5030bac36a37e58ad9bdf59dcb4cb5ecb8b2f",
     "privileges": "e5c174e922f0240159a9531d986e7c6257df73bfa3d53ba61e94dcd149eaab76",
     "fingerprint_server": "83988cb43b79b838e7d58659a1cee8003bcf20e3670b5025bd6f2bc0d8bde5fb",
+    "acknowledgement": "2495a898d4ec7122fef1051425ccc8f8567a34a7142a95c80453298b3bc8a0ba",
 }
 
 

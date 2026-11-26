@@ -10,6 +10,7 @@ from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:  # nozdormu imports this module
+    from caverns_of_time.murozond import Classification
     from caverns_of_time.nozdormu import StepStatus
 
 
@@ -32,6 +33,20 @@ class PreflightRefused(CavernsError):
         self.statuses = tuple(statuses)
         listing = ", ".join(f"{s.step.label} ({s.status})" for s in self.statuses)
         super().__init__(f"the run is refused for: {listing}")
+
+
+class GuardRefused(PreflightRefused):
+    """Murozond refused a run: a step that is not safe is not named in `acknowledge`; `statuses` and
+    `classifications` hold those steps, in parallel."""
+
+    def __init__(self, statuses: Sequence[StepStatus], classifications: Sequence[Classification]) -> None:
+        self.statuses = tuple(statuses)
+        self.classifications = tuple(classifications)
+        listing = ", ".join(
+            f"{s.step.label} ({c.risk}: {', '.join(dict.fromkeys(f.reason for f in c.findings))})"
+            for s, c in zip(self.statuses, self.classifications, strict=True)
+        )
+        CavernsError.__init__(self, f"Murozond refuses the run for: {listing}: name each in acknowledge to run it")
 
 
 class StepFailed(CavernsError):
