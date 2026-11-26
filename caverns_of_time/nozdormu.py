@@ -545,6 +545,20 @@ def _recheck(changeset: Changeset, status: StepStatus, entries: Sequence[LedgerE
     return status if decision is None else StepStatus(status.step, *decision)
 
 
+def _recorded_error(error: Exception) -> str:
+    """What a `failed` row keeps of *error*: `<SQLSTATE>: <primary message>`, never DETAIL, HINT or CONTEXT.
+
+    Read by duck typing (psycopg 3 `sqlstate`, psycopg2 `pgcode`, both `diag.message_primary`) so that no driver is
+    imported; an error without them keeps the first line of its text, else its class name.
+    """
+    code = getattr(error, "sqlstate", None) or getattr(error, "pgcode", None)
+    primary = getattr(getattr(error, "diag", None), "message_primary", None)
+    if code and primary and isinstance(code, str) and isinstance(primary, str):
+        return f"{code}: {primary}"
+    lines = str(error).strip().splitlines()
+    return lines[0].strip() if lines and lines[0].strip() else type(error).__name__
+
+
 def _record_failure(
     connection: Connection,
     changeset: Changeset,
@@ -566,7 +580,9 @@ def _record_failure(
             lock(cursor)
             if not _ledger_exists(cursor):
                 raise CavernsError("the ledger does not exist")
-            entry = _insert(cursor, changeset.name, step, _OUTCOME_FAILED, error=str(error), duration_ms=duration_ms)
+            entry = _insert(
+                cursor, changeset.name, step, _OUTCOME_FAILED, error=_recorded_error(error), duration_ms=duration_ms
+            )
             if record_fingerprint:
                 _record_fingerprint(cursor, entry)
     except Exception as record_error:

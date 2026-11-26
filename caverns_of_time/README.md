@@ -433,7 +433,7 @@ With nothing found: `✅ No drift — the live schema matches the fingerprint at
   | `checksum` | the step's checksum (64 lower-case hex digits) |
   | `outcome` | `applied`, `failed`, `baseline` or `accepted` |
   | `fingerprint` | required on `baseline`, else null |
-  | `error` | the database error, present exactly on `failed` |
+  | `error` | on `failed` only: the SQLSTATE and the primary message (`<SQLSTATE>: <message>`), never the DETAIL, HINT or CONTEXT; an error without a SQLSTATE keeps the first line of its text. Step SQL must not carry secrets: a primary message can quote a literal of the failing statement. |
   | `duration_ms` | how long the step ran, when it ran |
   | `recorded_at`, `recorded_by` | `clock_timestamp()` and `current_user` at insert |
   | `caverns_version` | the package version that wrote the row |

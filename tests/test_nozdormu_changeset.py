@@ -385,3 +385,8 @@ def test_a_baseline_at_a_step_the_changeset_lacks_is_an_error() -> None:
 def test_a_collection_of_names_is_not_none_or_a_string(values: object) -> None:
     with pytest.raises(ChangesetError, match="must be a collection of names"):
         _connection.names("accept", values)  # type: ignore[arg-type]
+
+
+def test_an_error_without_a_code_records_the_first_line_of_its_text() -> None:
+    assert nozdormu._recorded_error(ValueError("first\nsecond")) == "first"
+    assert nozdormu._recorded_error(ValueError("")) == "ValueError"

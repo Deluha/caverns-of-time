@@ -601,10 +601,32 @@ def test_a_failing_step_is_rolled_back_recorded_and_raised(ledger_conn: Any) -> 
     assert isinstance(failed.value.__cause__, DRIVER_ERRORS)
     assert _query(ledger_conn, APP_ROWS) == [("schema", "applied"), ("bad", "failed")]
     row = _query(ledger_conn, "SELECT version, error, duration_ms FROM caverns.ledger WHERE outcome = 'failed'")[0]
-    assert row[0] == 5 and "division by zero" in row[1] and row[2] >= 0
+    assert row[0] == 5 and row[1] == "22012: division by zero" and row[2] >= 0
     assert not _exists(ledger_conn, "nozdormu_test.bad")  # rolled back with its transaction
     assert not _exists(ledger_conn, "nozdormu_test.later")  # later steps did not run
     assert _statuses(ledger_conn, FAILING) == {"schema": Status.APPLIED, "bad": Status.PENDING, "later": Status.PENDING}
+
+
+def _failed_error(conn: Any, step: Step) -> str | None:
+    """The `error` of the failed row that `step` leaves in a changeset after the schema step."""
+    install(conn)
+    with pytest.raises(StepFailed) as failed:
+        apply(conn, Changeset("app", [SCHEMA, step]))
+    assert isinstance(failed.value.__cause__, DRIVER_ERRORS)
+    return _query(conn, "SELECT error FROM caverns.ledger WHERE outcome = 'failed'")[0][0]
+
+
+def test_a_failed_row_keeps_the_sqlstate_and_the_primary_message(ledger_conn: Any) -> None:
+    missing = Step("missing", "SELECT 1 FROM nozdormu_test.missing")
+    assert _failed_error(ledger_conn, missing) == '42P01: relation "nozdormu_test.missing" does not exist'
+
+
+def test_a_failed_row_drops_the_detail_hint_and_context(ledger_conn: Any) -> None:
+    raising = Step(
+        "raising",
+        "DO $$ BEGIN RAISE EXCEPTION 'boom' USING DETAIL = 'secret detail', HINT = 'h'; END $$",
+    )
+    assert _failed_error(ledger_conn, raising) == "P0001: boom"
 
 
 def test_a_failed_step_can_be_fixed_and_applied(ledger_conn: Any) -> None:
