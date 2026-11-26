@@ -762,7 +762,7 @@ def _apply_statuses(
     plan = _plan(changeset, statuses, reapply, accept)
     if record_fingerprint and plan:
         _warn_of_drift(connection, changeset)
-    written = []
+    written: list[LedgerEntry] = []
     for position, (status, outcome) in enumerate(plan, start=1):
         entry = _write_step(
             connection,
