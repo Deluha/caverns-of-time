@@ -352,10 +352,10 @@ comment, and a psql `\` command, make their statement `unknown`. Function and pr
 
 | Risk | Statements |
 |---|---|
-| `destructive` | every `DROP` (`IF EXISTS`, `DROP INDEX` and `DROP OWNED` included); `ALTER TABLE ... DROP [COLUMN]` and `DROP CONSTRAINT` (a column's `DROP DEFAULT`, `DROP NOT NULL`, `DROP EXPRESSION` and `DROP IDENTITY` are not); an `ALTER` of another object with a `DROP` action; `TRUNCATE`; `DELETE`; a `MERGE` with a `DELETE` |
+| `destructive` | every `DROP` (`IF EXISTS`, `DROP INDEX` and `DROP OWNED` included); `ALTER TABLE ... DROP [COLUMN]` and `DROP CONSTRAINT` (a column's `DROP DEFAULT`, `DROP NOT NULL`, `DROP EXPRESSION` and `DROP IDENTITY` are not); an `ALTER` of another object with a `DROP` action; `TRUNCATE`; `DELETE`; a `MERGE` with a `DELETE`; a `COPY` of a `DELETE` or `MERGE` query (`COPY (DELETE ... RETURNING ...) TO ...`) |
 | `lock_hazard` | `CREATE [UNIQUE] INDEX` without `CONCURRENTLY`; `ADD CONSTRAINT` and `ADD NOT NULL` (PostgreSQL 18) without `NOT VALID` (`PRIMARY KEY` or `UNIQUE ... USING INDEX` is safe); `ALTER COLUMN ... TYPE` and `SET DATA TYPE`; `SET NOT NULL`; `REINDEX` (also with `CONCURRENTLY` turned off in its option list: only no value, `true`, `on`, `1` or those as a string leave it on) and `REFRESH MATERIALIZED VIEW` without `CONCURRENTLY` (a `.concurrently` name is not the keyword); `VACUUM FULL`; `CLUSTER`; `LOCK`; `SET TABLESPACE`; `SET LOGGED` and `SET UNLOGGED`; `ATTACH PARTITION`; `DETACH PARTITION` without `CONCURRENTLY`; `ADD COLUMN` with an inline `PRIMARY KEY`, `UNIQUE` or `GENERATED ... STORED` |
-| `unknown` | `DO`, `CALL`, `EXECUTE`, `SELECT`, `WITH`, `MERGE` without a `DELETE`, other `VACUUM`, transaction control, a statement that does not start with a word or starts with any other keyword, and a statement the lexer cannot read to its end |
-| `safe` | `INSERT`, `UPDATE`, `COPY`, `GRANT`, `REVOKE`, `COMMENT`, `SET`, `RESET`, `ANALYZE`; every other `CREATE`, including `CREATE [OR REPLACE] FUNCTION` and `PROCEDURE`; every other `ALTER`, such as a rename, an owner change, `VALIDATE CONSTRAINT`, `SET (...)` and `SET ACCESS METHOD` |
+| `unknown` | `DO`, `CALL`, `EXECUTE`, `SELECT`, `WITH`, `MERGE` without a `DELETE`, other `VACUUM`, `COPY ... PROGRAM` (runs a shell command on the server), transaction control, a statement that does not start with a word or starts with any other keyword, and a statement the lexer cannot read to its end |
+| `safe` | `INSERT`, `UPDATE`, `COPY` otherwise, `GRANT`, `REVOKE`, `COMMENT`, `SET`, `RESET`, `ANALYZE`; every other `CREATE`, including `CREATE [OR REPLACE] FUNCTION` and `PROCEDURE`; every other `ALTER`, such as a rename, an owner change, `VALIDATE CONSTRAINT`, `SET (...)` and `SET ACCESS METHOD` |
 
 A table created earlier in the same SQL (`CREATE [TEMP|UNLOGGED|FOREIGN] TABLE`; `IF NOT EXISTS` does not count, as
 it may find an old table with data) is new and empty, so a later
@@ -795,7 +795,11 @@ With nothing found: `✅ No drift — the live schema matches the fingerprint at
 - The drift check runs in its own transaction before the first step: drift made between it and the first step is not
   seen, and the run's fingerprint absorbs it unrecorded.
 - Murozond reads strings as with `standard_conforming_strings = on` (PostgreSQL's default); `apply` does not check the
-  setting, and with it off a backslash in a plain string can hide a statement from the classifier.
+  setting, and with it off a backslash in a plain string can hide a statement from the classifier. A `SET
+  standard_conforming_strings = off` in one step also makes a later step's plain strings read differently from how
+  Murozond reads them. Not tightened in v0.1.
+- `ALTER DOMAIN ... ADD CONSTRAINT` without `NOT VALID` and `ALTER DOMAIN ... SET NOT NULL` scan every column of the
+  domain but are not flagged. Not tightened in v0.1.
 - A run stopped after its first row but before its last (killed, connection lost) leaves the latest fingerprint older than
   the ledger; the next `apply` then reads the run's own effect as drift and refuses by default: check `chromie
   drift`, then apply once with `on_drift="warn"`.

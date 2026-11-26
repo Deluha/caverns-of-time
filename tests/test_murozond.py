@@ -324,11 +324,40 @@ def test_unknown_statements(sql: str, reason: str) -> None:
 
 
 @pytest.mark.parametrize(
+    ("sql", "expected"),
+    [
+        ("COPY (DELETE FROM t RETURNING a) TO STDOUT", [(D, 1, "COPY with DELETE")]),
+        (
+            "copy (merge into t using s on true when matched then delete returning 1) to stdout",
+            [(D, 1, "COPY with DELETE"), (D, 1, "COPY with MERGE")],
+        ),
+        (
+            "COPY (MERGE INTO t USING s ON true WHEN MATCHED THEN UPDATE SET a = 1 RETURNING 1) TO STDOUT",
+            [(D, 1, "COPY with MERGE")],
+        ),
+        ("COPY t FROM PROGRAM 'cmd'", [(U, 1, "COPY PROGRAM")]),
+        ("COPY t TO PROGRAM 'cmd'", [(U, 1, "COPY PROGRAM")]),
+        ("COPY (DELETE FROM t RETURNING a) TO PROGRAM 'cmd'", [(D, 1, "COPY with DELETE"), (U, 1, "COPY PROGRAM")]),
+        ("COPY t FROM STDIN", []),
+        ("COPY t TO STDOUT", []),
+        ("COPY (SELECT 1) TO STDOUT", []),
+        ("COPY (SELECT a FROM t) TO STDOUT WITH (FORMAT csv)", []),
+        ("COPY t (a, b) FROM '/file'", []),
+        ("COPY t FROM '/file' WITH (FORMAT csv, DEFAULT 'delete')", []),
+        ('COPY (SELECT 1 AS "delete") TO STDOUT', []),
+        ("COPY (SELECT t.delete FROM t) TO STDOUT", []),
+        ("COPY (SELECT 1) TO STDOUT WITH (FORCE_QUOTE (program))", []),
+    ],
+)
+def test_copy(sql: str, expected: list[tuple[Risk, int, str]]) -> None:
+    assert found(sql) == expected
+
+
+@pytest.mark.parametrize(
     "sql",
     [
         "INSERT INTO t VALUES (1)",
         "UPDATE t SET a = 1",
-        "COPY t FROM STDIN",
         "GRANT SELECT ON t TO r",
         "REVOKE ALL ON t FROM r",
         "COMMENT ON TABLE t IS 'x'",

@@ -12,7 +12,7 @@ The destructive-change guard, and what a run does about drift:
   `safe`) and a `Finding(risk, statement, reason)` per risky statement or `ALTER TABLE` action. Rules in brief:
   every `DROP`, `TRUNCATE`, `DELETE` and `ALTER TABLE ... DROP` is destructive; `CREATE INDEX` without
   `CONCURRENTLY`, `ADD CONSTRAINT` without `NOT VALID`, `ALTER COLUMN TYPE` and `SET NOT NULL` are lock hazards;
-  `DO`, `CALL`, `SELECT` and any statement it does not know are unknown. There is no SQL parser: a lexer reads
+  a `COPY` of a `DELETE` or `MERGE` query is destructive and `COPY ... PROGRAM` is unknown; `DO`, `CALL`, `SELECT` and any statement it does not know are unknown. There is no SQL parser: a lexer reads
   keywords, and a finding's reason is fixed text, never quoted SQL.
 - The guard on `apply`: `apply(..., acknowledge=())` refuses with `GuardRefused` (a `PreflightRefused`) every step that
   would run and is not safe unless its label is named. The refusals come in order, all before anything is written:

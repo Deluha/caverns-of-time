@@ -83,7 +83,7 @@ _COLUMN_HAZARDS = (
     (("STORED",), "ADD COLUMN GENERATED STORED"),
 )
 _TRANSACTION_CONTROL = ("BEGIN", "START", "COMMIT", "END", "ROLLBACK", "ABORT", "SAVEPOINT", "RELEASE", "PREPARE")
-_SAFE_LEADING = frozenset("INSERT UPDATE COPY GRANT REVOKE COMMENT SET RESET ANALYZE ANALYSE".split())
+_SAFE_LEADING = frozenset("INSERT UPDATE GRANT REVOKE COMMENT SET RESET ANALYZE ANALYSE".split())
 _SETTINGS = frozenset({"SET", "RESET"})  # they may change what an unqualified name refers to
 # Statements whose leading keyword alone decides them.
 _FIXED: dict[str, Verdict] = {
@@ -148,6 +148,20 @@ def _drop(tokens: Sequence[Token], _created: set[Name]) -> list[Verdict]:
 
 def _merge(tokens: Sequence[Token], _created: set[Name]) -> list[Verdict]:
     return [(Risk.DESTRUCTIVE, "MERGE with DELETE") if _has(tokens, "DELETE") else (Risk.UNKNOWN, "MERGE")]
+
+
+def _copy(tokens: Sequence[Token], _created: set[Name]) -> list[Verdict]:
+    """`COPY`: a DELETE or MERGE in the parenthesised query is destructive, PROGRAM runs a server command (unknown)."""
+    query: Sequence[Token] = []
+    if len(tokens) > 1 and _is_punct(tokens[1], "("):
+        close = next(
+            (i for i in range(2, len(tokens)) if _is_punct(tokens[i], ")") and tokens[i].depth == 0), len(tokens)
+        )
+        query = tokens[2:close]
+    verdicts = [(Risk.DESTRUCTIVE, f"COPY with {word}") for word in ("DELETE", "MERGE") if _has_keyword(query, word)]
+    if _has_keyword(tokens, "PROGRAM", top=True):
+        verdicts.append((Risk.UNKNOWN, "COPY PROGRAM"))
+    return verdicts
 
 
 def _reindex(tokens: Sequence[Token], _created: set[Name]) -> list[Verdict]:
@@ -314,6 +328,7 @@ def _alter_other(tokens: Sequence[Token]) -> list[Verdict]:
 _HANDLERS: dict[str, Handler] = {
     "DROP": _drop,
     "MERGE": _merge,
+    "COPY": _copy,
     "CREATE": _create,
     "ALTER": _alter,
     "REINDEX": _reindex,
