@@ -51,16 +51,18 @@ read-only transaction that is always rolled back. It decides the ledger first, t
 
 | Status | When |
 |---|---|
-| `applied` | the latest non-failed row matches, or the step is before the baseline's step, or is the baseline's step with an unchanged checksum |
+| `applied` | the latest non-failed row (a `baseline` row included) has the step's checksum |
 | `conflict` | the latest row of the step that is not `failed` has another checksum (the SQL was edited) |
 | `pending` | no such row, and the step has no check or its check is false |
 | `unknown` | no such row, but the check is true: the effect is present and nothing recorded it |
+| `before_baseline` | no such row, and the step sits at or before the baseline's step: it was added after the baseline was taken, so nothing says whether the database has its effect; its check is not run |
 
 A `failed` row never decides a status. A step's check runs only when the ledger is silent about the step.
 A check is exactly one statement: psycopg 3 refuses a second result set (`ChangesetError`), psycopg2
 cannot report one, so there the rule is documented rather than detected.
 
-A step inserted before the baseline's step counts as applied and never runs: add new steps after it. A
+A step inserted before the baseline's step is `before_baseline`, not applied: `apply` refuses the run until the
+step is acknowledged (below); add new steps after the baseline's step to avoid it. A
 `baseline` row whose step the changeset no longer has makes preflight and apply refuse (`ChangesetError`);
 because the ledger is append-only, the way out is a new changeset name. Keep the baseline's step in the changeset.
 
@@ -95,13 +97,13 @@ refuses, and says nothing when no fingerprint is recorded. The warning only reac
 `install` takes the same path for Caverns' own changeset; when the ledger table exists without its row (a
 schema-only restore) it records its own step as `accepted` without running it, and logs a warning.
 
-A `conflict` or `unknown` step refuses the whole run before anything is executed or written
+A `conflict`, `unknown` or `before_baseline` step refuses the whole run before anything is executed or written
 (`PreflightRefused`, listing the steps) unless the caller acknowledges it:
 
 | Argument | Allowed for | Effect |
 |---|---|---|
-| `reapply` | `conflict` | run the edited SQL, record a new `applied` row; the old row stays |
-| `accept` | `conflict`, `unknown` | record an `accepted` row with the current checksum, run nothing |
+| `reapply` | `conflict`, `before_baseline` | run the step's SQL, record a new `applied` row; an old row stays |
+| `accept` | `conflict`, `unknown`, `before_baseline` | record an `accepted` row with the current checksum, run nothing |
 
 Naming a step in any other status is a `PreflightRefused`; naming a label the changeset lacks, or one
 label in both, is a `ChangesetError`. Preferred practice: add a new step rather than edit one that has
@@ -109,15 +111,15 @@ been applied. Statements that cannot run inside a transaction (`CREATE INDEX CON
 unsupported in v0.1: such a step fails and is recorded as a failed step.
 
 **Nozdormu, baseline.** `baseline(connection, changeset, *, through=None, schemas=None)` adopts a database
-that already holds a changeset's effects. It writes one `baseline` row (label: the `through` step, by
-default the last; that step's checksum; a fingerprint) and executes nothing; from then on every step up to
-and including `through` is `applied`, the later ones follow the normal rules. It runs in one transaction
-under the advisory lock and is refused (`BaselineRefused`) when the changeset already has any ledger row.
+that already holds a changeset's effects. It writes one `baseline` row per step from the first through the `through` step (default the last), in
+changeset order, each with its own step's checksum and the same fingerprint hash, and executes nothing; from
+then on every step up to and including `through` is `applied`, the later ones follow the normal rules, and a
+step added before `through` later is `before_baseline`. It runs in one transaction under the advisory lock and is refused (`BaselineRefused`) when the changeset already has any ledger row.
 The fingerprint is the hash of Infinite's fingerprint (below) of the given schemas; without `schemas` it
 covers every schema except `pg_*`, `information_schema` and `caverns`, never an earlier baseline's set. A
 named schema that does not exist is refused. The baseline also stores the fingerprint in
-`caverns.fingerprint`, in the same transaction, at the baseline row's version, which makes its schemas the
-watched schemas.
+`caverns.fingerprint`, in the same transaction, once, at the version of the last baseline row (the `through`
+step's), which makes its schemas the watched schemas.
 
 **Infinite, the fingerprint.** `infinite.fingerprint(connection, *, schemas=None)` reads the shape of a
 database's schemas from the system catalogs, in one read-only transaction that writes nothing and is always
@@ -440,7 +442,7 @@ With nothing found: `✅ No drift — the live schema matches the fingerprint at
   reject UPDATE, DELETE and TRUNCATE (hard rule 5); a correction is a new row. `LedgerEntry` carries these
   columns in this order.
 - `preflight(connection, changeset) -> list[StepStatus]` and `Status` (`applied`, `pending`, `unknown`,
-  `conflict`). A check that does not return exactly one row with one boolean column, or raises a database
+  `conflict`, `before_baseline`). A check that does not return exactly one row with one boolean column, or raises a database
   error, is a `ChangesetError` naming the step; so is a `baseline` row at a step the changeset lacks.
   `LedgerNotInstalled` is raised when Caverns' own changeset is not fully applied (call `install` first,
   also after an upgrade that added an own step).
@@ -459,7 +461,8 @@ With nothing found: `✅ No drift — the live schema matches the fingerprint at
   and `version`, the failed row's ledger version; its `__cause__` is the driver's error), a plain
   `CavernsError` (its `__cause__` is the step's error) when a failed step cannot be recorded, and the
   errors of `preflight`. A run that writes rows stores a fingerprint and may log drift warnings (see apply).
-- `baseline(connection, changeset, *, through=None, schemas=None) -> LedgerEntry`: the row written. Raises
+- `baseline(connection, changeset, *, through=None, schemas=None) -> LedgerEntry`: the `through` step's row (one
+  row is written per step up to it). Raises
   `BaselineRefused` (the changeset has rows; a named schema that does not exist) and `ChangesetError` (a
   `through` the changeset lacks, a bare string for `schemas`, an empty `schemas`). It stores the fingerprint.
 - `infinite.fingerprint(connection, *, schemas=None) -> Fingerprint`: `Fingerprint(schemas, document, hash)`, a

@@ -12,7 +12,7 @@ import pytest
 
 from caverns_of_time import _connection, _fingerprint, epochs, nozdormu
 from caverns_of_time.errors import ChangesetError
-from caverns_of_time.nozdormu import Changeset, LedgerEntry, Status, Step
+from caverns_of_time.nozdormu import Changeset, LedgerEntry, Status, Step, StepStatus
 
 SQL = "CREATE TABLE t (id int);"
 
@@ -319,17 +319,60 @@ def test_a_failed_row_does_not_count() -> None:
     assert _decide([_entry(1, A, "failed")], {"a"})[0] == ("a", Status.UNKNOWN, None)
 
 
-def test_the_baseline_covers_its_step_and_every_step_before_it() -> None:
-    assert _decide([_entry(1, B, "baseline")]) == [
+def test_baseline_rows_decide_their_steps_as_applied() -> None:
+    assert _decide([_entry(1, A, "baseline"), _entry(2, B, "baseline")]) == [
         ("a", Status.APPLIED, 1),
+        ("b", Status.APPLIED, 2),
+        ("c", Status.PENDING, None),
+    ]
+
+
+def test_a_step_before_the_baseline_without_a_row_is_before_the_baseline() -> None:
+    assert _decide([_entry(1, B, "baseline")]) == [
+        ("a", Status.BEFORE_BASELINE, 1),
         ("b", Status.APPLIED, 1),
         ("c", Status.PENDING, None),
     ]
 
 
+def test_a_step_before_the_baseline_skips_its_check() -> None:
+    assert _decide([_entry(1, B, "baseline")], {"a"})[0] == ("a", Status.BEFORE_BASELINE, 1)
+
+
 def test_a_row_of_a_step_before_the_baseline_wins_over_the_baseline() -> None:
     entries = [_entry(1, B, "baseline"), _entry(2, A, checksum="0" * 64)]
     assert _decide(entries)[0] == ("a", Status.CONFLICT, 2)
+    assert _decide([_entry(1, B, "baseline"), _entry(2, A)])[0] == ("a", Status.APPLIED, 2)
+
+
+def test_a_failed_row_before_the_baseline_does_not_lift_the_status() -> None:
+    assert _decide([_entry(1, B, "baseline"), _entry(2, A, "failed")])[0] == ("a", Status.BEFORE_BASELINE, 1)
+
+
+@pytest.mark.parametrize(
+    ("status", "reapply", "accept", "allowed"),
+    [
+        (Status.CONFLICT, True, False, True),
+        (Status.BEFORE_BASELINE, True, False, True),
+        (Status.UNKNOWN, True, False, False),
+        (Status.PENDING, True, False, False),
+        (Status.APPLIED, True, False, False),
+        (Status.CONFLICT, False, True, True),
+        (Status.UNKNOWN, False, True, True),
+        (Status.BEFORE_BASELINE, False, True, True),
+        (Status.PENDING, False, True, False),
+        (Status.APPLIED, False, True, False),
+        (Status.CONFLICT, False, False, False),
+        (Status.UNKNOWN, False, False, False),
+        (Status.BEFORE_BASELINE, False, False, False),
+        (Status.PENDING, False, False, True),
+        (Status.APPLIED, False, False, True),
+    ],
+)
+def test_which_statuses_a_run_may_go_on_past(status: Status, reapply: bool, accept: bool, allowed: bool) -> None:
+    given = StepStatus(A, status, None)
+    reapplied, accepted = frozenset({"a"} if reapply else ()), frozenset({"a"} if accept else ())
+    assert nozdormu._acknowledged(given, reapplied, accepted) is allowed
 
 
 def test_a_baseline_at_a_step_the_changeset_lacks_is_an_error() -> None:

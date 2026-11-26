@@ -200,12 +200,13 @@ class LedgerEntry:
 
 
 class Status(enum.StrEnum):
-    """Where a step stands: recorded as applied, not yet applied, present but unrecorded, or edited."""
+    """Where a step stands: applied, pending, present but unrecorded, edited, or added before the baseline."""
 
     APPLIED = "applied"
     PENDING = "pending"
     UNKNOWN = "unknown"
     CONFLICT = "conflict"
+    BEFORE_BASELINE = "before_baseline"
 
 
 @dataclass(frozen=True)
@@ -426,15 +427,16 @@ def _ledger_decision(
 ) -> tuple[Status, LedgerEntry] | None:
     """What the ledger alone says of the step at *index*, or None when only its check can tell.
 
-    The latest row that is not a failure decides: the same checksum is applied, another is a conflict.
-    Without one, a step at or before the *baseline*'s step (see `_baseline_position`) is applied.
+    The latest row that is not a failure decides (a `baseline` row included): the same checksum is applied,
+    another is a conflict. Without one, a step at or before the *baseline*'s step (see `_baseline_position`)
+    was added after the baseline was taken: `before_baseline`, decided by the baseline row, its check not run.
     """
     step = changeset.steps[index]
     latest = next((e for e in reversed(entries) if e.label == step.label and e.outcome != _OUTCOME_FAILED), None)
     if latest is not None:
         return (Status.APPLIED if latest.checksum == step.checksum else Status.CONFLICT), latest
     if baseline is not None and index <= baseline[1]:
-        return Status.APPLIED, baseline[0]
+        return Status.BEFORE_BASELINE, baseline[0]
     return None
 
 
@@ -500,14 +502,18 @@ def history(connection: Connection, *, changeset: str | None = None, limit: int 
         return [LedgerEntry(*values) for values in cursor.fetchall()]
 
 
+# The statuses that refuse a run until the caller names the step in `accept` (or, bar `unknown`, `reapply`).
+_ACKNOWLEDGEABLE = (Status.CONFLICT, Status.UNKNOWN, Status.BEFORE_BASELINE)
+
+
 def _acknowledged(status: StepStatus, reapply: frozenset[str], accept: frozenset[str]) -> bool:
     """Whether the run may go on past this step as the caller asked."""
     label, current = status.step.label, status.status
     if label in reapply:
-        return current is Status.CONFLICT
+        return current in (Status.CONFLICT, Status.BEFORE_BASELINE)
     if label in accept:
-        return current in (Status.CONFLICT, Status.UNKNOWN)
-    return current not in (Status.CONFLICT, Status.UNKNOWN)
+        return current in _ACKNOWLEDGEABLE
+    return current not in _ACKNOWLEDGEABLE
 
 
 def _plan(
@@ -705,9 +711,9 @@ def apply(
 ) -> list[LedgerEntry]:
     """Apply the steps of *changeset* that are pending, one transaction and one ledger row each.
 
-    A step already applied is skipped. A `conflict` or `unknown` step refuses the whole run
-    (`PreflightRefused`, nothing written) unless named in *reapply* (conflict only: run the edited
-    SQL, record a new `applied` row) or *accept* (conflict or unknown: record `accepted` without
+    A step already applied is skipped. A `conflict`, `unknown` or `before_baseline` step refuses the
+    whole run (`PreflightRefused`, nothing written) unless named in *reapply* (conflict or before_baseline:
+    run the SQL, record a new `applied` row) or *accept* (any of the three: record `accepted` without
     running). A step that fails is rolled back, recorded as `failed` and raised as `StepFailed`;
     later steps do not run. Returns the rows written, in order.
 
@@ -720,13 +726,13 @@ def apply(
     return _apply_statuses(connection, changeset, statuses, reapply_names, accept_names, record_fingerprint=True)
 
 
-def _baseline_step(changeset: Changeset, through: str | None) -> Step:
-    """The step a baseline stands at: *through*, by default the last."""
+def _baseline_steps(changeset: Changeset, through: str | None) -> Sequence[Step]:
+    """The steps a baseline records: the first through *through*, by default the last."""
     if through is None:
-        return changeset.steps[-1]
-    for step in changeset.steps:
+        return changeset.steps
+    for index, step in enumerate(changeset.steps):
         if step.label == through:
-            return step
+            return changeset.steps[: index + 1]
     raise ChangesetError(f"changeset {changeset.name!r} has no step {through!r} to baseline through")
 
 
@@ -739,16 +745,17 @@ def baseline(
 ) -> LedgerEntry:
     """Record an existing database as the starting point of *changeset*; nothing is executed.
 
-    One `baseline` row for the step *through* (default the last) carries that step's checksum and a
-    fingerprint (`infinite.fingerprint`'s hash) of *schemas* (default: every schema but `pg_*`,
-    `information_schema` and `caverns`), which is also stored in `caverns.fingerprint` in the same transaction.
+    One `baseline` row per step through *through* (default the last), in changeset order, each with its own
+    step's checksum and the same fingerprint hash (`infinite.fingerprint`'s) of *schemas* (default: every
+    schema but `pg_*`, `information_schema` and `caverns`); the fingerprint itself is stored once in
+    `caverns.fingerprint`, at the last row's version, in the same transaction. Returns the *through* step's row.
     The schemas of the latest baseline are the watched schemas of later runs. Afterwards every step up to
-    *through* is `applied`. Refused (`BaselineRefused`) when the changeset already has ledger rows or a named
-    schema does not exist.
+    *through* is `applied`; a step added before it later is `before_baseline`. Refused (`BaselineRefused`)
+    when the changeset already has ledger rows or a named schema does not exist.
     """
     check_connection(connection)
     _reject_reserved(changeset)
-    step = _baseline_step(changeset, through)
+    steps = _baseline_steps(changeset, through)
     named = named_schemas(schemas)
     with read_only(connection) as cursor:
         _require_installed(cursor)
@@ -757,7 +764,8 @@ def baseline(
         if _read_entries(cursor, changeset.name):
             raise BaselineRefused(f"changeset {changeset.name!r} already has ledger rows")
         fingerprint = capture(cursor, resolve_schemas(cursor, named, BaselineRefused, default_schemas))
-        entry = _insert(cursor, changeset.name, step, _OUTCOME_BASELINE, fingerprint=fingerprint.hash)
+        for step in steps:
+            entry = _insert(cursor, changeset.name, step, _OUTCOME_BASELINE, fingerprint=fingerprint.hash)
         record(cursor, entry.version, fingerprint)
     _log.info("baseline of changeset %s at step %s: ledger version %d", entry.changeset, entry.label, entry.version)
     return entry

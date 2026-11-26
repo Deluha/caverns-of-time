@@ -338,6 +338,24 @@ def test_status_json_shape(ledger_conn: Any, db_dsn: str, tmp_path: Path, capsys
     }
 
 
+def test_status_of_a_step_before_the_baseline_is_a_finding(
+    ledger_conn: Any, db_dsn: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    directory = _changeset_directory(tmp_path)
+    nozdormu.install(ledger_conn)
+    nozdormu.baseline(ledger_conn, nozdormu.Changeset.from_directory("app", directory))
+    (directory / "0_early.sql").write_text("SELECT 1", encoding="utf-8")
+    code, out, err = _run(capsys, "status", str(directory), "--dsn", db_dsn)
+    assert code == chromie.EXIT_FINDING
+    assert [line.split() for line in out.splitlines()] == [
+        ["LABEL", "STATUS", "VERSION"],
+        ["0_early", "before_baseline", "5"],
+        ["1_schema", "applied", "4"],
+        ["2_table", "applied", "5"],
+    ]
+    assert err == "❌ 1 of 3 steps of changeset app not applied: 0_early (before_baseline).\n"
+
+
 def test_status_json_of_applied_steps_succeeds(
     ledger_conn: Any, db_dsn: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

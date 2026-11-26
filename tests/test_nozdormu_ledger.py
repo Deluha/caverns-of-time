@@ -313,10 +313,14 @@ def test_preflight_trusts_the_ledger_over_a_check(ledger_conn: Any) -> None:
     assert _statuses(ledger_conn)["schema"] is Status.APPLIED
 
 
-def test_preflight_covers_the_steps_up_to_the_baseline(ledger_conn: Any) -> None:
+def test_preflight_marks_a_step_before_the_baseline_that_has_no_row(ledger_conn: Any) -> None:
     install(ledger_conn)
-    _record(ledger_conn, TABLE, "baseline")
-    assert _statuses(ledger_conn) == {"schema": Status.APPLIED, "table": Status.APPLIED, "index": Status.PENDING}
+    _record(ledger_conn, TABLE, "baseline")  # one row only: the schema step has none of its own
+    assert _statuses(ledger_conn) == {
+        "schema": Status.BEFORE_BASELINE,
+        "table": Status.APPLIED,
+        "index": Status.PENDING,
+    }
 
 
 def test_preflight_refuses_a_baseline_at_a_step_the_changeset_lacks(ledger_conn: Any) -> None:
@@ -766,14 +770,21 @@ def test_baseline_refuses_a_connection_with_autocommit_on(ledger_conn: Any) -> N
         ledger_conn.autocommit = False
 
 
-def test_baseline_records_one_row_for_the_last_step_and_runs_nothing(ledger_conn: Any) -> None:
+def test_baseline_records_a_row_per_step_and_runs_nothing(ledger_conn: Any) -> None:
     install(ledger_conn)
     entry = baseline(ledger_conn, APP)
     assert (entry.changeset, entry.label, entry.outcome) == ("app", "index", "baseline")
     assert entry.checksum == INDEX.checksum
     assert FINGERPRINT.fullmatch(entry.fingerprint or "")
     assert (entry.duration_ms, entry.error, entry.caverns_version) == (None, None, __version__)
-    assert _query(ledger_conn, APP_ROWS) == [("index", "baseline")]
+    assert _query(ledger_conn, APP_ROWS) == [("schema", "baseline"), ("table", "baseline"), ("index", "baseline")]
+    rows = _query(
+        ledger_conn, "SELECT label, checksum, fingerprint FROM caverns.ledger WHERE changeset = 'app' ORDER BY version"
+    )
+    assert [(label, checksum) for label, checksum, _ in rows] == [(step.label, step.checksum) for step in APP.steps]
+    assert {fingerprint for _, _, fingerprint in rows} == {entry.fingerprint}  # one hash on every row
+    # The fingerprint is stored once, at the last row's version.
+    assert _query(ledger_conn, "SELECT version FROM caverns.fingerprint") == [(entry.version,)]
     assert not _exists(ledger_conn, "nozdormu_test.t")
     assert set(_statuses(ledger_conn).values()) == {Status.APPLIED}
     assert apply(ledger_conn, APP) == []
@@ -784,8 +795,65 @@ def test_baseline_through_a_step_leaves_the_later_steps_pending(ledger_conn: Any
     _existing_database(ledger_conn)
     entry = baseline(ledger_conn, APP, through="table")
     assert (entry.label, entry.checksum) == ("table", TABLE.checksum)
+    assert _query(ledger_conn, APP_ROWS) == [("schema", "baseline"), ("table", "baseline")]
     assert _statuses(ledger_conn) == {"schema": Status.APPLIED, "table": Status.APPLIED, "index": Status.PENDING}
     assert [(e.label, e.outcome) for e in apply(ledger_conn, APP)] == [("index", "applied")]
+
+
+def _baselined_with_a_step_inserted_before(conn: Any) -> tuple[Changeset, Step]:
+    """Baseline `APP`, then return a changeset with a new step in front of the baseline's step."""
+    install(conn)
+    baseline(conn, APP)
+    early = Step("early", "CREATE TABLE nozdormu_test.early (id int)")
+    return Changeset("app", [SCHEMA, early, TABLE, INDEX]), early
+
+
+def test_a_step_inserted_before_the_baseline_is_before_the_baseline_and_refused(ledger_conn: Any) -> None:
+    changeset, early = _baselined_with_a_step_inserted_before(ledger_conn)
+    assert _statuses(ledger_conn, changeset) == {
+        "schema": Status.APPLIED,
+        "early": Status.BEFORE_BASELINE,
+        "table": Status.APPLIED,
+        "index": Status.APPLIED,
+    }
+    with pytest.raises(PreflightRefused) as refused:
+        apply(ledger_conn, changeset)
+    assert [(s.step, s.status) for s in refused.value.statuses] == [(early, Status.BEFORE_BASELINE)]
+    _assert_idle(ledger_conn)
+    assert len(_query(ledger_conn, APP_ROWS)) == 3
+
+
+def test_reapply_runs_a_step_before_the_baseline_and_records_applied(ledger_conn: Any) -> None:
+    changeset, early = _baselined_with_a_step_inserted_before(ledger_conn)
+    _execute(ledger_conn, SCHEMA.sql)
+    entries = apply(ledger_conn, changeset, reapply=["early"])
+    assert [(e.label, e.outcome) for e in entries] == [("early", "applied")]
+    assert _exists(ledger_conn, "nozdormu_test.early")
+    assert _statuses(ledger_conn, changeset)["early"] is Status.APPLIED
+
+
+def test_accept_records_a_step_before_the_baseline_without_running_it(ledger_conn: Any) -> None:
+    changeset, early = _baselined_with_a_step_inserted_before(ledger_conn)
+    _execute(ledger_conn, SCHEMA.sql)
+    entries = apply(ledger_conn, changeset, accept=["early"])
+    assert [(e.label, e.outcome, e.checksum) for e in entries] == [("early", "accepted", early.checksum)]
+    assert not _exists(ledger_conn, "nozdormu_test.early")
+    assert _statuses(ledger_conn, changeset)["early"] is Status.APPLIED
+
+
+def test_naming_an_applied_step_in_reapply_or_accept_is_refused(ledger_conn: Any) -> None:
+    changeset, _ = _baselined_with_a_step_inserted_before(ledger_conn)
+    for named in ({"reapply": ["table"]}, {"accept": ["table"]}):
+        with pytest.raises(PreflightRefused):
+            apply(ledger_conn, changeset, **named)
+        _assert_idle(ledger_conn)
+
+
+def test_an_edited_step_before_the_baseline_is_a_conflict(ledger_conn: Any) -> None:
+    install(ledger_conn)
+    baseline(ledger_conn, APP)
+    edited = Changeset("app", [Step("schema", "CREATE SCHEMA nozdormu_test -- edited"), TABLE, INDEX])
+    assert _statuses(ledger_conn, edited)["schema"] is Status.CONFLICT
 
 
 def test_baseline_refuses_a_step_the_changeset_lacks(ledger_conn: Any) -> None:
@@ -801,7 +869,7 @@ def test_a_second_baseline_is_refused(ledger_conn: Any) -> None:
     with pytest.raises(BaselineRefused, match="already has ledger rows"):
         baseline(ledger_conn, APP, through="table")
     _assert_idle(ledger_conn)
-    assert _query(ledger_conn, APP_ROWS) == [("index", "baseline")]
+    assert _query(ledger_conn, APP_ROWS) == [("schema", "baseline"), ("table", "baseline"), ("index", "baseline")]
 
 
 def test_a_baseline_is_refused_for_a_changeset_that_was_applied(ledger_conn: Any) -> None:
