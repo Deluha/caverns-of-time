@@ -716,10 +716,9 @@ def _write_step(
 ) -> LedgerEntry | None:
     """Run or accept one step in one transaction; None when another runner applied it first.
 
-    Only the *first* step of a run bounds its wait for Caverns' lock by *lock_timeout* (a timeout raises
-    `CavernsError` with nothing written); a later step waits for it without a timeout, so that the run, which has
-    written already, is not stopped between its rows and its fingerprint. The step's own lock waits are bounded
-    in every case.
+    Until the run has written a row (*first*), the wait for Caverns' lock is bounded by *lock_timeout* (a timeout
+    raises `CavernsError` with nothing written); afterwards a step waits for it without a timeout, so the run is
+    not stopped between its rows and its fingerprint. The step's own lock waits are bounded in every case.
 
     The ledger is read again under the lock: a status that changed since preflight (an `applied`
     one means the work is done) must not be acted on. With *record_fingerprint* a failure of the step
@@ -771,7 +770,7 @@ def _apply_statuses(
             status,
             outcome,
             record_fingerprint=record_fingerprint,
-            first=position == 1,
+            first=not written,
             last=position == len(plan),
             lock_timeout=lock_timeout,
         )

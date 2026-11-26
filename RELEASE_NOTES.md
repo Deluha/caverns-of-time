@@ -14,7 +14,7 @@ What a second review found in Phases 1–3, fixed before new components:
 - A `failed` row's `error` is the SQLSTATE and the primary message (`<SQLSTATE>: <message>`), no longer the whole
   error: step SQL must not carry secrets.
 - `apply(..., lock_timeout=5.0)` and `epochs.snapshot(..., lock_timeout=5.0)`: a wait for a lock gives up after
-  5 seconds (`None` keeps the session's own setting); a timeout on a run's first wait for Caverns' lock is a
+  5 seconds (`None` keeps the session's own setting); a timeout waiting for Caverns' lock before the run wrote a row is a
   `CavernsError`, nothing written. Once the run has written a row its later waits for Caverns' lock (the failure
   record's included) have no timeout, so a run is never stopped between its rows and its fingerprint.
 - Privileges: `install` refuses a `caverns` schema or relation owned by a role the current role is not a member of
