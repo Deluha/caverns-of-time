@@ -52,7 +52,7 @@ of them. A function is executable by `PUBLIC` unless revoked, so a later own ste
 itself (a test asserts that `PUBLIC` can execute no function of `caverns` after `install`); Caverns sets no default
 privileges. Only the schema's owner and the roles it grants to can use the ledger afterwards. Before applying
 anything `install` also refuses, with a `CavernsError` and nothing written, a `caverns` schema, or a relation in it,
-owned by a role the current role is not a member of that inherits its privileges (`schema caverns is owned by role
+owned by a role whose privileges the current role does not inherit (`schema caverns is owned by role
 alice, whose privileges role bob does not inherit: run install as alice or a member that inherits its privileges`; a member granted `WITH INHERIT
 FALSE` is refused too, as it cannot `REVOKE` or `ALTER`); a schema owned by a role the current role is a member of
 that inherits its privileges is accepted. The grants a role needs to run `apply`, `baseline`, `register`, `unregister`, `snapshot` and
@@ -505,8 +505,8 @@ With nothing found: `✅ No drift — the live schema matches the fingerprint at
   and `delete` with `dry_run`) are not checked.
 - `install(connection) -> list[LedgerEntry]`: the rows written, one per own step not yet applied, `[]` when
   Caverns is already installed; an `accepted` row for an own step whose table exists without its row. Raises
-  `CavernsError` for a `caverns` schema or relation owned by a role the current role is not a member of that
-  inherits its privileges.
+  `CavernsError` for a `caverns` schema or relation owned by a role whose privileges the current
+  role does not inherit.
 - The ledger, `caverns.ledger`, one row per recorded event:
 
   | Column | Holds |
