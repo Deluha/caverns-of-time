@@ -880,6 +880,74 @@ def test_snapshot_waits_for_the_lock_and_sees_what_the_holder_committed(ledger_c
     assert [t.row_count for t in result["epoch"].tables] == [2]
 
 
+def test_snapshot_gives_up_waiting_for_caverns_lock_with_a_caverns_error(ledger_conn: Any, second_conn: Any) -> None:
+    _installed_with_tables(ledger_conn, ONE)
+    register(ledger_conn, SCHEMA, "one")
+    _query(second_conn, "SELECT pg_advisory_lock(%s::bigint)", (_connection.ADVISORY_LOCK_KEY,))
+    try:
+        with pytest.raises(CavernsError, match=r"advisory lock: gave up waiting after 0\.2 seconds"):
+            snapshot(ledger_conn, "late", lock_timeout=0.2)
+    finally:
+        second_conn.rollback()
+        _query(second_conn, "SELECT pg_advisory_unlock(%s::bigint)", (_connection.ADVISORY_LOCK_KEY,))
+    _assert_idle(ledger_conn)
+    assert _query(ledger_conn, ADVISORY_LOCKS) == [(0,)]
+    assert catalog(ledger_conn) == []  # nothing written, and no lock left behind
+    assert snapshot(ledger_conn, "late", lock_timeout=0.2).name == "late"
+
+
+def test_snapshot_gives_up_waiting_for_a_source_table_with_the_drivers_error(
+    ledger_conn: Any, second_conn: Any
+) -> None:
+    _installed_with_tables(ledger_conn, ONE)
+    register(ledger_conn, SCHEMA, "one")
+    with second_conn.cursor() as cursor:
+        cursor.execute(f"LOCK TABLE {SCHEMA}.one IN ACCESS EXCLUSIVE MODE")
+    try:
+        with pytest.raises(DRIVER_ERRORS) as refused:
+            snapshot(ledger_conn, "blocked", lock_timeout=0.2)
+    finally:
+        second_conn.rollback()
+    assert _connection.sqlstate(refused.value) == "55P03"
+    assert not isinstance(refused.value, CavernsError)
+    _assert_idle(ledger_conn)
+    assert _query(ledger_conn, ADVISORY_LOCKS) == [(0,)]
+    assert catalog(ledger_conn) == []
+    assert snapshot(ledger_conn, "blocked").name == "blocked"
+
+
+@pytest.mark.parametrize(("option", "seen"), [(None, "7s"), (0.2, "200ms"), ("default", "5s")])
+def test_snapshot_sets_the_lock_timeout_in_its_transaction_only(
+    ledger_conn: Any, monkeypatch: pytest.MonkeyPatch, option: Any, seen: str
+) -> None:
+    _installed_with_tables(ledger_conn, ONE)
+    register(ledger_conn, SCHEMA, "one")
+    _execute(ledger_conn, "SET lock_timeout = '7s'")
+    original = _connection.set_lock_timeout
+    observed: list[str] = []
+
+    def watch(cursor: Any, seconds: float | None) -> None:
+        original(cursor, seconds)
+        cursor.execute("SELECT current_setting('lock_timeout')")
+        observed.append(cursor.fetchone()[0])
+
+    monkeypatch.setattr(epochs, "set_lock_timeout", watch)
+    if option == "default":
+        snapshot(ledger_conn, "a")
+    else:
+        snapshot(ledger_conn, "a", lock_timeout=option)
+    assert observed == [seen]
+    assert _query(ledger_conn, "SHOW lock_timeout") == [("7s",)]
+
+
+def test_snapshot_refuses_a_lock_timeout_that_is_not_valid(ledger_conn: Any) -> None:
+    install(ledger_conn)
+    for value in (0, -1, True, float("nan"), float("inf"), "5", 1e10):
+        with pytest.raises(ChangesetError, match="lock_timeout"):
+            snapshot(ledger_conn, "a", lock_timeout=value)  # type: ignore[arg-type]
+    _assert_idle(ledger_conn)
+
+
 def test_session_lock_is_held_in_the_block_and_released_after_it(ledger_conn: Any) -> None:
     with _connection.session_lock(ledger_conn):
         assert _query(ledger_conn, ADVISORY_LOCKS) == [(1,)]

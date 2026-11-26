@@ -741,6 +741,105 @@ def test_a_runner_waits_for_the_lock_and_reads_the_ledger_after_it(ledger_conn: 
     assert _query(ledger_conn, RACE_ROWS) == [("race", "applied")]
 
 
+# --- lock timeout --------------------------------------------------------------------------
+
+HOLD_LOCK_SQL = "SELECT pg_advisory_lock(%s::bigint)"
+RELEASE_LOCK_SQL = "SELECT pg_advisory_unlock(%s::bigint)"
+SEEN_STEP = Step("seen", "CREATE TABLE nozdormu_test.seen AS SELECT current_setting('lock_timeout') AS v")
+
+
+def _hold_caverns_lock(conn: Any) -> None:
+    """Another session takes Caverns' advisory lock for its session, as a running Caverns write would."""
+    _execute(conn, HOLD_LOCK_SQL, (_connection.ADVISORY_LOCK_KEY,))
+
+
+def _release_caverns_lock(conn: Any) -> None:
+    conn.rollback()
+    _execute(conn, RELEASE_LOCK_SQL, (_connection.ADVISORY_LOCK_KEY,))
+
+
+def test_apply_gives_up_waiting_for_caverns_lock_with_a_caverns_error(ledger_conn: Any, second_conn: Any) -> None:
+    install(ledger_conn)
+    _hold_caverns_lock(second_conn)
+    try:
+        started = time.monotonic()
+        with pytest.raises(CavernsError, match=r"advisory lock: gave up waiting after 0\.2 seconds") as refused:
+            apply(ledger_conn, APP, lock_timeout=0.2)
+        assert time.monotonic() - started < WAIT_SECONDS
+    finally:
+        _release_caverns_lock(second_conn)
+    assert not isinstance(refused.value, StepFailed)
+    assert _connection.sqlstate(refused.value.__cause__) == "55P03"  # type: ignore[arg-type]
+    _assert_idle(ledger_conn)
+    assert _query(ledger_conn, APP_ROWS) == []
+    assert not _exists(ledger_conn, "nozdormu_test.t")
+    assert [e.label for e in apply(ledger_conn, APP, lock_timeout=0.2)] == ["schema", "table", "index"]
+
+
+def test_the_lock_timeout_message_names_whole_seconds_without_a_decimal(ledger_conn: Any, second_conn: Any) -> None:
+    _hold_caverns_lock(second_conn)
+    try:
+        with ledger_conn.cursor() as cursor, pytest.raises(CavernsError, match="after 1 second "):
+            _connection.lock(cursor, lock_timeout=1.0)
+    finally:
+        ledger_conn.rollback()
+        _release_caverns_lock(second_conn)
+
+
+def test_lock_with_no_argument_bounds_the_wait_by_the_default(ledger_conn: Any) -> None:
+    with _connection.transaction(ledger_conn) as cursor:
+        _connection.lock(cursor)
+        cursor.execute("SELECT current_setting('lock_timeout')")
+        assert cursor.fetchone() == ("5s",)
+    assert _query(ledger_conn, "SHOW lock_timeout") == [("0",)]  # transaction-local: the session's own is back
+
+
+@pytest.mark.parametrize(
+    ("option", "seen", "after"),
+    [(None, "7s", "7s"), (0.2, "200ms", "7s"), (0.0001, "1ms", "7s"), ("default", "5s", "7s")],
+)
+def test_apply_sets_the_lock_timeout_for_each_step_only(ledger_conn: Any, option: Any, seen: str, after: str) -> None:
+    install(ledger_conn)
+    _execute(ledger_conn, "SET lock_timeout = '7s'")
+    changeset = Changeset("app", [SCHEMA, SEEN_STEP])
+    if option == "default":
+        apply(ledger_conn, changeset)
+    else:
+        apply(ledger_conn, changeset, lock_timeout=option)
+    assert _query(ledger_conn, "SELECT v FROM nozdormu_test.seen") == [(seen,)]
+    assert _query(ledger_conn, "SHOW lock_timeout") == [(after,)]
+
+
+def test_a_step_that_waits_for_a_lock_fails_with_the_lock_error_recorded(ledger_conn: Any, second_conn: Any) -> None:
+    install(ledger_conn)
+    apply(ledger_conn, FIRST_TWO)
+    reading = Changeset("app", [SCHEMA, TABLE, Step("read", "SELECT count(*) FROM nozdormu_test.t")])
+    with second_conn.cursor() as cursor:
+        cursor.execute("LOCK TABLE nozdormu_test.t IN ACCESS EXCLUSIVE MODE")  # held by an open transaction
+    try:
+        with pytest.raises(StepFailed) as failed:
+            apply(ledger_conn, reading, lock_timeout=0.2)
+    finally:
+        second_conn.rollback()
+    assert isinstance(failed.value.__cause__, DRIVER_ERRORS)
+    assert _connection.sqlstate(failed.value.__cause__) == "55P03"
+    rows = _query(
+        ledger_conn, "SELECT label, outcome, error FROM caverns.ledger WHERE changeset = 'app' ORDER BY version"
+    )
+    assert [(r[0], r[1]) for r in rows] == [("schema", "applied"), ("table", "applied"), ("read", "failed")]
+    assert rows[2][2].startswith("55P03: ")
+    assert [e.label for e in apply(ledger_conn, reading)] == ["read"]  # the step is pending again
+
+
+def test_a_lock_timeout_that_is_not_valid_is_refused_before_anything_runs(ledger_conn: Any) -> None:
+    install(ledger_conn)
+    for value in (0, -1, True, float("nan"), float("inf"), "5", 1e10):
+        with pytest.raises(ChangesetError, match="lock_timeout"):
+            apply(ledger_conn, APP, lock_timeout=value)  # type: ignore[arg-type]
+    apply(ledger_conn, APP, lock_timeout=0.0001)  # one millisecond is a valid timeout
+    assert _query(ledger_conn, APP_ROWS) == [("schema", "applied"), ("table", "applied"), ("index", "applied")]
+
+
 def test_a_percent_sign_in_a_step_is_literal_on_both_drivers(ledger_conn: Any) -> None:
     percent = Step("percent", "CREATE TABLE nozdormu_test.pct AS SELECT 'a%s' AS v, 100 % 7 AS m")
     install(ledger_conn)

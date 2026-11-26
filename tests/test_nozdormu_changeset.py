@@ -390,3 +390,36 @@ def test_a_collection_of_names_is_not_none_or_a_string(values: object) -> None:
 def test_an_error_without_a_code_records_the_first_line_of_its_text() -> None:
     assert nozdormu._recorded_error(ValueError("first\nsecond")) == "first"
     assert nozdormu._recorded_error(ValueError("")) == "ValueError"
+
+
+@pytest.mark.parametrize("value", [None, 0.0001, 0.2, 5, 5.0, 2147483.647])
+def test_a_lock_timeout_that_is_none_or_a_positive_number_is_accepted(value: object) -> None:
+    _connection.validate_lock_timeout(value)
+
+
+@pytest.mark.parametrize("value", [0, 0.0, -1, True, False, float("nan"), float("inf"), float("-inf"), "5", 1e10, [5]])
+def test_a_lock_timeout_that_is_not_a_positive_number_is_refused(value: object) -> None:
+    with pytest.raises(ChangesetError, match="lock_timeout"):
+        _connection.validate_lock_timeout(value)
+
+
+def test_the_default_lock_timeout_is_five_seconds() -> None:
+    assert _connection.DEFAULT_LOCK_TIMEOUT == 5.0
+
+
+class _CodedError(Exception):
+    def __init__(self, **attributes: object) -> None:
+        super().__init__("coded")
+        for name, value in attributes.items():
+            setattr(self, name, value)
+
+
+def test_the_sqlstate_is_read_from_either_drivers_attribute() -> None:
+    assert _connection.sqlstate(_CodedError(sqlstate="55P03")) == "55P03"
+    assert _connection.sqlstate(_CodedError(pgcode="22012")) == "22012"
+    assert _connection.sqlstate(_CodedError(sqlstate=None, pgcode="22012")) == "22012"
+
+
+@pytest.mark.parametrize("error", [ValueError("x"), _CodedError(sqlstate=""), _CodedError(sqlstate=5)])
+def test_an_error_without_a_text_sqlstate_has_none(error: BaseException) -> None:
+    assert _connection.sqlstate(error) is None

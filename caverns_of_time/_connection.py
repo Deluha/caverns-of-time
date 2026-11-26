@@ -9,6 +9,7 @@ validation and catalog helpers the components share (names, limits, the pinned s
 from __future__ import annotations
 
 import logging
+import math
 from collections.abc import Collection, Iterator, Sequence
 from contextlib import contextmanager
 from typing import Any, Protocol
@@ -17,6 +18,7 @@ from caverns_of_time.errors import CavernsError, ChangesetError
 
 __all__ = [
     "ADVISORY_LOCK_KEY",
+    "DEFAULT_LOCK_TIMEOUT",
     "EPOCHS_EXISTS_SQL",
     "Connection",
     "Cursor",
@@ -28,8 +30,11 @@ __all__ = [
     "read_only",
     "run_check",
     "session_lock",
+    "set_lock_timeout",
+    "sqlstate",
     "transaction",
     "validate_limit",
+    "validate_lock_timeout",
     "validate_name",
 ]
 
@@ -74,6 +79,13 @@ ADVISORY_LOCK_KEY = 0x43617665726E73  # "Caverns"
 _LOCK_SQL = "SELECT pg_advisory_xact_lock(%s::bigint)"
 _SESSION_LOCK_SQL = "SELECT pg_advisory_lock(%s::bigint)"
 _SESSION_UNLOCK_SQL = "SELECT pg_advisory_unlock(%s::bigint)"
+# Seconds a Caverns write waits for any lock (its own advisory lock, and for a step the locks its SQL takes).
+DEFAULT_LOCK_TIMEOUT = 5.0
+# Transaction-local: it ends with the transaction, so the session's own setting is never changed.
+_LOCK_TIMEOUT_SQL = "SELECT set_config('lock_timeout', %s, true)"
+_LOCK_NOT_AVAILABLE = "55P03"  # SQLSTATE lock_not_available, what a lock_timeout raises
+_LOCK_TIMEOUT_MAX_MS = 2**31 - 1  # an integer of milliseconds, what `lock_timeout` takes
+_MILLISECONDS = 1000
 # Lets a catalog read name an object by its schema-qualified type regardless of the caller's search_path.
 _PIN_SEARCH_PATH_SQL = "SELECT set_config('search_path', 'pg_catalog', true)"
 # The settings that change how a value prints (`to_jsonb` of a timestamptz, a range of them, interval, float8,
@@ -154,25 +166,65 @@ def read_only(connection: Connection) -> Iterator[Cursor]:
         connection.rollback()
 
 
-def lock(cursor: Cursor) -> None:
-    """Take Caverns' advisory lock until the transaction ends."""
-    cursor.execute(_LOCK_SQL, (ADVISORY_LOCK_KEY,))
+def sqlstate(error: BaseException) -> str | None:
+    """The SQLSTATE of a driver's error (psycopg 3 `sqlstate`, psycopg2 `pgcode`), read without importing a driver."""
+    code = getattr(error, "sqlstate", None) or getattr(error, "pgcode", None)
+    return code if isinstance(code, str) and code else None
+
+
+def _milliseconds(seconds: float) -> int:
+    return max(1, round(seconds * _MILLISECONDS))
+
+
+def set_lock_timeout(cursor: Cursor, seconds: float | None) -> None:
+    """Bound every lock wait of the transaction to *seconds*; None leaves the session's own setting."""
+    if seconds is not None:
+        cursor.execute(_LOCK_TIMEOUT_SQL, (f"{_milliseconds(seconds)}ms",))
+
+
+def _take_advisory_lock(cursor: Cursor, sql: str, lock_timeout: float | None) -> None:
+    """Run the advisory lock statement *sql* under *lock_timeout*; a wait that times out is a `CavernsError`."""
+    set_lock_timeout(cursor, lock_timeout)
+    try:
+        cursor.execute(sql, (ADVISORY_LOCK_KEY,))
+    except Exception as error:
+        if sqlstate(error) != _LOCK_NOT_AVAILABLE:
+            raise
+        waited = "" if lock_timeout is None else f" after {_seconds_text(lock_timeout)}"
+        raise CavernsError(
+            f"another Caverns run holds Caverns' advisory lock: gave up waiting{waited} (lock_timeout)"
+        ) from error
+
+
+def _seconds_text(seconds: float) -> str:
+    text = str(int(seconds)) if seconds == int(seconds) else str(seconds)
+    return f"{text} second" if text == "1" else f"{text} seconds"
+
+
+def lock(cursor: Cursor, *, lock_timeout: float | None = DEFAULT_LOCK_TIMEOUT) -> None:
+    """Take Caverns' advisory lock until the transaction ends.
+
+    *lock_timeout* seconds (None: the session's own setting) bound the wait, and every later lock wait of the
+    transaction; a wait that times out raises `CavernsError`.
+    """
+    _take_advisory_lock(cursor, _LOCK_SQL, lock_timeout)
 
 
 @contextmanager
-def session_lock(connection: Connection) -> Iterator[None]:
+def session_lock(connection: Connection, *, lock_timeout: float | None = DEFAULT_LOCK_TIMEOUT) -> Iterator[None]:
     """Hold Caverns' advisory lock for the session, taken and committed before the block begins.
 
     For a block that runs a REPEATABLE READ `transaction`: the transaction-level `lock` statement would take
     that transaction's snapshot before it waits (see `_READ_COMMITTED_SQL`), while this one commits first, so
-    the snapshot comes after the lock is held. The lock is released when the block ends. A session lock survives
-    a rollback, so a failure while taking it (the server may have granted it) and a block that raised release it
-    best-effort and let the error propagate (a lost connection frees the lock); a release that fails after the
-    block succeeded is logged as a warning, never raised: the block's work is committed.
+    the snapshot comes after the lock is held. *lock_timeout* bounds the wait as for `lock`. The lock is
+    released when the block ends. A session lock survives a rollback, so a failure while taking it (the server
+    may have granted it) and a block that raised release it best-effort and let the error propagate (a lost
+    connection frees the lock); a release that fails after the block succeeded is logged as a warning, never
+    raised: the block's work is committed.
     """
     try:
         with cursor(connection) as cur:
-            cur.execute(_SESSION_LOCK_SQL, (ADVISORY_LOCK_KEY,))
+            _take_advisory_lock(cur, _SESSION_LOCK_SQL, lock_timeout)
         connection.commit()
     except BaseException:
         _release_session_lock_quietly(connection)
@@ -221,6 +273,23 @@ def validate_limit(limit: object) -> None:
         return
     if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= _LIMIT_MAX:
         raise ChangesetError(f"limit must be a positive integer up to {_LIMIT_MAX}, not {limit!r}")
+
+
+def validate_lock_timeout(value: object) -> None:
+    """A lock timeout: None (the session's own) or a positive finite number of seconds, 1 ms to the integer limit."""
+    if value is None:
+        return
+    if (
+        not isinstance(value, int | float)
+        or isinstance(value, bool)
+        or not math.isfinite(value)
+        or not 0 < value
+        or _milliseconds(value) > _LOCK_TIMEOUT_MAX_MS
+    ):
+        raise ChangesetError(
+            f"lock_timeout must be None or a positive number of seconds up to {_LOCK_TIMEOUT_MAX_MS // _MILLISECONDS},"
+            f" not {value!r}"
+        )
 
 
 def validate_name(kind: str, value: object) -> None:

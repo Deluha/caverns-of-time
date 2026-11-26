@@ -14,7 +14,7 @@ difference of two epochs and their deletion).
 |---|---|
 | `__init__.py` | `__version__`, read from the installed distribution's metadata |
 | `errors.py` | The exception types, all in one module |
-| `_connection.py` | Shared private plumbing, not a component: the `Connection` and `Cursor` protocols, the connection guard, the transaction helpers, the advisory lock every Caverns write takes (`ADVISORY_LOCK_KEY`, `lock`; `session_lock` for a REPEATABLE READ `transaction`), the name and limit validation (`validate_name`, `validate_limit`), the pinned search path (`pin_search_path`), the one-statement check runner and the collection-of-names guard |
+| `_connection.py` | Shared private plumbing, not a component: the `Connection` and `Cursor` protocols, the connection guard, the transaction helpers, the advisory lock every Caverns write takes (`ADVISORY_LOCK_KEY`, `lock`; `session_lock` for a REPEATABLE READ `transaction`) and its lock timeout (`DEFAULT_LOCK_TIMEOUT`, `set_lock_timeout`), the SQLSTATE reader `sqlstate`, the name, limit and lock timeout validation (`validate_name`, `validate_limit`, `validate_lock_timeout`), the pinned search path (`pin_search_path`), the one-statement check runner and the collection-of-names guard |
 | `_fingerprint.py` | Shared private fingerprint machinery, not a component: `Fingerprint`, the catalog queries, the document and its hash, the default, watched and missing schemas, `Difference`, `restrict` and `compare`, and the storage of fingerprints in `caverns.fingerprint` (`record`, `latest`) |
 | `console.py` | The console helpers: status lines with their icons, tables and JSON, the confirmation prompt (`confirm`, `interactive`); the only module that prints or reads |
 | `chromie.py` | Chromie: the `chromie` command's parsing, connection configuration and dispatch (command flow only) |
@@ -66,7 +66,7 @@ step is acknowledged (below); add new steps after the baseline's step to avoid i
 `baseline` row whose step the changeset no longer has makes preflight and apply refuse (`ChangesetError`);
 because the ledger is append-only, the way out is a new changeset name. Keep the baseline's step in the changeset.
 
-**Nozdormu, apply.** `apply(connection, changeset, *, reapply=(), accept=())` runs preflight, then walks the
+**Nozdormu, apply.** `apply(connection, changeset, *, reapply=(), accept=(), lock_timeout=5.0)` runs preflight, then walks the
 steps in changeset order: `applied` is skipped, `pending` runs. Each write transaction starts at READ
 COMMITTED whatever the session's isolation level, so that what is read under the lock is current. Each step
 is its own transaction: take the ledger's advisory lock, read the ledger again (a step another runner
@@ -79,6 +79,16 @@ step's own error. That happens when the failed step was Caverns' own `ledger` st
 that cannot create the schema), so there is no ledger to record into, or when the `failed` row cannot be
 written (a read-only session). A connection lost during a step raises the driver's error and records
 nothing. The rows written are returned and logged.
+
+*Lock timeout.* `lock_timeout` is the seconds one step's transaction waits for any lock: before it takes Caverns'
+advisory lock the transaction sets `lock_timeout` to it (transaction-local, so the session's own setting is
+untouched afterwards), which bounds Caverns' lock and every lock the step's SQL then waits for. It is `5.0` by
+default; a positive finite number (rounded to milliseconds, at least 1 ms, at most 2147483.647 s), else
+`ChangesetError`; `None` leaves the session's own `lock_timeout` in force. A timeout on Caverns' lock (another
+Caverns run holds it) raises `CavernsError` naming the lock, with the transaction rolled back and nothing
+written; a timeout inside a step fails the step like any other error: rolled back, a `failed` row whose error is
+`55P03: <message>` and `StepFailed`, the step `pending` again. `install` and `baseline` always use the default, and
+so do `register`, `unregister` and `delete`; they take no parameter.
 
 A run that writes ledger rows stores one fingerprint in `caverns.fingerprint` (below), in the transaction of
 its last ledger row: the last planned step's transaction when that step writes a row, or, when a step fails,
@@ -193,7 +203,7 @@ returns the stored row; another key replaces the stored one (the row's time and 
 warning through the `caverns_of_time.epochs` logger. `unregister` deletes the registry row only: the epochs
 already taken keep the table's rows. The registry is mutable configuration, so it has no trigger.
 
-**Epochs, snapshot.** `snapshot(connection, name)` copies every registered table into one new epoch: a row of
+**Epochs, snapshot.** `snapshot(connection, name, *, lock_timeout=5.0)` copies every registered table into one new epoch: a row of
 `caverns.epoch` (the name, the latest ledger version, the time, the user, the Caverns version), a row of
 `epoch_source` per table (its key, its `columns` as a JSON list of name and type in column order, its row count) and
 a row of `epoch_row` per source row (the key as a JSON object of the key columns' values, the row as `to_jsonb`
@@ -212,7 +222,10 @@ pins for its transaction, so an epoch does not depend on the session that took i
 ends `+00:00`), `IntervalStyle` `postgres`, `extra_float_digits` 1, `bytea_output` `hex`, `DateStyle` `ISO, MDY` and
 `lc_monetary` `C`; the caller's own settings are untouched afterwards. If releasing the advisory lock fails
 after the epoch is committed, the snapshot still returns, with a warning (`could not release Caverns' advisory lock: <error>`) through the
-`caverns_of_time._connection` logger. `catalog(connection, *, limit=None)` lists the epochs
+`caverns_of_time._connection` logger. `lock_timeout` (as for `apply`: seconds, default `5.0`, `None` keeps the
+session's own) bounds the wait for Caverns' advisory lock, where a timeout raises `CavernsError`, and, set at the
+start of the REPEATABLE READ transaction, the wait for each source table's lock: a timeout there rolls the copy
+back and raises the driver's own error (SQLSTATE `55P03`), untranslated. `catalog(connection, *, limit=None)` lists the epochs
 newest first, deleted ones included, each with its tables.
 
 **Epochs, as of.** `as_of(connection, epoch, schema, table, *, limit=None)` reads one table of an epoch back: the
@@ -455,8 +468,9 @@ With nothing found: `✅ No drift — the live schema matches the fingerprint at
   `LedgerNotInstalled` when the ledger table does not exist, and `ChangesetError` for an invalid changeset name or a
   *limit* that is not an integer from 1 to 9223372036854775807, the bigint maximum (a `bool` is not one).
   `chromie log --limit` takes 0 to the same maximum.
-- `apply(connection, changeset, *, reapply=(), accept=()) -> list[LedgerEntry]`: the rows written, in order
-  (`[]` when nothing is to do). A bare string for `reapply` or `accept`, or a label in both, is a `ChangesetError`.
+- `apply(connection, changeset, *, reapply=(), accept=(), lock_timeout=5.0) -> list[LedgerEntry]`: the rows written, in order
+  (`[]` when nothing is to do). A bare string for `reapply` or `accept`, a label in both, or a `lock_timeout` that is not
+  `None` or a positive number (a `bool` is not one) is a `ChangesetError`; a wait for Caverns' lock that times out is a `CavernsError`.
   Raises `PreflightRefused` (attribute `statuses`, the offending steps), `StepFailed` (attributes `label`
   and `version`, the failed row's ledger version; its `__cause__` is the driver's error), a plain
   `CavernsError` (its `__cause__` is the step's error) when a failed step cannot be recorded, and the
@@ -488,8 +502,8 @@ With nothing found: `✅ No drift — the live schema matches the fingerprint at
   `ChangesetError`, `LedgerNotInstalled` and `EpochRefused` (the table is not registered).
 - `epochs.tracked(connection) -> list[TrackedTable]`: the registry ordered by schema and table, in one read-only
   transaction that writes nothing. Raises `LedgerNotInstalled`.
-- `epochs.snapshot(connection, name) -> Epoch`: copies every registered table into a new epoch called *name* (a
-  label-style name, unique for good). Raises `ChangesetError` for a bad name, `LedgerNotInstalled` and `EpochRefused`
+- `epochs.snapshot(connection, name, *, lock_timeout=5.0) -> Epoch`: copies every registered table into a new epoch called *name* (a
+  label-style name, unique for good). Raises `ChangesetError` for a bad name or `lock_timeout`, `CavernsError` when Caverns' lock times out, `LedgerNotInstalled` and `EpochRefused`
   (no registered table, a name taken, a registered table or key column that is gone, a key with duplicates or
   nulls); a refusal writes nothing. Logs `took epoch NAME at ledger version V: N rows in M tables`.
 - `epochs.catalog(connection, *, limit=None) -> list[Epoch]`: the epochs newest first, deleted ones included, at

@@ -17,6 +17,7 @@ from typing import Any
 
 from caverns_of_time import __version__, _connection
 from caverns_of_time._connection import (
+    DEFAULT_LOCK_TIMEOUT,
     EPOCHS_EXISTS_SQL,
     Connection,
     Cursor,
@@ -26,8 +27,10 @@ from caverns_of_time._connection import (
     pin_search_path,
     read_only,
     session_lock,
+    set_lock_timeout,
     transaction,
     validate_limit,
+    validate_lock_timeout,
     validate_name,
 )
 from caverns_of_time.errors import ChangesetError, EpochNotFound, EpochRefused, LedgerNotInstalled
@@ -468,7 +471,7 @@ def _copy_rows(cursor: Cursor, epoch: int, tracked_table: TrackedTable) -> int:
     return int(read)
 
 
-def snapshot(connection: Connection, name: str) -> Epoch:
+def snapshot(connection: Connection, name: str, *, lock_timeout: float | None = DEFAULT_LOCK_TIMEOUT) -> Epoch:
     """Copy every registered table into a new epoch called *name*, tagged with the latest ledger version.
 
     The tables are read in one REPEATABLE READ transaction that starts after Caverns' advisory lock is held, so
@@ -477,10 +480,19 @@ def snapshot(connection: Connection, name: str) -> Epoch:
     nothing. Raises `ChangesetError` for a bad *name*, `LedgerNotInstalled` before `install()` and `EpochRefused`
     for a name that is taken (a deleted epoch's too), no registered table, a registered table or key column that no
     longer exists, and a key with duplicates or nulls.
+
+    *lock_timeout* is the seconds the call waits for Caverns' advisory lock (a timeout raises `CavernsError`) and,
+    in the copying transaction, for the lock on each source table (a timeout there raises the driver's error, after
+    the rollback); None keeps the session's own `lock_timeout`, a number must be positive.
     """
     check_connection(connection)
     validate_name("epoch name", name)
-    with session_lock(connection), transaction(connection, repeatable_read=True) as cursor:
+    validate_lock_timeout(lock_timeout)
+    with (
+        session_lock(connection, lock_timeout=lock_timeout),
+        transaction(connection, repeatable_read=True) as cursor,
+    ):
+        set_lock_timeout(cursor, lock_timeout)
         _require_installed(cursor)
         pin_output_settings(cursor)  # first: a driver reads a timestamptz only in an ISO `DateStyle`
         cursor.execute(_EPOCH_NAME_SQL, (name,))

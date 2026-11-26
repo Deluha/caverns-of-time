@@ -20,6 +20,7 @@ from pathlib import Path
 
 from caverns_of_time import __version__
 from caverns_of_time._connection import (
+    DEFAULT_LOCK_TIMEOUT,
     EPOCHS_EXISTS_SQL,
     Connection,
     Cursor,
@@ -28,8 +29,10 @@ from caverns_of_time._connection import (
     names,
     read_only,
     run_check,
+    sqlstate,
     transaction,
     validate_limit,
+    validate_lock_timeout,
     validate_name,
 )
 from caverns_of_time._fingerprint import (
@@ -551,9 +554,9 @@ def _recorded_error(error: Exception) -> str:
     Read by duck typing (psycopg 3 `sqlstate`, psycopg2 `pgcode`, both `diag.message_primary`) so that no driver is
     imported; an error without them keeps the first line of its text, else its class name.
     """
-    code = getattr(error, "sqlstate", None) or getattr(error, "pgcode", None)
+    code = sqlstate(error)
     primary = getattr(getattr(error, "diag", None), "message_primary", None)
-    if code and primary and isinstance(code, str) and isinstance(primary, str):
+    if code and primary and isinstance(primary, str):
         return f"{code}: {primary}"
     lines = str(error).strip().splitlines()
     return lines[0].strip() if lines and lines[0].strip() else type(error).__name__
@@ -567,6 +570,7 @@ def _record_failure(
     duration_ms: int,
     *,
     record_fingerprint: bool,
+    lock_timeout: float | None,
 ) -> StepFailed:
     """Record a failed step in a transaction of its own; the error to raise.
 
@@ -577,7 +581,7 @@ def _record_failure(
     """
     try:
         with transaction(connection) as cursor:
-            lock(cursor)
+            lock(cursor, lock_timeout=lock_timeout)
             if not _ledger_exists(cursor):
                 raise CavernsError("the ledger does not exist")
             entry = _insert(
@@ -620,7 +624,13 @@ def _warn_of_drift(connection: Connection, changeset: Changeset) -> None:
 
 
 def _execute_step(
-    connection: Connection, changeset: Changeset, cursor: Cursor, step: Step, *, record_fingerprint: bool
+    connection: Connection,
+    changeset: Changeset,
+    cursor: Cursor,
+    step: Step,
+    *,
+    record_fingerprint: bool,
+    lock_timeout: float | None,
 ) -> int:
     """Run the step's SQL as written; its duration in milliseconds.
 
@@ -633,7 +643,13 @@ def _execute_step(
     except Exception as error:
         connection.rollback()
         raise _record_failure(
-            connection, changeset, step, error, _elapsed_ms(started), record_fingerprint=record_fingerprint
+            connection,
+            changeset,
+            step,
+            error,
+            _elapsed_ms(started),
+            record_fingerprint=record_fingerprint,
+            lock_timeout=lock_timeout,
         ) from error
     return _elapsed_ms(started)
 
@@ -646,6 +662,7 @@ def _write_step(
     *,
     record_fingerprint: bool,
     last: bool,
+    lock_timeout: float | None,
 ) -> LedgerEntry | None:
     """Run or accept one step in one transaction; None when another runner applied it first.
 
@@ -656,7 +673,7 @@ def _write_step(
     """
     step = status.step
     with transaction(connection) as cursor:
-        lock(cursor)
+        lock(cursor, lock_timeout=lock_timeout)
         current = _recheck(changeset, status, _read_entries(cursor, changeset.name))
         if current.status is Status.APPLIED:
             return None
@@ -664,7 +681,9 @@ def _write_step(
             raise PreflightRefused([current])
         duration = None
         if outcome == _OUTCOME_APPLIED:
-            duration = _execute_step(connection, changeset, cursor, step, record_fingerprint=record_fingerprint)
+            duration = _execute_step(
+                connection, changeset, cursor, step, record_fingerprint=record_fingerprint, lock_timeout=lock_timeout
+            )
         entry = _insert(cursor, changeset.name, step, outcome, duration_ms=duration)
         if record_fingerprint and last:
             _record_fingerprint(cursor, entry)
@@ -679,6 +698,7 @@ def _apply_statuses(
     accept: frozenset[str],
     *,
     record_fingerprint: bool,
+    lock_timeout: float | None = DEFAULT_LOCK_TIMEOUT,
 ) -> list[LedgerEntry]:
     """Walk the planned steps in order, each in its own transaction; the rows written.
 
@@ -697,6 +717,7 @@ def _apply_statuses(
             outcome,
             record_fingerprint=record_fingerprint,
             last=position == len(plan),
+            lock_timeout=lock_timeout,
         )
         if entry is not None:
             _log.info(
@@ -724,6 +745,7 @@ def apply(
     *,
     reapply: Collection[str] = (),
     accept: Collection[str] = (),
+    lock_timeout: float | None = DEFAULT_LOCK_TIMEOUT,
 ) -> list[LedgerEntry]:
     """Apply the steps of *changeset* that are pending, one transaction and one ledger row each.
 
@@ -736,10 +758,24 @@ def apply(
     A run that writes ledger rows stores one fingerprint of the watched schemas, in the transaction of its
     last row (a failed step's `failed` row included); before its first step it logs a warning per difference
     between the live watched schemas and the latest recorded fingerprint.
+
+    *lock_timeout* is the seconds each step's transaction waits for any lock, Caverns' advisory lock and the
+    locks the step's SQL needs alike (None keeps the session's own `lock_timeout`; a number must be positive).
+    A wait for Caverns' lock that times out raises `CavernsError`, nothing written; one inside a step fails the
+    step like any other error (`failed` row `55P03: ...`, `StepFailed`).
     """
+    validate_lock_timeout(lock_timeout)
     reapply_names, accept_names = names("reapply", reapply), names("accept", accept)
     statuses = preflight(connection, changeset)
-    return _apply_statuses(connection, changeset, statuses, reapply_names, accept_names, record_fingerprint=True)
+    return _apply_statuses(
+        connection,
+        changeset,
+        statuses,
+        reapply_names,
+        accept_names,
+        record_fingerprint=True,
+        lock_timeout=lock_timeout,
+    )
 
 
 def _baseline_steps(changeset: Changeset, through: str | None) -> Sequence[Step]:
