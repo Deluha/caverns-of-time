@@ -50,7 +50,8 @@ def fingerprint(connection: Connection, *, schemas: Collection[str] | None = Non
     """The fingerprint of *schemas* (default: the watched schemas: those of the latest baseline's fingerprint, else
     every schema but `pg_*`, `information_schema` and `caverns`, read now).
 
-    Reads the tables, columns, indexes, constraints, views and functions in one read-only transaction and
+    Reads the tables, columns, indexes, constraints, views, functions, triggers, row-level security, policies
+    and enum labels in one read-only transaction and
     writes nothing. Raises `ChangesetError` for a bare string, a non-string name or an empty collection for
     *schemas*, and for a named schema that does not exist.
     """

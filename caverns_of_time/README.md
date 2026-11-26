@@ -236,7 +236,7 @@ transaction (the caller's session is untouched): `TimeZone` `UTC`, `IntervalStyl
 `bytea_output` `hex`, `DateStyle` `ISO, MDY`, `lc_monetary` `C`, `quote_all_identifiers` `off` and
 `standard_conforming_strings` `on`. A hash does not depend on the session that took it, and a hash recorded under default
 settings is unchanged. The document is keyed by schema, then by kind, then by object name; every schema
-named appears with all six kinds, empty when it holds none, so an empty or dropped schema is visible:
+named appears with all ten kinds, empty when it holds none, so an empty or dropped schema is visible:
 
 | Kind | Key | Value |
 |---|---|---|
@@ -246,9 +246,17 @@ named appears with all six kinds, empty when it holds none, so an empty or dropp
 | `constraint` | `<table>.<constraint>` | `pg_get_constraintdef`; table constraints of the kinds check, foreign key, primary key, unique and exclusion (a `NOT NULL` is the column's `not_null`) |
 | `view` | `<view>` | `{"kind": "v" \| "m", "definition": pg_get_viewdef}`: view or materialized view; a view's shape is its definition |
 | `function` | `<name>(<identity arguments>)` | `pg_get_functiondef`; functions and procedures |
+| `trigger` | `<table>.<trigger>` | `{"definition", "enabled"}`: `pg_get_triggerdef`; `"origin"`, `"disabled"`, `"replica"` or `"always"`. User triggers on any relation (a constraint trigger included); the internal triggers of a foreign key are left out |
+| `row_security` | `<table>` | `{"enabled", "forced"}`: booleans. Only a table (ordinary or partitioned) with either flag set has an entry |
+| `policy` | `<table>.<policy>` | `{"command", "permissive", "roles", "using", "with_check"}`: `"all"`, `"select"`, `"insert"`, `"update"` or `"delete"`; a boolean; the sorted role names (`"public"` for PUBLIC); `pg_get_expr` of the USING and WITH CHECK expressions or null |
+| `enum` | `<type>` | the type's labels, in sort order (a list) |
 
-An object that belongs to an extension is left out (an extension's table takes its indexes and constraints with
-it). Not covered: triggers, sequences, types, grants, ownership, comments and extensions themselves. The hash is the
+An object that belongs to an extension is left out (an extension's table takes its indexes, constraints, triggers
+and policies with it). Not covered: sequences, types other than enums, grants, ownership, comments, extensions
+themselves, storage options and publications. A fingerprint recorded by an earlier release holds fewer kinds
+(the last four above were added later): `compare` compares a schema the recorded document holds on the kinds that
+entry holds, so such a fingerprint reports no drift for the newer kinds, and the next fingerprint recorded covers all
+ten; a schema the recorded document lacks is compared on every kind. The hash is the
 SHA-256 of the document's canonical JSON (sorted keys, no whitespace). Without `schemas` the fingerprint covers
 the watched schemas (below); the result's `schemas` are sorted and unique.
 
@@ -653,7 +661,7 @@ With nothing found: `✅ No drift — the live schema matches the fingerprint at
   for every public function.
 - `infinite.drift(connection, changeset=None, *, schemas=None) -> Drift`: `Drift(fingerprint_version, schemas,
   differences, disagreements)`, a frozen dataclass of the ledger version of the fingerprint compared with, the
-  schemas compared (a tuple), the `Difference(kind, name, change)` values (`kind` one of the six kinds, `change`
+  schemas compared (a tuple), the `Difference(kind, name, change)` values (`kind` one of the ten kinds, `change`
   `added`, `removed` or `changed`) and the `StepStatus` values of the disagreements, each a tuple. Read-only
   transactions, nothing written. Raises `LedgerNotInstalled` before
   `install()` (the fingerprint table does not exist or lacks its `server_version` column; given a *changeset*, also before the `epochs` step, by its
