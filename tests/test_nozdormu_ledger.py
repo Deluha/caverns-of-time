@@ -1128,6 +1128,112 @@ def test_a_step_that_waits_for_a_lock_fails_with_the_lock_error_recorded(ledger_
     assert [e.label for e in apply(ledger_conn, reading)] == ["read"]  # the step is pending again
 
 
+HELD_SECONDS = 0.5
+
+
+def _release_caverns_lock_when_a_runner_has_waited(holder: Any, outcome: dict[str, Any]) -> threading.Thread:
+    """Release the advisory lock *holder* has taken, but only after a runner is seen waiting for it for a while.
+
+    Deterministic: the thread polls `pg_locks` until a waiter is queued, then lets HELD_SECONDS pass (several
+    times any `lock_timeout` the tests use) before it unlocks, so a wait bounded by that timeout has certainly
+    failed by then. The caller must not use *holder* until the thread has joined.
+    """
+
+    def release() -> None:
+        try:
+            _wait_for_a_waiting_lock(holder)
+            time.sleep(HELD_SECONDS)
+            _release_caverns_lock(holder)
+        except BaseException as error:  # reported by the test
+            outcome["error"] = error
+
+    thread = threading.Thread(target=release, daemon=True)
+    thread.start()
+    return thread
+
+
+def _write_planned_step(conn: Any, label: str, *, first: bool, lock_timeout: float | None) -> Any:
+    """What `apply` does for one planned, pending step of APP: `_write_step` in the step's own transaction."""
+    status = next(s for s in preflight(conn, APP) if s.step.label == label)
+    return nozdormu._write_step(
+        conn, APP, status, "applied", record_fingerprint=True, first=first, last=True, lock_timeout=lock_timeout
+    )
+
+
+def test_a_later_step_waits_for_caverns_lock_without_a_timeout(ledger_conn: Any, second_conn: Any) -> None:
+    """After an earlier step committed, the run's next wait for the lock outlasts `lock_timeout`, then goes on.
+
+    The run is cut at the step: a second session cannot be made to take the lock between two steps of a real
+    `apply`, so the per-step writer is called as `apply` calls it for its second step.
+    """
+    install(ledger_conn)
+    apply(ledger_conn, Changeset("app", [SCHEMA]))
+    _hold_caverns_lock(second_conn)
+    outcome: dict[str, Any] = {}
+    releaser = _release_caverns_lock_when_a_runner_has_waited(second_conn, outcome)
+    try:
+        entry = _write_planned_step(ledger_conn, "table", first=False, lock_timeout=0.1)
+    finally:
+        releaser.join(WAIT_SECONDS)
+    assert "error" not in outcome
+    assert (entry.label, entry.outcome) == ("table", "applied")
+    assert _query(ledger_conn, APP_ROWS) == [("schema", "applied"), ("table", "applied")]
+    assert _exists(ledger_conn, "nozdormu_test.t")
+    stored = _query(ledger_conn, "SELECT count(*) FROM caverns.fingerprint WHERE version = %s", (entry.version,))
+    assert stored == [(1,)]
+
+
+def test_the_first_step_still_gives_up_waiting_for_caverns_lock(ledger_conn: Any, second_conn: Any) -> None:
+    install(ledger_conn)
+    _hold_caverns_lock(second_conn)
+    try:
+        with pytest.raises(CavernsError, match=r"advisory lock: gave up waiting after 0\.2 seconds"):
+            _write_planned_step(ledger_conn, "schema", first=True, lock_timeout=0.2)
+    finally:
+        _release_caverns_lock(second_conn)
+    _assert_idle(ledger_conn)
+    assert _query(ledger_conn, APP_ROWS) == []
+    assert not _exists(ledger_conn, "nozdormu_test")
+
+
+def test_a_failure_is_recorded_after_waiting_for_caverns_lock_without_a_timeout(
+    ledger_conn: Any, second_conn: Any
+) -> None:
+    install(ledger_conn)
+    _hold_caverns_lock(second_conn)
+    outcome: dict[str, Any] = {}
+    releaser = _release_caverns_lock_when_a_runner_has_waited(second_conn, outcome)
+    try:
+        failed = nozdormu._record_failure(
+            ledger_conn, APP, SCHEMA, ValueError("boom"), 1, record_fingerprint=False, lock_timeout=0.1
+        )
+    finally:
+        releaser.join(WAIT_SECONDS)
+    assert "error" not in outcome
+    assert failed.label == "schema"
+    assert _query(ledger_conn, "SELECT label, outcome, error FROM caverns.ledger WHERE changeset = 'app'") == [
+        ("schema", "failed", "boom")
+    ]
+
+
+def test_a_later_steps_own_lock_wait_is_still_bounded(ledger_conn: Any, second_conn: Any) -> None:
+    install(ledger_conn)
+    apply(ledger_conn, FIRST_TWO)
+    reading = Changeset(
+        "app", [SCHEMA, TABLE, Step("noop", "SELECT 1"), Step("read", "SELECT count(*) FROM nozdormu_test.t")]
+    )
+    with second_conn.cursor() as cursor:
+        cursor.execute("LOCK TABLE nozdormu_test.t IN ACCESS EXCLUSIVE MODE")
+    try:
+        with pytest.raises(StepFailed) as failed:
+            apply(ledger_conn, reading, lock_timeout=0.2)
+    finally:
+        second_conn.rollback()
+    assert _connection.sqlstate(failed.value.__cause__) == "55P03"  # type: ignore[arg-type]
+    rows = _query(ledger_conn, "SELECT label, outcome FROM caverns.ledger WHERE changeset = 'app' ORDER BY version")
+    assert rows[-2:] == [("noop", "applied"), ("read", "failed")]  # `read` is the run's second step
+
+
 def test_a_lock_timeout_that_is_not_valid_is_refused_before_anything_runs(ledger_conn: Any) -> None:
     install(ledger_conn)
     for value in (0, -1, True, float("nan"), float("inf"), "5", 1e10):

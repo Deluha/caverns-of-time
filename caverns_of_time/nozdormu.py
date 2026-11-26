@@ -22,6 +22,7 @@ from caverns_of_time import __version__
 from caverns_of_time._connection import (
     DEFAULT_LOCK_TIMEOUT,
     EPOCHS_EXISTS_SQL,
+    MILLISECONDS,
     Connection,
     Cursor,
     check_connection,
@@ -79,7 +80,6 @@ _log = logging.getLogger(__name__)
 _ASCII_WHITESPACE = " \t\n\r\f\v"
 _SQL_SUFFIX = ".sql"
 _CHECK_SUFFIX = ".check.sql"
-_MILLISECONDS = 1000
 
 # Caverns' own changeset; its name is also the schema that holds the ledger.
 _OWN_CHANGESET_NAME = "caverns"
@@ -437,7 +437,7 @@ def _read_entries(cursor: Cursor, changeset: str) -> list[LedgerEntry]:
 
 
 def _elapsed_ms(started: float) -> int:
-    return round((time.monotonic() - started) * _MILLISECONDS)
+    return round((time.monotonic() - started) * MILLISECONDS)
 
 
 def _insert(
@@ -619,6 +619,9 @@ def _record_failure(
 ) -> StepFailed:
     """Record a failed step in a transaction of its own; the error to raise.
 
+    The wait for Caverns' lock has no timeout: the run has a failure to record, and losing the row would leave
+    the ledger silent about it. *lock_timeout* bounds the waits after it.
+
     With *record_fingerprint* the transaction also stores the fingerprint of the database as the steps
     before the failed one left it. Raises `CavernsError` from *error* when the failure cannot be recorded:
     the ledger does not exist (the failed step was its own) or writing the row fails (a read-only
@@ -626,7 +629,7 @@ def _record_failure(
     """
     try:
         with transaction(connection) as cursor:
-            lock(cursor, lock_timeout=lock_timeout)
+            lock(cursor, lock_timeout=lock_timeout, unbounded_wait=True)
             if not _ledger_exists(cursor):
                 raise CavernsError("the ledger does not exist")
             entry = _insert(
@@ -706,10 +709,16 @@ def _write_step(
     outcome: str,
     *,
     record_fingerprint: bool,
+    first: bool,
     last: bool,
     lock_timeout: float | None,
 ) -> LedgerEntry | None:
     """Run or accept one step in one transaction; None when another runner applied it first.
+
+    Only the *first* step of a run bounds its wait for Caverns' lock by *lock_timeout* (a timeout raises
+    `CavernsError` with nothing written); a later step waits for it without a timeout, so that the run, which has
+    written already, is not stopped between its rows and its fingerprint. The step's own lock waits are bounded
+    in every case.
 
     The ledger is read again under the lock: a status that changed since preflight (an `applied`
     one means the work is done) must not be acted on. With *record_fingerprint* a failure of the step
@@ -718,7 +727,7 @@ def _write_step(
     """
     step = status.step
     with transaction(connection) as cursor:
-        lock(cursor, lock_timeout=lock_timeout)
+        lock(cursor, lock_timeout=lock_timeout, unbounded_wait=not first)
         current = _recheck(changeset, status, _read_entries(cursor, changeset.name))
         if current.status is Status.APPLIED:
             return None
@@ -761,6 +770,7 @@ def _apply_statuses(
             status,
             outcome,
             record_fingerprint=record_fingerprint,
+            first=position == 1,
             last=position == len(plan),
             lock_timeout=lock_timeout,
         )
@@ -822,10 +832,12 @@ def apply(
     last row (a failed step's `failed` row included); before its first step it logs a warning per difference
     between the live watched schemas and the latest recorded fingerprint.
 
-    *lock_timeout* is the seconds each step's transaction waits for any lock, Caverns' advisory lock and the
-    locks the step's SQL needs alike (None keeps the session's own `lock_timeout`; a number must be positive).
-    A wait for Caverns' lock that times out raises `CavernsError`, nothing written; one inside a step fails the
-    step like any other error (`failed` row `55P03: ...`, `StepFailed`).
+    *lock_timeout* is the seconds each step's transaction waits for a lock its SQL needs, and the first step's
+    for Caverns' advisory lock (None keeps the session's own `lock_timeout`; a number must be positive, 1 ms or
+    more). The first wait for Caverns' lock that times out raises `CavernsError`, nothing written; one inside a
+    step fails the step like any other error (`failed` row `55P03: ...`, `StepFailed`). Once the run has
+    written a row, its later waits for Caverns' lock, the failure record's included, have no timeout, so that a
+    run is never stopped between its rows and its fingerprint.
 
     A standby or a read-only session is refused with `CavernsError`, nothing written.
     """

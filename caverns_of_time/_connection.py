@@ -19,6 +19,7 @@ __all__ = [
     "ADVISORY_LOCK_KEY",
     "DEFAULT_LOCK_TIMEOUT",
     "EPOCHS_EXISTS_SQL",
+    "MILLISECONDS",
     "Connection",
     "Cursor",
     "check_connection",
@@ -86,9 +87,10 @@ _SESSION_UNLOCK_SQL = "SELECT pg_advisory_unlock(%s::bigint)"
 DEFAULT_LOCK_TIMEOUT = 5.0
 # Transaction-local: it ends with the transaction, so the session's own setting is never changed.
 _LOCK_TIMEOUT_SQL = "SELECT set_config('lock_timeout', %s, true)"
+_NO_LOCK_TIMEOUT = "0"  # lock_timeout 0 waits for ever
 _LOCK_NOT_AVAILABLE = "55P03"  # SQLSTATE lock_not_available, what a lock_timeout raises
 _LOCK_TIMEOUT_MAX_MS = 2**31 - 1  # an integer of milliseconds, what `lock_timeout` takes
-_MILLISECONDS = 1000
+MILLISECONDS = 1000
 # Lets a catalog read name an object by its schema-qualified type regardless of the caller's search_path.
 _PIN_SEARCH_PATH_SQL = "SELECT set_config('search_path', 'pg_catalog', true)"
 # The settings that change how a value prints (`to_jsonb` of a timestamptz, a range of them, interval, float8,
@@ -202,18 +204,30 @@ def sqlstate(error: BaseException) -> str | None:
 
 
 def _milliseconds(seconds: float) -> int:
-    return max(1, round(seconds * _MILLISECONDS))
+    return max(1, round(seconds * MILLISECONDS))
+
+
+def _set_lock_timeout_setting(cursor: Cursor, value: str) -> None:
+    cursor.execute(_LOCK_TIMEOUT_SQL, (value,))
 
 
 def set_lock_timeout(cursor: Cursor, seconds: float | None) -> None:
     """Bound every lock wait of the transaction to *seconds*; None leaves the session's own setting."""
     if seconds is not None:
-        cursor.execute(_LOCK_TIMEOUT_SQL, (f"{_milliseconds(seconds)}ms",))
+        _set_lock_timeout_setting(cursor, f"{_milliseconds(seconds)}ms")
 
 
-def _take_advisory_lock(cursor: Cursor, sql: str, lock_timeout: float | None) -> None:
-    """Run the advisory lock statement *sql* under *lock_timeout*; a wait that times out is a `CavernsError`."""
-    set_lock_timeout(cursor, lock_timeout)
+def _take_advisory_lock(cursor: Cursor, sql: str, lock_timeout: float | None, *, unbounded_wait: bool = False) -> None:
+    """Run the advisory lock statement *sql* under *lock_timeout*; a wait that times out is a `CavernsError`.
+
+    With *unbounded_wait* (and a *lock_timeout*) the statement waits with no timeout and *lock_timeout* is set
+    after it, for the transaction's later lock waits.
+    """
+    unbounded_wait = unbounded_wait and lock_timeout is not None
+    if unbounded_wait:
+        _set_lock_timeout_setting(cursor, _NO_LOCK_TIMEOUT)
+    else:
+        set_lock_timeout(cursor, lock_timeout)
     try:
         cursor.execute(sql, (ADVISORY_LOCK_KEY,))
     except Exception as error:
@@ -223,6 +237,8 @@ def _take_advisory_lock(cursor: Cursor, sql: str, lock_timeout: float | None) ->
         raise CavernsError(
             f"another Caverns run holds Caverns' advisory lock: gave up waiting{waited} (lock_timeout)"
         ) from error
+    if unbounded_wait:
+        set_lock_timeout(cursor, lock_timeout)
 
 
 def _seconds_text(seconds: float) -> str:
@@ -230,13 +246,15 @@ def _seconds_text(seconds: float) -> str:
     return f"{text} second" if text == "1" else f"{text} seconds"
 
 
-def lock(cursor: Cursor, *, lock_timeout: float | None = DEFAULT_LOCK_TIMEOUT) -> None:
+def lock(cursor: Cursor, *, lock_timeout: float | None = DEFAULT_LOCK_TIMEOUT, unbounded_wait: bool = False) -> None:
     """Take Caverns' advisory lock until the transaction ends.
 
     *lock_timeout* seconds (None: the session's own setting) bound the wait, and every later lock wait of the
-    transaction; a wait that times out raises `CavernsError`.
+    transaction; a wait that times out raises `CavernsError`. With *unbounded_wait* the wait for Caverns' lock
+    has no timeout (for a run that has written already and must not stop before it is complete), and
+    *lock_timeout* bounds only the waits after it; with None the session's own setting governs both.
     """
-    _take_advisory_lock(cursor, _LOCK_SQL, lock_timeout)
+    _take_advisory_lock(cursor, _LOCK_SQL, lock_timeout, unbounded_wait=unbounded_wait)
 
 
 @contextmanager
@@ -342,7 +360,7 @@ def validate_lock_timeout(value: object) -> None:
         or _milliseconds(value) > _LOCK_TIMEOUT_MAX_MS
     ):
         raise ChangesetError(
-            f"lock_timeout must be None or a positive number of seconds up to {_LOCK_TIMEOUT_MAX_MS // _MILLISECONDS},"
+            f"lock_timeout must be None or a positive number of seconds up to {_LOCK_TIMEOUT_MAX_MS // MILLISECONDS},"
             f" not {value!r}"
         )
 

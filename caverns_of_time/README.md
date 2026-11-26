@@ -106,15 +106,18 @@ that cannot create the schema), so there is no ledger to record into, or when th
 written (a read-only session). A connection lost during a step raises the driver's error and records
 nothing. The rows written are returned and logged.
 
-*Lock timeout.* `lock_timeout` is the seconds one step's transaction waits for any lock: before it takes Caverns'
-advisory lock the transaction sets `lock_timeout` to it (transaction-local, so the session's own setting is
-untouched afterwards), which bounds Caverns' lock and every lock the step's SQL then waits for. It is `5.0` by
-default; a positive finite number (rounded to milliseconds, at least 1 ms, at most 2147483.647 s), else
-`ChangesetError`; `None` leaves the session's own `lock_timeout` in force. A timeout on Caverns' lock (another
-Caverns run holds it) raises `CavernsError` naming the lock, with the transaction rolled back and nothing
-written; a timeout inside a step fails the step like any other error: rolled back, a `failed` row whose error is
-`55P03: <message>` and `StepFailed`, the step `pending` again. `install` and `baseline` always use the default, and
-so do `register`, `unregister` and `delete`; they take no parameter.
+*Lock timeout.* `lock_timeout` is the seconds one step's transaction waits for a lock its SQL needs, and the
+run's first step waits for Caverns' lock: the transaction sets `lock_timeout` to it (transaction-local, so the
+session's own setting is untouched afterwards) before it takes Caverns' advisory lock, and the step's SQL runs under
+it. It is `5.0` by default; a positive finite number (rounded to milliseconds, at least 1 ms, at most 2147483.647 s),
+else `ChangesetError`; `None` leaves the session's own `lock_timeout` in force. A timeout on that first wait for
+Caverns' lock (another Caverns run holds it) raises `CavernsError` naming the lock, with the transaction rolled back
+and nothing written. Once the run has committed a step, its later waits for Caverns' lock, and the one that
+records a failure, have no timeout (`lock_timeout` is set after the lock is held), so a run is never stopped between
+its rows and its fingerprint, and a `failed` row is never lost to a busy lock; the waits of every step's own SQL
+stay bounded. A timeout inside a step fails the step like any other error: rolled back, a `failed` row whose error
+is `55P03: <message>` and `StepFailed`, the step `pending` again. `install` follows the same rule, with the fixed
+default; `baseline`, `register`, `unregister` and `delete` always use the default too, and take no parameter.
 
 *Search path.* A step's SQL and its check run under the connection's own `search_path`, which Caverns does not pin:
 schema-qualify every object a step creates or touches, or the step builds in whatever schema the session's path
@@ -533,7 +536,7 @@ With nothing found: `✅ No drift — the live schema matches the fingerprint at
   `chromie log --limit` takes 0 to the same maximum.
 - `apply(connection, changeset, *, reapply=(), accept=(), lock_timeout=5.0) -> list[LedgerEntry]`: the rows written, in order
   (`[]` when nothing is to do). A bare string for `reapply` or `accept`, a label in both, or a `lock_timeout` that is not
-  `None` or a positive number (a `bool` is not one) is a `ChangesetError`; a wait for Caverns' lock that times out is a `CavernsError`.
+  `None` or a positive number (a `bool` is not one) is a `ChangesetError`; the first step's wait for Caverns' lock that times out is a `CavernsError`, nothing written.
   Raises `PreflightRefused` (attribute `statuses`, the offending steps), `StepFailed` (attributes `label`
   and `version`, the failed row's ledger version; its `__cause__` is the driver's error), a plain
   `CavernsError` (its `__cause__` is the step's error) when a failed step cannot be recorded, and the
