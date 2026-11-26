@@ -40,7 +40,12 @@ DRIVER_ERRORS = (psycopg.Error, psycopg2.Error)
 SCHEMA = "nozdormu_test"
 EPOCH_TABLES = ["epoch", "epoch_deletion", "epoch_row", "epoch_source", "epoch_table"]
 LEDGER_ROWS = "SELECT version, label, outcome FROM caverns.ledger WHERE changeset = 'caverns' ORDER BY version"
-OWN_ROWS = [(1, "ledger", "applied"), (2, "fingerprint", "applied"), (3, "epochs", "applied")]
+OWN_ROWS = [
+    (1, "ledger", "applied"),
+    (2, "fingerprint", "applied"),
+    (3, "epochs", "applied"),
+    (4, "privileges", "applied"),
+]
 APP = Changeset("app", [nozdormu.Step("one", "SELECT 1")])
 
 
@@ -123,7 +128,10 @@ def test_a_database_installed_before_epochs_gets_the_step_with_install(
     _assert_idle(ledger_conn)
     assert [e.label for e in nozdormu.history(ledger_conn)] == ["fingerprint", "ledger"]  # the old rows still read
     entries = install(ledger_conn)
-    assert [(e.version, e.label, e.outcome) for e in entries] == [(3, "epochs", "applied")]
+    assert [(e.version, e.label, e.outcome) for e in entries] == [
+        (3, "epochs", "applied"),
+        (4, "privileges", "applied"),
+    ]
     assert _query(ledger_conn, LEDGER_ROWS) == OWN_ROWS
     assert _tables_exist(ledger_conn) == EPOCH_TABLES
     assert len(preflight(ledger_conn, APP)) == len(APP.steps)

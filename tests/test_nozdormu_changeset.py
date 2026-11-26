@@ -241,8 +241,9 @@ def test_every_sql_constant_names_the_own_tables_in_the_own_schema(table: str) -
             assert qualifier == nozdormu._OWN_CHANGESET_NAME, name
 
 
-def test_the_own_changeset_is_the_ledger_fingerprint_and_epochs_steps() -> None:
-    assert [step.label for step in nozdormu._OWN_CHANGESET.steps] == ["ledger", "fingerprint", "epochs"]
+def test_the_own_changeset_is_the_ledger_fingerprint_epochs_and_privileges_steps() -> None:
+    labels = [step.label for step in nozdormu._OWN_CHANGESET.steps]
+    assert labels == ["ledger", "fingerprint", "epochs", "privileges"]
     assert all(step.check for step in nozdormu._OWN_CHANGESET.steps)
 
 
@@ -252,6 +253,7 @@ _OWN_STEP_CHECKSUMS = {
     "ledger": "6ccdacf3430bfa341afd4f7f0d7fdba8a76c5ce344b58109387a38ca7ab1251b",
     "fingerprint": "69a4b5b9fe688d80e5089127f8f2c022dcdeb5d1aee13279a7ab0bd62bc8ba31",
     "epochs": "d35779e89163f27f628f153510a5030bac36a37e58ad9bdf59dcb4cb5ecb8b2f",
+    "privileges": "e5c174e922f0240159a9531d986e7c6257df73bfa3d53ba61e94dcd149eaab76",
 }
 
 

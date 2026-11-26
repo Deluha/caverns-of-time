@@ -35,15 +35,40 @@ sub-directories, is a step in file-name order, labelled with the file name minus
 readable from one file (`Step.from_file`).
 
 **Nozdormu, the ledger.** Every recorded change is a row of `caverns.ledger`. Caverns creates it itself:
-`install(connection)` applies Caverns' own changeset (named `caverns`, three steps: `ledger`, then `fingerprint`,
-the table of recorded fingerprints, then `epochs`, the epoch tables) and records each step as a ledger row, in the same transaction as its DDL.
+`install(connection)` applies Caverns' own changeset (named `caverns`, four steps: `ledger`, then `fingerprint`,
+the table of recorded fingerprints, then `epochs`, the epoch tables, then `privileges`, below) and records each step as a ledger row, in the same transaction as its DDL.
 Installing again writes nothing and returns `[]`. Until the ledger exists, reading it behaves as an empty
-ledger; that is how the own changeset bootstraps. A database installed before the `fingerprint` or the `epochs`
-step existed lacks its row: call `install()` again after upgrading, which applies each missing step as a pending
-step; until then `preflight`, `apply` and `baseline` raise `LedgerNotInstalled` (`history` needs only
+ledger; that is how the own changeset bootstraps. A database installed before the `fingerprint`, the `epochs` or
+the `privileges` step existed lacks its row: call `install()` again after upgrading, which applies each missing step
+as a pending step; until then `preflight`, `apply` and `baseline` raise `LedgerNotInstalled` (`history` needs only
 the ledger table and keeps working), and so do the epoch functions until `epochs` is applied. `drift` raises it before
 the `fingerprint` step; before the `epochs` step it does so only given a changeset (its `preflight` runs first):
 without one it checks only `caverns.fingerprint`. `install` records no fingerprint.
+
+**Nozdormu, privileges.** The own step `privileges` revokes every privilege of `PUBLIC` on the schema `caverns`,
+on its tables, its sequences and its functions (`REVOKE ALL ... FROM PUBLIC`); its check is that `PUBLIC` holds none
+of them. A function is executable by `PUBLIC` unless revoked, so a later own step that adds a function revokes it
+itself (a test asserts that `PUBLIC` can execute no function of `caverns` after `install`); Caverns sets no default
+privileges. Only the schema's owner and the roles it grants to can use the ledger afterwards. Before applying
+anything `install` also refuses, with a `CavernsError` and nothing written, a `caverns` schema, or a relation in it,
+owned by a role the current role is not a member of (`schema caverns is owned by role alice, of which role bob is
+not a member: run install as alice or a member of it`); a schema owned by a role the current role is a member of
+is accepted. The grants a role needs to run `apply`, `baseline`, `register`, `unregister`, `snapshot` and
+`delete` (it need not own anything, and an identity sequence needs no grant of its own):
+
+```sql
+GRANT USAGE ON SCHEMA caverns TO runner;
+GRANT SELECT, INSERT ON caverns.ledger, caverns.fingerprint, caverns.epoch, caverns.epoch_source,
+    caverns.epoch_row, caverns.epoch_deletion TO runner;
+GRANT SELECT, INSERT, UPDATE, DELETE ON caverns.epoch_table TO runner;  -- the mutable registry
+GRANT DELETE ON caverns.epoch_row TO runner;                           -- `delete` removes a deleted epoch's rows
+```
+
+Reading (`preflight`, `history`, `drift`, `catalog`, `as_of`, `diff`) needs `USAGE` and `SELECT` only. `install`
+runs as the schema's owner or a member of the owner's role. The append-only triggers guard against mistakes, not
+against the schema's owner or a superuser, who can drop or disable them. **Upgrade:** run `install()` once after
+upgrading, as the owner; it applies `privileges`, after which a role that used the schema only through `PUBLIC` needs
+the grants above.
 
 **Nozdormu, preflight.** `preflight(connection, changeset)` reports one `StepStatus` (step, status and the
 ledger row that decided it, if any) per step in changeset order and writes nothing: it runs in one
@@ -436,7 +461,8 @@ With nothing found: `✅ No drift — the live schema matches the fingerprint at
   because Caverns must commit and roll back itself. A step's SQL and check run exactly as written, with no parameters, so a
   `%` in them is literal.
 - `install(connection) -> list[LedgerEntry]`: the rows written, one per own step not yet applied, `[]` when
-  Caverns is already installed; an `accepted` row for an own step whose table exists without its row.
+  Caverns is already installed; an `accepted` row for an own step whose table exists without its row. Raises
+  `CavernsError` for a `caverns` schema or relation owned by a role the current role is not a member of.
 - The ledger, `caverns.ledger`, one row per recorded event:
 
   | Column | Holds |

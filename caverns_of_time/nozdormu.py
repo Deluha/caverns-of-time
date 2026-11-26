@@ -344,12 +344,49 @@ CREATE OR REPLACE TRIGGER epoch_row_guard_update_delete BEFORE UPDATE OR DELETE 
 CREATE OR REPLACE TRIGGER epoch_row_no_truncate BEFORE TRUNCATE ON caverns.epoch_row
     FOR EACH STATEMENT EXECUTE FUNCTION caverns.epoch_append_only();
 """
+# WARNING: this statement ships with the release: never edit it once released; its checksum is recorded
+# in every consumer's ledger. A change to the grants is a new step of the own changeset (hard rule 6).
+_PRIVILEGES_DDL_SQL = """
+REVOKE ALL ON SCHEMA caverns FROM PUBLIC;
+REVOKE ALL ON ALL TABLES IN SCHEMA caverns FROM PUBLIC;
+REVOKE ALL ON ALL SEQUENCES IN SCHEMA caverns FROM PUBLIC;
+REVOKE ALL ON ALL FUNCTIONS IN SCHEMA caverns FROM PUBLIC;
+"""
+# True only when PUBLIC holds no privilege on the schema, a relation or a function of it; false (never an error)
+# while the schema or the last table of the earlier own steps does not exist (an empty schema holds nothing
+# to revoke yet, and the step must still run).
+_PRIVILEGES_REVOKED_SQL = """
+SELECT to_regnamespace('caverns') IS NOT NULL AND to_regclass('caverns.epoch_deletion') IS NOT NULL
+   AND NOT EXISTS (SELECT 1 FROM pg_namespace n, aclexplode(n.nspacl) a WHERE n.nspname = 'caverns' AND a.grantee = 0)
+   AND NOT EXISTS (
+       SELECT 1 FROM pg_class c, aclexplode(c.relacl) a
+       WHERE c.relnamespace = to_regnamespace('caverns') AND a.grantee = 0)
+   AND NOT EXISTS (
+       SELECT 1 FROM pg_proc p
+       WHERE p.pronamespace = to_regnamespace('caverns') AND has_function_privilege('public', p.oid, 'EXECUTE'))
+"""
+# The first object of the own schema (the schema, then its relations by name) whose owner the current role is not a
+# member of: what it is called, its owner and the current role. No row when every owner is the role or one of its roles.
+_FOREIGN_OWNER_SQL = """
+SELECT description, owner, current_user::text FROM (
+    SELECT 0 AS rank, 'schema caverns' AS description, n.nspowner AS owner_oid,
+           pg_get_userbyid(n.nspowner)::text AS owner
+    FROM pg_namespace n WHERE n.nspname = 'caverns'
+    UNION ALL
+    SELECT 1, 'relation caverns.' || c.relname, c.relowner, pg_get_userbyid(c.relowner)::text
+    FROM pg_class c WHERE c.relnamespace = to_regnamespace('caverns')
+) objects
+WHERE NOT pg_has_role(current_user, owner_oid, 'MEMBER')
+ORDER BY rank, description
+LIMIT 1
+"""
 _OWN_CHANGESET = Changeset(
     _OWN_CHANGESET_NAME,
     [
         Step("ledger", _LEDGER_DDL_SQL, check=_LEDGER_EXISTS_SQL),
         Step("fingerprint", _FINGERPRINT_DDL_SQL, check=FINGERPRINT_EXISTS_SQL),
         Step("epochs", _EPOCHS_DDL_SQL, check=EPOCHS_EXISTS_SQL),
+        Step("privileges", _PRIVILEGES_DDL_SQL, check=_PRIVILEGES_REVOKED_SQL),
     ],
 )
 
@@ -727,10 +764,27 @@ def _apply_statuses(
     return written
 
 
+def _require_owned(cursor: Cursor) -> None:
+    """Refuse (`CavernsError`) the own schema or a relation in it that the current role neither owns nor inherits."""
+    cursor.execute(_FOREIGN_OWNER_SQL)
+    row = cursor.fetchone()
+    if row is not None:
+        description, owner, current = row
+        raise CavernsError(
+            f"{description} is owned by role {owner}, of which role {current} is not a member: "
+            f"run install as {owner} or a member of it"
+        )
+
+
 def install(connection: Connection) -> list[LedgerEntry]:
-    """Create the ledger by applying Caverns' own changeset; the rows written ([] when installed)."""
+    """Create the ledger by applying Caverns' own changeset; the rows written ([] when installed).
+
+    Refuses (`CavernsError`, nothing written) a `caverns` schema or a relation in it owned by a role the current
+    role is not a member of.
+    """
     check_connection(connection)
     with read_only(connection) as cursor:
+        _require_owned(cursor)
         statuses = _statuses(cursor, _OWN_CHANGESET)
     # An effect without its row (a schema-only restore) is recorded as accepted: re-running would only repeat it.
     unknown = frozenset(s.step.label for s in statuses if s.status is Status.UNKNOWN)
