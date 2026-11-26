@@ -4,6 +4,40 @@ What shipped, newest first. What is planned: `ROADMAP.md`.
 
 ## v0.1.0 — in development
 
+### Phase 4 — Hardening
+
+What a second review found in Phases 1–3, fixed before new components:
+
+- A step added at or before the baseline's step has its own status, `before_baseline` (`Status.BEFORE_BASELINE`);
+  `apply` refuses the run until `reapply` or `accept` acknowledges it, and `chromie status` shows it and exits 1.
+  `baseline` now writes one `baseline` row per step up to `through`, each with its step's checksum.
+- A `failed` row's `error` is the SQLSTATE and the primary message (`<SQLSTATE>: <message>`), no longer the whole
+  error: step SQL must not carry secrets.
+- `apply(..., lock_timeout=5.0)` and `epochs.snapshot(..., lock_timeout=5.0)`: a wait for a lock gives up after
+  5 seconds (`None` keeps the session's own setting); a timeout on Caverns' lock is a `CavernsError`.
+- Privileges: `install` refuses a `caverns` schema or relation owned by a role the current role is not a member of,
+  and the new own step `privileges` revokes every privilege of `PUBLIC` on the schema, its tables, sequences and
+  functions. The grants a runner role needs are documented; the append-only triggers guard against mistakes, not
+  against the schema's owner or a superuser.
+- Every write is refused with a `CavernsError` on a standby and in a read-only session. A failed release of the
+  snapshot's session lock, or one that finds the lock not held (a transaction-mode pooler), raises a `CavernsError`
+  (the epoch stands) instead of a warning.
+- The fingerprint is read under pinned output and definition settings and records the server's version: the own
+  step `fingerprint_server` adds `caverns.fingerprint.server_version` and `Fingerprint.server_version`. A hash
+  recorded under default settings is unchanged.
+- `epochs.snapshot` refuses, before copying a row, a table with row-level security the role does not bypass (a
+  superuser, `BYPASSRLS`, or the owner without `FORCE`), estimates the registered tables' size, logs it and refuses
+  above `max_bytes` (default 1 GiB, `None` for no limit), and refuses a key too large for an index entry; the
+  README states the cost of its long REPEATABLE READ transaction.
+- Steps and checks run under the caller's `search_path`, which is not pinned: schema-qualify them.
+- Known limitations: Caverns writes only to a primary, logical replication of the `caverns` schema is unsupported,
+  and the snapshot's session lock needs a direct or session-mode connection.
+- **Upgrade:** a database installed by Phase 3 code must run `install()` again, which adds the `privileges` and
+  `fingerprint_server` steps; until then `preflight`, `apply` and `baseline` raise `LedgerNotInstalled`, and so does
+  `drift`. A changeset baselined by earlier code has a single baseline row, so its earlier steps now read
+  `before_baseline`: acknowledge them with `accept`. `apply` and `snapshot` now give up after 5 seconds waiting for a
+  lock (pass `lock_timeout=None` for the old behaviour), and a snapshot above 1 GiB now needs `max_bytes`.
+
 ### Phase 3 — Epochs
 
 Run-level snapshots of opted-in tables:

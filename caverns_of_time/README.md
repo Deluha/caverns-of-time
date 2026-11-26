@@ -14,7 +14,7 @@ difference of two epochs and their deletion).
 |---|---|
 | `__init__.py` | `__version__`, read from the installed distribution's metadata |
 | `errors.py` | The exception types, all in one module |
-| `_connection.py` | Shared private plumbing, not a component: the `Connection` and `Cursor` protocols, the connection guard and the writable check (`check_connection`, `check_writable`), the transaction helpers, the advisory lock every Caverns write takes (`ADVISORY_LOCK_KEY`, `lock`; `session_lock` for a REPEATABLE READ `transaction`, whose failed release is a `CavernsError`) and its lock timeout (`DEFAULT_LOCK_TIMEOUT`, `set_lock_timeout`), the SQLSTATE reader `sqlstate`, the name, limit and lock timeout validation (`validate_name`, `validate_limit`, `validate_lock_timeout`), the pinned search path (`pin_search_path`), the one-statement check runner and the collection-of-names guard |
+| `_connection.py` | Shared private plumbing, not a component: the `Connection` and `Cursor` protocols, the connection guard and the writable check (`check_connection`, `check_writable`), the transaction helpers, the advisory lock every Caverns write takes (`ADVISORY_LOCK_KEY`, `lock`; `session_lock` for a REPEATABLE READ `transaction`, whose failed release is a `CavernsError`) and its lock timeout (`DEFAULT_LOCK_TIMEOUT`, `set_lock_timeout`), the SQLSTATE reader `sqlstate`, the name, limit and lock timeout validation (`validate_name`, `validate_limit`, `validate_lock_timeout`), the pinned search path and settings (`pin_search_path`, `pin_output_settings`, `pin_definition_settings`), the one-statement check runner and the collection-of-names guard |
 | `_fingerprint.py` | Shared private fingerprint machinery, not a component: `Fingerprint`, the catalog queries, the document and its hash, the default, watched and missing schemas, `Difference`, `restrict` and `compare`, and the storage of fingerprints in `caverns.fingerprint` (`record`, `latest`) |
 | `console.py` | The console helpers: status lines with their icons, tables and JSON, the confirmation prompt (`confirm`, `interactive`); the only module that prints or reads |
 | `chromie.py` | Chromie: the `chromie` command's parsing, connection configuration and dispatch (command flow only) |
@@ -115,6 +115,10 @@ Caverns run holds it) raises `CavernsError` naming the lock, with the transactio
 written; a timeout inside a step fails the step like any other error: rolled back, a `failed` row whose error is
 `55P03: <message>` and `StepFailed`, the step `pending` again. `install` and `baseline` always use the default, and
 so do `register`, `unregister` and `delete`; they take no parameter.
+
+*Search path.* A step's SQL and its check run under the connection's own `search_path`, which Caverns does not pin:
+schema-qualify every object a step creates or touches, or the step builds in whatever schema the session's path
+names first.
 
 A run that writes ledger rows stores one fingerprint in `caverns.fingerprint` (below), in the transaction of
 its last ledger row: the last planned step's transaction when that step writes a row, or, when a step fails,
@@ -616,6 +620,9 @@ With nothing found: `✅ No drift — the live schema matches the fingerprint at
 ## Known limitations
 
 - Caverns writes only to a primary: a standby (in recovery) and a read-only session are refused.
+- Steps and checks run under the session's `search_path`, not a pinned one: schema-qualify them.
+- A snapshot copies in one REPEATABLE READ transaction, so a very large table needs a quiet period and a
+  `max_bytes` to match; copying in batches is not supported yet.
 - Logical replication of the `caverns` schema is unsupported: the ledger, fingerprint and epoch tables are not
   designed to be replicated, and a subscriber's copy is not a ledger Caverns can write.
 
