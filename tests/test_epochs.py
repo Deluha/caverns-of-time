@@ -8,8 +8,11 @@ session lock's failed release.
 from __future__ import annotations
 
 import logging
+import re
+import secrets
 import threading
 from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import replace
 from typing import Any
 
@@ -39,7 +42,7 @@ from caverns_of_time.epochs import (
 )
 from caverns_of_time.errors import CavernsError, ChangesetError, EpochNotFound, EpochRefused, LedgerNotInstalled
 from caverns_of_time.nozdormu import Changeset, install, preflight
-from tests.test_nozdormu_ledger import WAIT_SECONDS, _wait_for_a_waiting_lock
+from tests.test_nozdormu_ledger import RUNNER_GRANTS, WAIT_SECONDS, _wait_for_a_waiting_lock
 
 DRIVER_ERRORS = (psycopg.Error, psycopg2.Error)
 SCHEMA = "nozdormu_test"
@@ -610,9 +613,9 @@ def test_snapshot_logs_what_it_took(ledger_conn: Any, caplog: pytest.LogCaptureF
     top = max(e.version for e in nozdormu.history(ledger_conn))
     with caplog.at_level(logging.INFO, logger=epochs.__name__):
         snapshot(ledger_conn, "logged")
-    assert [r.getMessage() for r in caplog.records] == [
-        f"took epoch logged at ledger version {top}: 1 rows in 1 tables"
-    ]
+    estimate, took = [r.getMessage() for r in caplog.records]
+    assert re.fullmatch(r"snapshot logged: about [1-9]\d* bytes in 1 tables", estimate)
+    assert took == f"took epoch logged at ledger version {top}: 1 rows in 1 tables"
 
 
 def test_snapshot_of_an_empty_table_records_it_with_no_rows(ledger_conn: Any) -> None:
@@ -807,6 +810,174 @@ def test_snapshot_copies_the_rows_of_a_partitioned_table(ledger_conn: Any) -> No
     assert [t.row_count for t in taken.tables] == [3]
     rows = as_of(ledger_conn, "parts", SCHEMA, "parts").rows
     assert [(row["id"], row["n"]) for row in rows] == [(1, 10), (3, 30), (12, 20)]
+
+
+# --- row-level security, size and key size --------------------------------------------------
+
+RLS_TABLE = (
+    f"CREATE TABLE {SCHEMA}.rls (id int PRIMARY KEY, name text)",
+    f"INSERT INTO {SCHEMA}.rls VALUES (1, 'a'), (2, 'b'), (3, 'c')",
+    f"ALTER TABLE {SCHEMA}.rls ENABLE ROW LEVEL SECURITY",
+    f"CREATE POLICY only_one ON {SCHEMA}.rls USING (id = 1)",
+)
+
+
+@pytest.fixture
+def rls_roles(ledger_conn: Any) -> Iterator[tuple[str, str, str]]:
+    """Three roles, cluster-wide so uniquely named: a reader, the table's owner and one with BYPASSRLS."""
+    suffix = secrets.token_hex(4)
+    reader, owner, bypass = (f"caverns_test_rls_{kind}_{suffix}" for kind in ("reader", "owner", "bypass"))
+    try:
+        for role, attribute in ((reader, "NOLOGIN"), (owner, "NOLOGIN"), (bypass, "NOLOGIN BYPASSRLS")):
+            _execute(ledger_conn, f"CREATE ROLE {role} {attribute}")
+        yield reader, owner, bypass
+    finally:
+        ledger_conn.rollback()
+        _execute(ledger_conn, "RESET ROLE", "DROP SCHEMA IF EXISTS caverns CASCADE")
+        _execute(ledger_conn, f"DROP SCHEMA IF EXISTS {SCHEMA} CASCADE")
+        for role in (reader, owner, bypass):
+            _execute(ledger_conn, f"DROP OWNED BY {role}", f"DROP ROLE IF EXISTS {role}")
+
+
+def _rls_setup(conn: Any, roles: tuple[str, str, str], *extra: str) -> None:
+    """Caverns installed, the `rls` table (owned by the owner, with a policy) registered, the roles granted."""
+    owner = roles[1]
+    _installed_with_tables(conn, *RLS_TABLE, f"ALTER TABLE {SCHEMA}.rls OWNER TO {owner}", *extra)
+    register(conn, SCHEMA, "rls")
+    for role in roles:
+        _execute(
+            conn,
+            f"GRANT USAGE ON SCHEMA {SCHEMA} TO {role}",
+            f"GRANT SELECT ON {SCHEMA}.rls TO {role}",
+            *(grant.format(role=role) for grant in RUNNER_GRANTS),
+        )
+
+
+@contextmanager
+def _as_role(conn: Any, role: str) -> Iterator[None]:
+    _execute(conn, f"SET ROLE {role}")
+    try:
+        yield
+    finally:
+        conn.rollback()
+        _execute(conn, "RESET ROLE")
+
+
+def test_snapshot_refuses_a_table_with_row_level_security_the_role_does_not_bypass(
+    ledger_conn: Any, rls_roles: tuple[str, str, str]
+) -> None:
+    _rls_setup(ledger_conn, rls_roles)
+    reader = rls_roles[0]
+    with _as_role(ledger_conn, reader), pytest.raises(EpochRefused) as refused:
+        snapshot(ledger_conn, "rls")
+    assert str(refused.value) == (
+        f"table {SCHEMA}.rls has row-level security and role {reader} does not bypass it: "
+        f"a snapshot would copy only the rows {reader} can see"
+    )
+    _nothing_written(ledger_conn)
+
+
+def test_snapshot_accepts_the_owner_of_a_row_level_security_table_without_force(
+    ledger_conn: Any, rls_roles: tuple[str, str, str]
+) -> None:
+    _rls_setup(ledger_conn, rls_roles)
+    with _as_role(ledger_conn, rls_roles[1]):
+        taken = snapshot(ledger_conn, "owner")
+    assert [t.row_count for t in taken.tables] == [3]
+    assert [key for key, _ in _stored(ledger_conn, taken.epoch, "rls")] == [{"id": 1}, {"id": 2}, {"id": 3}]
+
+
+def test_snapshot_refuses_the_owner_of_a_row_level_security_table_with_force(
+    ledger_conn: Any, rls_roles: tuple[str, str, str]
+) -> None:
+    _rls_setup(ledger_conn, rls_roles, f"ALTER TABLE {SCHEMA}.rls FORCE ROW LEVEL SECURITY")
+    owner = rls_roles[1]
+    with _as_role(ledger_conn, owner), pytest.raises(EpochRefused, match=f"has row-level security and role {owner} "):
+        snapshot(ledger_conn, "forced")
+    _nothing_written(ledger_conn)
+
+
+def test_snapshot_accepts_a_role_with_bypassrls_and_a_superuser(
+    ledger_conn: Any, rls_roles: tuple[str, str, str]
+) -> None:
+    _rls_setup(ledger_conn, rls_roles, f"ALTER TABLE {SCHEMA}.rls FORCE ROW LEVEL SECURITY")
+    with _as_role(ledger_conn, rls_roles[2]):
+        assert [t.row_count for t in snapshot(ledger_conn, "bypass").tables] == [3]
+    assert [t.row_count for t in snapshot(ledger_conn, "super").tables] == [3]  # the test connection's superuser
+
+
+def test_snapshot_leaves_row_security_as_the_session_had_it(ledger_conn: Any) -> None:
+    _installed_with_tables(ledger_conn, ONE)
+    register(ledger_conn, SCHEMA, "one")
+    snapshot(ledger_conn, "pinned")
+    assert _query(ledger_conn, "SHOW row_security") == [("on",)]
+
+
+def test_snapshot_refuses_above_max_bytes_and_writes_nothing(ledger_conn: Any) -> None:
+    _installed_with_tables(ledger_conn, ONE, TWO, f"INSERT INTO {SCHEMA}.one VALUES (1, 'x')")
+    register(ledger_conn, SCHEMA, "one")
+    register(ledger_conn, SCHEMA, "two")
+    with pytest.raises(
+        EpochRefused,
+        match=r"snapshot 'small' would copy about [1-9]\d* bytes from 2 tables, above max_bytes 1: "
+        r"pass a larger max_bytes, or None for no limit",
+    ):
+        snapshot(ledger_conn, "small", max_bytes=1)
+    _nothing_written(ledger_conn)
+
+
+def test_snapshot_accepts_any_size_with_no_max_bytes(ledger_conn: Any) -> None:
+    _installed_with_tables(ledger_conn, ONE)
+    register(ledger_conn, SCHEMA, "one")
+    assert snapshot(ledger_conn, "unbounded", max_bytes=None).name == "unbounded"
+
+
+def test_snapshot_estimates_a_partitioned_table_by_its_partitions(
+    ledger_conn: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    _installed_with_tables(
+        ledger_conn,
+        f"CREATE TABLE {SCHEMA}.parts (id int PRIMARY KEY, n int) PARTITION BY RANGE (id)",
+        f"CREATE TABLE {SCHEMA}.parts_low PARTITION OF {SCHEMA}.parts FOR VALUES FROM (0) TO (10)",
+        f"INSERT INTO {SCHEMA}.parts VALUES (1, 10)",
+    )
+    register(ledger_conn, SCHEMA, "parts")
+    expected = _query(ledger_conn, f"SELECT pg_table_size('{SCHEMA}.parts_low')")[0][0]
+    with caplog.at_level(logging.INFO, logger=epochs.__name__):
+        snapshot(ledger_conn, "parts")
+    assert f"snapshot parts: about {expected} bytes in 1 tables" in [r.getMessage() for r in caplog.records]
+    with pytest.raises(EpochRefused, match="above max_bytes"):
+        snapshot(ledger_conn, "parts again", max_bytes=expected - 1)
+
+
+@pytest.mark.parametrize("value", [0, -1, True, 1.5, "1"])
+def test_snapshot_refuses_a_max_bytes_that_is_not_valid(ledger_conn: Any, value: Any) -> None:
+    _installed_with_tables(ledger_conn, ONE)
+    register(ledger_conn, SCHEMA, "one")
+    with pytest.raises(ChangesetError, match="max_bytes must be None or a positive integer"):
+        snapshot(ledger_conn, "bad", max_bytes=value)
+    _nothing_written(ledger_conn)
+
+
+def test_snapshot_refuses_a_key_too_large_for_an_index_entry_before_writing_a_row(ledger_conn: Any) -> None:
+    _installed_with_tables(
+        ledger_conn,
+        ONE,
+        f"CREATE TABLE {SCHEMA}.wide (k text, v int)",  # no index of its own: the key is only registered
+        f"INSERT INTO {SCHEMA}.one VALUES (1, 'x')",
+        f"INSERT INTO {SCHEMA}.wide SELECT string_agg(md5(i::text), ''), 1 FROM generate_series(1, 94) i",
+    )
+    register(ledger_conn, SCHEMA, "one")
+    register(ledger_conn, SCHEMA, "wide", key=["k"])
+    with pytest.raises(
+        EpochRefused,
+        match=rf"table {SCHEMA}\.wide has a key of about 3\d{{3}} bytes, above the 2704-byte limit of an index entry: "
+        r"declare a shorter key",
+    ):
+        snapshot(ledger_conn, "wide")  # `one` sorts first: nothing of it is kept either
+    _nothing_written(ledger_conn)
+    _execute(ledger_conn, f"UPDATE {SCHEMA}.wide SET k = left(k, 2000)")
+    assert [t.row_count for t in snapshot(ledger_conn, "wide").tables] == [1, 1]
 
 
 VALUES = (

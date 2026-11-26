@@ -234,7 +234,7 @@ returns the stored row; another key replaces the stored one (the row's time and 
 warning through the `caverns_of_time.epochs` logger. `unregister` deletes the registry row only: the epochs
 already taken keep the table's rows. The registry is mutable configuration, so it has no trigger.
 
-**Epochs, snapshot.** `snapshot(connection, name, *, lock_timeout=5.0)` copies every registered table into one new epoch: a row of
+**Epochs, snapshot.** `snapshot(connection, name, *, lock_timeout=5.0, max_bytes=1073741824)` copies every registered table into one new epoch: a row of
 `caverns.epoch` (the name, the latest ledger version, the time, the user, the Caverns version), a row of
 `epoch_source` per table (its key, its `columns` as a JSON list of name and type in column order, its row count) and
 a row of `epoch_row` per source row (the key as a JSON object of the key columns' values, the row as `to_jsonb`
@@ -244,7 +244,20 @@ waits) and all tables are read in one consistent view; the lock is released when
 follows the label rules and is unique for good: a deleted epoch keeps its name. A refusal rolls everything back,
 so nothing is written: no registered table, a name taken, a registered table or key column that no longer exists,
 a key with duplicates or with nulls (nulls are checked first, so two rows with a null key report nulls, not duplicates;
-only a key column's own null counts: an array key holding a null element is a valid key). The copy of a table is one statement PostgreSQL composes (hard rule 3):
+only a key column's own null counts: an array key holding a null element is a valid key). Three more refusals come
+before any row is copied, after every registered table and key column is found (the epoch's catalog row is
+inserted first and rolled back with the rest). **Row-level security:** a table with row-level security is refused
+(`EpochRefused`, naming the table and the role) unless the current role is a superuser, has `BYPASSRLS`, or owns the
+table and the table has no `FORCE ROW LEVEL SECURITY`, because a copy would hold only the rows the role can see;
+`row_security` is also set `off` in the snapshot's transaction, so PostgreSQL raises an error instead of filtering
+if a policy applies anyway. **Size:** the `pg_table_size` of the registered tables (a partitioned table counts its
+partitions) is logged at INFO (`snapshot NAME: about N bytes in M tables`); above `max_bytes` (default 1 GiB, a
+positive integer, `None` for no limit; anything else is a `ChangesetError`) the snapshot is refused (`EpochRefused`).
+The estimate is the tables' size on disk, not the size of the copy, which `jsonb` can make larger or smaller.
+**Key size:** the largest `epoch_row` primary-key entry a table would need (its key as stored, the schema and table
+names, the epoch, an index entry header and an alignment allowance) must fit the btree entry limit derived from the
+server's `block_size` (2,704 bytes on 8 kB pages); a longer key is refused with the table named, where the copy would
+otherwise fail with the driver's own error. Declare a shorter key. Checking it reads each table once more. The copy of a table is one statement PostgreSQL composes (hard rule 3):
 `format` quotes the schema and table names and the key as literals from a template bound as a value, never built in
 Python. A value's type is not in the row: JSON holds numbers, strings, booleans, nulls, arrays and objects, so
 read a value's type from the epoch's `columns` (`Column.type`, printed by `format_type` with the search path
@@ -259,7 +272,11 @@ one". The epoch is committed and stands. The session-level lock needs a connecti
 directly or through a session-mode pooler. `lock_timeout` (as for `apply`: seconds, default `5.0`, `None` keeps the
 session's own) bounds the wait for Caverns' advisory lock, where a timeout raises `CavernsError`, and, set at the
 start of the REPEATABLE READ transaction, the wait for each source table's lock: a timeout there rolls the copy
-back and raises the driver's own error (SQLSTATE `55P03`), untranslated. `catalog(connection, *, limit=None)` lists the epochs
+back and raises the driver's own error (SQLSTATE `55P03`), untranslated. **The cost of the long transaction:** the
+copy is one REPEATABLE READ transaction for as long as the copy takes, so it holds back vacuum's horizon (dead rows
+the whole database produces meanwhile are not reclaimed) and holds an `AccessShare` lock on every registered table
+(blocking DDL that needs a stronger lock, such as `ALTER TABLE` or `TRUNCATE`, until it ends). Schedule a large
+snapshot for a quiet period; copying in batches is not supported yet. `catalog(connection, *, limit=None)` lists the epochs
 newest first, deleted ones included, each with its tables.
 
 **Epochs, as of.** `as_of(connection, epoch, schema, table, *, limit=None)` reads one table of an epoch back: the
@@ -546,10 +563,11 @@ With nothing found: `✅ No drift — the live schema matches the fingerprint at
   `ChangesetError`, `LedgerNotInstalled` and `EpochRefused` (the table is not registered).
 - `epochs.tracked(connection) -> list[TrackedTable]`: the registry ordered by schema and table, in one read-only
   transaction that writes nothing. Raises `LedgerNotInstalled`.
-- `epochs.snapshot(connection, name, *, lock_timeout=5.0) -> Epoch`: copies every registered table into a new epoch called *name* (a
-  label-style name, unique for good). Raises `ChangesetError` for a bad name or `lock_timeout`, `CavernsError` when Caverns' lock times out, `LedgerNotInstalled` and `EpochRefused`
-  (no registered table, a name taken, a registered table or key column that is gone, a key with duplicates or
-  nulls); a refusal writes nothing. Logs `took epoch NAME at ledger version V: N rows in M tables`.
+- `epochs.snapshot(connection, name, *, lock_timeout=5.0, max_bytes=1073741824) -> Epoch`: copies every registered table into a new epoch called *name* (a
+  label-style name, unique for good). Raises `ChangesetError` for a bad name, `lock_timeout` or `max_bytes`, `CavernsError` when Caverns' lock times out, `LedgerNotInstalled` and `EpochRefused`
+  (no registered table, a name taken, a registered table or key column that is gone, a table with row-level security
+  the role does not bypass, a size above `max_bytes`, a key too large for an index entry, a key with duplicates or
+  nulls); a refusal writes nothing. Logs `snapshot NAME: about N bytes in M tables`, then `took epoch NAME at ledger version V: N rows in M tables`.
 - `epochs.catalog(connection, *, limit=None) -> list[Epoch]`: the epochs newest first, deleted ones included, at
   most *limit* (None: all) in one read-only transaction that writes nothing. Raises `ChangesetError` for a *limit*
   that is not a positive integer up to 9223372036854775807 and `LedgerNotInstalled`.
