@@ -5,8 +5,8 @@ database a past you can query: which schema changes were applied and when, what 
 like at an earlier run, and whether anything changed outside the timeline.
 
 **Status: in development, nothing released.** Phase 0 (the development process), Phase 1 (Nozdormu),
-Phase 2 (Chromie and Infinite) and Phase 3 (Epochs) are built; the CLI is installed with the `cli` extra
-(`pip install 'caverns-of-time[cli]'`). `ROADMAP.md` holds the plan and its status.
+Phase 2 (Chromie and Infinite), Phase 3 (Epochs) and Phase 4 (Hardening) are built; the CLI is installed with the
+`cli` extra (`pip install 'caverns-of-time[cli]'`). `ROADMAP.md` holds the plan and its status.
 
 ## Components
 
