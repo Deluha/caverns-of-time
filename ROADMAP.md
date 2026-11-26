@@ -88,7 +88,7 @@ changed outside the timeline. The first consumer is not the design target.
 | 2 — Chromie and Infinite | Merged | [#3](https://github.com/Deluha/caverns-of-time/pull/3) |
 | 3 — Epochs | Merged | [#4](https://github.com/Deluha/caverns-of-time/pull/4) |
 | 4 — Hardening | Merged | [#7](https://github.com/Deluha/caverns-of-time/pull/7) |
-| 5 — Murozond | In progress | |
+| 5 — Murozond | In review | [#8](https://github.com/Deluha/caverns-of-time/pull/8) |
 | 6 — Timewalking | Not started | |
 | 7 — Chromie write commands | Not started | |
 | 8 — First consumer adoption and release | Not started | |
