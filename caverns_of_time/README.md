@@ -426,15 +426,20 @@ VERSION  CHANGESET  LABEL     OUTCOME  RECORDED_AT (UTC)    BY
 
 `chromie status DIRECTORY [--changeset NAME]` loads the directory as a changeset (named after the directory unless
 `--changeset` says otherwise) and prints each step's status with the version of the ledger row that decided it
-(`-` when none). Exit 0 when every step is `applied`, 1 when any is not (an error line lists them), 2 on a
+(`-` when none) and its Murozond risk (`murozond.classify` of the step's SQL: `safe`, or the risk followed by its
+findings' distinct reasons, e.g. `destructive (DROP TABLE)`). Exit 0 when every step is `applied`, 1 when any is not (an error line lists them), 2 on a
 usage error such as a missing directory or a ledger that is not installed. `--format json` prints
-`{"changeset": ..., "steps": [{"label", "status", "version"}]}` with the same exit codes:
+`{"changeset": ..., "steps": [{"label", "status", "version", "risk", "findings": [{"risk", "statement",
+"reason"}]}]}` (`findings` is `[]` for a safe step) with the same exit codes. After the summary line a warning
+lists the steps that would need an acknowledgement to apply: not `applied`, not `unknown` (accepting runs no SQL)
+and not safe. No warning otherwise:
 
 ```text
-LABEL     STATUS   VERSION
-1_schema  applied  2
-2_table   pending  -
+LABEL     STATUS   VERSION  RISK
+1_schema  applied  2        safe
+2_table   pending  -        destructive (DROP TABLE)
 ❌ 1 of 2 steps of changeset app not applied: 2_table (pending).
+⚠️ 1 step needs an acknowledgement to apply: 2_table (destructive).
 ```
 
 `chromie as-of EPOCH SCHEMA.TABLE [--limit N]` shows a table as it was at an epoch (`epochs.as_of`). `SCHEMA.TABLE`

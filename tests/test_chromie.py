@@ -293,9 +293,9 @@ def test_status_of_applied_steps_succeeds(
     code, out, err = _run(capsys, "status", str(directory), "--dsn", db_dsn)
     assert (code, err) == (0, "")
     assert [line.split() for line in out.splitlines()] == [
-        ["LABEL", "STATUS", "VERSION"],
-        ["1_schema", "applied", "7"],
-        ["2_table", "applied", "8"],
+        ["LABEL", "STATUS", "VERSION", "RISK"],
+        ["1_schema", "applied", "7", "safe"],
+        ["2_table", "applied", "8", "safe"],
         ["✅", "All", "2", "steps", "of", "changeset", "app", "applied."],
     ]
 
@@ -308,9 +308,9 @@ def test_status_of_a_pending_step_is_a_finding(
     code, out, err = _run(capsys, "status", str(directory), "--dsn", db_dsn)
     assert code == chromie.EXIT_FINDING
     assert [line.split() for line in out.splitlines()] == [
-        ["LABEL", "STATUS", "VERSION"],
-        ["1_schema", "pending", "-"],
-        ["2_table", "pending", "-"],
+        ["LABEL", "STATUS", "VERSION", "RISK"],
+        ["1_schema", "pending", "-", "safe"],
+        ["2_table", "pending", "-", "safe"],
     ]
     assert err == "❌ 2 of 2 steps of changeset app not applied: 1_schema (pending), 2_table (pending).\n"
 
@@ -328,15 +328,15 @@ def test_status_takes_the_changeset_name_from_the_option(
 def test_status_json_shape(ledger_conn: Any, db_dsn: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     directory = _changeset_directory(tmp_path)
     _installed_and_applied(ledger_conn, directory)
-    (directory / "3_later.sql").write_text("SELECT 1", encoding="utf-8")
+    (directory / "3_later.sql").write_text("ANALYZE", encoding="utf-8")
     code, out, err = _run(capsys, "status", str(directory), "--dsn", db_dsn, "--format", "json")
     assert (code, err) == (chromie.EXIT_FINDING, "")
     assert json.loads(out) == {
         "changeset": "app",
         "steps": [
-            {"label": "1_schema", "status": "applied", "version": 7},
-            {"label": "2_table", "status": "applied", "version": 8},
-            {"label": "3_later", "status": "pending", "version": None},
+            {"label": "1_schema", "status": "applied", "version": 7, "risk": "safe", "findings": []},
+            {"label": "2_table", "status": "applied", "version": 8, "risk": "safe", "findings": []},
+            {"label": "3_later", "status": "pending", "version": None, "risk": "safe", "findings": []},
         ],
     }
 
@@ -347,14 +347,14 @@ def test_status_of_a_step_before_the_baseline_is_a_finding(
     directory = _changeset_directory(tmp_path)
     nozdormu.install(ledger_conn)
     nozdormu.baseline(ledger_conn, nozdormu.Changeset.from_directory("app", directory))
-    (directory / "0_early.sql").write_text("SELECT 1", encoding="utf-8")
+    (directory / "0_early.sql").write_text("ANALYZE", encoding="utf-8")
     code, out, err = _run(capsys, "status", str(directory), "--dsn", db_dsn)
     assert code == chromie.EXIT_FINDING
     assert [line.split() for line in out.splitlines()] == [
-        ["LABEL", "STATUS", "VERSION"],
-        ["0_early", "before_baseline", "8"],
-        ["1_schema", "applied", "7"],
-        ["2_table", "applied", "8"],
+        ["LABEL", "STATUS", "VERSION", "RISK"],
+        ["0_early", "before_baseline", "8", "safe"],
+        ["1_schema", "applied", "7", "safe"],
+        ["2_table", "applied", "8", "safe"],
     ]
     assert err == "❌ 1 of 3 steps of changeset app not applied: 0_early (before_baseline).\n"
 
@@ -367,6 +367,113 @@ def test_status_json_of_applied_steps_succeeds(
     code, out, err = _run(capsys, "status", str(directory), "--dsn", db_dsn, "--format", "json")
     assert (code, err) == (0, "")
     assert [step["status"] for step in json.loads(out)["steps"]] == ["applied", "applied"]
+
+
+RISKY_STEPS = {
+    "3_drop.sql": "DROP TABLE nozdormu_test.t",
+    "4_idx.sql": "CREATE INDEX t_id ON nozdormu_test.t (id);\nALTER TABLE nozdormu_test.t ALTER COLUMN id SET NOT NULL",
+    "5_odd.sql": "FROBNICATE nozdormu_test.t",
+}
+
+
+def _write_steps(directory: Path, steps: dict[str, str]) -> None:
+    for file_name, sql in steps.items():
+        (directory / file_name).write_text(sql, encoding="utf-8")
+
+
+def test_status_shows_each_steps_risk_with_its_reasons(
+    ledger_conn: Any, db_dsn: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    directory = _changeset_directory(tmp_path)
+    nozdormu.install(ledger_conn)
+    _write_steps(directory, RISKY_STEPS)
+    code, out, err = _run(capsys, "status", str(directory), "--dsn", db_dsn)
+    assert code == chromie.EXIT_FINDING
+    rows = out.splitlines()
+    assert rows[0].split() == ["LABEL", "STATUS", "VERSION", "RISK"]
+    assert [row.split(None, 3)[3] for row in rows[1:]] == [
+        "safe",
+        "safe",
+        "destructive (DROP TABLE)",
+        "lock_hazard (CREATE INDEX without CONCURRENTLY, SET NOT NULL)",
+        "unknown (unrecognised statement)",
+    ]
+
+
+def test_status_lists_the_steps_that_need_an_acknowledgement(
+    ledger_conn: Any, db_dsn: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    directory = _changeset_directory(tmp_path)
+    nozdormu.install(ledger_conn)
+    _write_steps(directory, RISKY_STEPS)
+    _, _, err = _run(capsys, "status", str(directory), "--dsn", db_dsn)
+    assert err.splitlines()[1] == (
+        "⚠️ 3 steps need an acknowledgement to apply: 3_drop (destructive), 4_idx (lock_hazard), 5_odd (unknown)."
+    )
+
+
+def test_status_acknowledgement_warning_is_singular_for_one_step(
+    ledger_conn: Any, db_dsn: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    directory = _changeset_directory(tmp_path)
+    nozdormu.install(ledger_conn)
+    _write_steps(directory, {"3_drop.sql": RISKY_STEPS["3_drop.sql"]})
+    _, _, err = _run(capsys, "status", str(directory), "--dsn", db_dsn)
+    assert err.splitlines()[1] == "⚠️ 1 step needs an acknowledgement to apply: 3_drop (destructive)."
+
+
+def test_status_skips_applied_and_unknown_status_steps_in_the_warning(
+    ledger_conn: Any, db_dsn: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    directory = _changeset_directory(tmp_path)
+    _installed_and_applied(ledger_conn, directory)
+    _write_steps(directory, {"3_drop.sql": RISKY_STEPS["3_drop.sql"], "3_drop.check.sql": "SELECT true"})
+    code, out, err = _run(capsys, "status", str(directory), "--dsn", db_dsn)
+    assert code == chromie.EXIT_FINDING
+    assert "3_drop    unknown" in out
+    assert "acknowledgement" not in err
+
+
+def test_status_has_no_warning_when_every_step_is_applied_even_if_risky(
+    ledger_conn: Any, db_dsn: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    directory = _changeset_directory(tmp_path)
+    _installed_and_applied(ledger_conn, directory)
+    _write_steps(directory, {"3_drop.sql": RISKY_STEPS["3_drop.sql"]})
+    changeset = Changeset.from_directory(directory.name, directory)
+    nozdormu.apply(ledger_conn, changeset, acknowledge=frozenset({"3_drop"}))
+    code, out, err = _run(capsys, "status", str(directory), "--dsn", db_dsn)
+    assert (code, err) == (0, "")
+    assert "3_drop    applied" in out
+    assert "destructive (DROP TABLE)" in out
+
+
+def test_status_has_no_warning_when_the_pending_steps_are_safe(
+    ledger_conn: Any, db_dsn: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    nozdormu.install(ledger_conn)
+    _, _, err = _run(capsys, "status", str(_changeset_directory(tmp_path)), "--dsn", db_dsn)
+    assert "acknowledgement" not in err
+
+
+def test_status_json_carries_risk_and_findings(
+    ledger_conn: Any, db_dsn: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    directory = _changeset_directory(tmp_path)
+    nozdormu.install(ledger_conn)
+    _write_steps(directory, {"3_drop.sql": RISKY_STEPS["3_drop.sql"]})
+    code, out, err = _run(capsys, "status", str(directory), "--dsn", db_dsn, "--format", "json")
+    assert (code, err) == (chromie.EXIT_FINDING, "")
+    steps = json.loads(out)["steps"]
+    assert steps[0]["risk"] == "safe"
+    assert steps[0]["findings"] == []
+    assert steps[2] == {
+        "label": "3_drop",
+        "status": "pending",
+        "version": None,
+        "risk": "destructive",
+        "findings": [{"risk": "destructive", "statement": 1, "reason": "DROP TABLE"}],
+    }
 
 
 def test_status_of_a_missing_directory_is_a_usage_error(
