@@ -6,13 +6,15 @@ import logging
 import re
 import threading
 import time
+from collections.abc import Iterator
 from typing import Any
 
 import psycopg
 import psycopg2
 import pytest
 
-from caverns_of_time import __version__, _connection, nozdormu
+from caverns_of_time import __version__, _connection, epochs, infinite, nozdormu
+from caverns_of_time import _fingerprint as fingerprint_store
 from caverns_of_time.errors import (
     BaselineRefused,
     CavernsError,
@@ -23,6 +25,7 @@ from caverns_of_time.errors import (
 )
 from caverns_of_time.infinite import fingerprint as take_fingerprint
 from caverns_of_time.nozdormu import Changeset, Status, Step, apply, baseline, history, install, preflight
+from tests.conftest import RUNNER_GRANTS, WAIT_SECONDS, throwaway_roles, wait_for_a_waiting_lock
 
 DRIVER_ERRORS = (psycopg.Error, psycopg2.Error)
 SCHEMA = Step("schema", "CREATE SCHEMA nozdormu_test", check="SELECT to_regnamespace('nozdormu_test') IS NOT NULL")
@@ -38,6 +41,8 @@ OWN_ROWS = [
     (1, "caverns", "ledger", "applied"),
     (2, "caverns", "fingerprint", "applied"),
     (3, "caverns", "epochs", "applied"),
+    (4, "caverns", "privileges", "applied"),
+    (5, "caverns", "fingerprint_server", "applied"),
 ]
 FINGERPRINT_ROWS = "SELECT version, schemas, hash FROM caverns.fingerprint ORDER BY version"
 FIRST_TWO = Changeset("app", [SCHEMA, TABLE])
@@ -127,6 +132,8 @@ def test_install_accepts_its_own_step_when_the_table_exists_without_its_row(ledg
         ("caverns", "ledger", "accepted"),
         ("caverns", "fingerprint", "applied"),
         ("caverns", "epochs", "applied"),
+        ("caverns", "privileges", "applied"),
+        ("caverns", "fingerprint_server", "applied"),
     ]
     assert entries[0].duration_ms is None
     assert len(preflight(ledger_conn, APP)) == len(APP.steps)
@@ -150,6 +157,221 @@ def test_install_refuses_a_connection_with_uncommitted_work(ledger_conn: Any) ->
     ledger_conn.commit()
     assert _exists(ledger_conn, "nozdormu_test.caller_work")
     assert not _exists(ledger_conn, "caverns.ledger")
+
+
+# --- privileges, Caverns' fourth own step --------------------------------------------------
+
+PUBLIC_ACL_ROWS = (
+    "SELECT (SELECT count(*) FROM pg_namespace n, aclexplode(n.nspacl) a"
+    "  WHERE n.nspname = 'caverns' AND a.grantee = 0),"
+    " (SELECT count(*) FROM pg_class c, aclexplode(c.relacl) a"
+    "  WHERE c.relnamespace = 'caverns'::regnamespace AND a.grantee = 0)"
+)
+PUBLIC_FUNCTIONS_SQL = (
+    "SELECT p.oid::regprocedure::text FROM pg_proc p WHERE p.pronamespace = 'caverns'::regnamespace"
+    " AND has_function_privilege('public', p.oid, 'EXECUTE') ORDER BY 1"
+)
+FUNCTIONS_SQL = "SELECT count(*) FROM pg_proc WHERE pronamespace = 'caverns'::regnamespace"
+
+
+def _install_own_steps(conn: Any, patch: pytest.MonkeyPatch, count: int) -> None:
+    """An installation of an earlier release: only the first *count* own steps."""
+    with patch.context() as earlier:
+        earlier.setattr(nozdormu, "_OWN_CHANGESET", Changeset("caverns", nozdormu._OWN_CHANGESET.steps[:count]))
+        install(conn)
+
+
+def _install_first_three_steps(conn: Any, patch: pytest.MonkeyPatch) -> None:
+    """An installation of the release before `privileges`: the first three own steps."""
+    _install_own_steps(conn, patch, 3)
+
+
+def test_install_leaves_public_no_privilege_in_the_own_schema(ledger_conn: Any) -> None:
+    install(ledger_conn)
+    assert _query(ledger_conn, PUBLIC_ACL_ROWS) == [(0, 0)]  # the schema, and every table and sequence in it
+    assert _query(ledger_conn, FUNCTIONS_SQL)[0][0] > 0  # the check below is not vacuous
+    # A function is executable by PUBLIC unless revoked: a later own step that adds one must revoke it itself.
+    assert _query(ledger_conn, PUBLIC_FUNCTIONS_SQL) == []
+    assert _query(ledger_conn, nozdormu._PRIVILEGES_REVOKED_SQL) == [(True,)]
+
+
+def test_the_privileges_check_is_false_without_the_schema_and_before_the_step(
+    ledger_conn: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    assert _query(ledger_conn, nozdormu._PRIVILEGES_REVOKED_SQL) == [(False,)]  # false, not an error
+    _install_first_three_steps(ledger_conn, monkeypatch)
+    assert _query(ledger_conn, nozdormu._PRIVILEGES_REVOKED_SQL) == [(False,)]
+    assert _query(ledger_conn, PUBLIC_FUNCTIONS_SQL) != []  # the default the step revokes
+
+
+def test_an_installation_of_the_previous_release_gets_the_privileges_step_with_install(
+    ledger_conn: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _install_first_three_steps(ledger_conn, monkeypatch)
+    assert _query(ledger_conn, LEDGER_ROWS) == OWN_ROWS[:3]
+    with pytest.raises(LedgerNotInstalled, match="call install"):
+        preflight(ledger_conn, APP)
+    _assert_idle(ledger_conn)
+    assert [e.label for e in history(ledger_conn)] == ["epochs", "fingerprint", "ledger"]  # the old rows still read
+    entries = install(ledger_conn)
+    assert [(e.version, e.changeset, e.label, e.outcome) for e in entries] == OWN_ROWS[3:]
+    assert entries[0].checksum == nozdormu._OWN_CHANGESET.steps[3].checksum
+    assert _query(ledger_conn, LEDGER_ROWS) == OWN_ROWS
+    assert _query(ledger_conn, PUBLIC_FUNCTIONS_SQL) == []
+    assert install(ledger_conn) == []  # applying twice writes nothing the second time
+    assert len(preflight(ledger_conn, APP)) == len(APP.steps)
+
+
+def test_install_accepts_the_privileges_step_when_the_revocations_are_already_there(
+    ledger_conn: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _install_first_three_steps(ledger_conn, monkeypatch)
+    _execute(ledger_conn, nozdormu._PRIVILEGES_DDL_SQL)  # a restore that kept the grants but not the row
+    entries = install(ledger_conn)
+    assert [(e.label, e.outcome) for e in entries] == [("privileges", "accepted"), ("fingerprint_server", "applied")]
+
+
+# What PUBLIC can do, spelled out: USAGE and CREATE on the schema, SELECT on a table, USAGE on a sequence.
+PUBLIC_GRANTS_SQL = (
+    "SELECT has_schema_privilege('public', 'caverns', 'USAGE'), has_schema_privilege('public', 'caverns', 'CREATE'),"
+    " has_table_privilege('public', 'caverns.ledger', 'SELECT'),"
+    " has_sequence_privilege('public', pg_get_serial_sequence('caverns.ledger', 'version'), 'USAGE')"
+)
+
+
+def test_install_revokes_what_public_was_granted_before_the_privileges_step(
+    ledger_conn: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _install_first_three_steps(ledger_conn, monkeypatch)
+    _run(
+        ledger_conn,
+        "GRANT USAGE, CREATE ON SCHEMA caverns TO PUBLIC",
+        "GRANT SELECT ON caverns.ledger TO PUBLIC",
+        "DO $$ BEGIN EXECUTE format('GRANT USAGE ON SEQUENCE %s TO PUBLIC',"
+        " pg_get_serial_sequence('caverns.ledger', 'version')); END $$",
+    )
+    assert _query(ledger_conn, PUBLIC_GRANTS_SQL) == [(True, True, True, True)]
+    assert _query(ledger_conn, nozdormu._PRIVILEGES_REVOKED_SQL) == [(False,)]
+    install(ledger_conn)
+    assert _query(ledger_conn, PUBLIC_GRANTS_SQL) == [(False, False, False, False)]
+    assert _query(ledger_conn, PUBLIC_ACL_ROWS) == [(0, 0)]
+
+
+def _run(conn: Any, *statements: str) -> None:
+    """Several statements, then one commit."""
+    with conn.cursor() as cursor:
+        for statement in statements:
+            cursor.execute(statement)
+    conn.commit()
+
+
+@pytest.fixture
+def roles(ledger_conn: Any) -> Iterator[tuple[str, str, str]]:
+    """Three roles, dropped after: an owner, a stranger and a member of the owner (inheriting its privileges)."""
+    with throwaway_roles(ledger_conn, ("owner", "NOLOGIN"), ("stranger", "NOLOGIN"), ("member", "NOLOGIN")) as made:
+        owner, stranger, member = made
+        _run(ledger_conn, f"GRANT {owner} TO {member}")
+        # Schema creation checks the database privilege even when the schema exists.
+        _run(
+            ledger_conn,
+            "DO $$ BEGIN EXECUTE format('GRANT CREATE ON DATABASE %I TO "
+            + ", ".join((stranger, member))
+            + "', current_database()); END $$",
+        )
+        yield owner, stranger, member
+
+
+def test_install_refuses_a_schema_owned_by_a_role_the_caller_is_not_a_member_of(
+    ledger_conn: Any, roles: tuple[str, str, str]
+) -> None:
+    owner, stranger, _ = roles
+    _run(ledger_conn, f"CREATE SCHEMA caverns AUTHORIZATION {owner}", f"SET ROLE {stranger}")
+    with pytest.raises(CavernsError) as refused:
+        install(ledger_conn)
+    assert str(refused.value) == (
+        f"schema caverns is owned by role {owner}, whose privileges role {stranger} does not inherit: "
+        f"run install as {owner} or a member that inherits its privileges"
+    )
+    _assert_idle(ledger_conn)
+    _run(ledger_conn, "RESET ROLE")
+    assert not _exists(ledger_conn, "caverns.ledger")  # nothing was written
+
+
+def test_install_refuses_a_relation_owned_by_a_role_the_caller_is_not_a_member_of(
+    ledger_conn: Any, roles: tuple[str, str, str]
+) -> None:
+    _, _, member = roles
+    _run(ledger_conn, f"CREATE SCHEMA caverns AUTHORIZATION {member}", "CREATE TABLE caverns.stray (id int)")
+    _run(ledger_conn, f"SET ROLE {member}")
+    with pytest.raises(
+        CavernsError, match="relation caverns.stray is owned by role .*, whose privileges role .* does not inherit"
+    ):
+        install(ledger_conn)
+    _run(ledger_conn, "RESET ROLE")
+    assert not _exists(ledger_conn, "caverns.ledger")
+
+
+def test_install_refuses_an_owner_whose_privileges_the_caller_does_not_inherit(
+    ledger_conn: Any, roles: tuple[str, str, str]
+) -> None:
+    """A member that does not inherit the owner's privileges cannot REVOKE or ALTER: refused like a stranger."""
+    owner, stranger, _ = roles
+    _run(
+        ledger_conn,
+        f"CREATE SCHEMA caverns AUTHORIZATION {owner}",
+        f"GRANT {owner} TO {stranger} WITH INHERIT FALSE",
+        f"SET ROLE {stranger}",
+    )
+    with pytest.raises(CavernsError) as refused:
+        install(ledger_conn)
+    assert str(refused.value) == (
+        f"schema caverns is owned by role {owner}, whose privileges role {stranger} does not inherit: "
+        f"run install as {owner} or a member that inherits its privileges"
+    )
+    _assert_idle(ledger_conn)
+    _run(ledger_conn, "RESET ROLE")
+    assert not _exists(ledger_conn, "caverns.ledger")  # nothing was written
+
+
+def test_install_accepts_a_schema_owned_by_a_role_the_caller_is_a_member_of(
+    ledger_conn: Any, roles: tuple[str, str, str]
+) -> None:
+    owner, _, member = roles
+    _run(ledger_conn, f"CREATE SCHEMA caverns AUTHORIZATION {owner}", f"SET ROLE {member}")
+    entries = install(ledger_conn)
+    assert [e.label for e in entries] == [label for _, _, label, _ in OWN_ROWS]
+    assert {e.changeset for e in entries} == {"caverns"}
+    _run(ledger_conn, "RESET ROLE")
+    assert _query(ledger_conn, LEDGER_ROWS) == OWN_ROWS
+    assert _query(ledger_conn, PUBLIC_ACL_ROWS) == [(0, 0)]
+    assert _query(ledger_conn, "SELECT DISTINCT recorded_by FROM caverns.ledger") == [(member,)]
+
+
+def test_a_runner_role_with_the_documented_grants_applies_and_snapshots(
+    ledger_conn: Any, roles: tuple[str, str, str]
+) -> None:
+    """The grants of the README suffice for every write after `install`; an identity sequence needs none."""
+    _, _, runner = roles
+    install(ledger_conn)
+    _run(
+        ledger_conn,
+        "CREATE SCHEMA nozdormu_test",
+        "CREATE TABLE nozdormu_test.t (id int PRIMARY KEY)",
+        "INSERT INTO nozdormu_test.t VALUES (1)",
+        f"GRANT USAGE ON SCHEMA nozdormu_test TO {runner}",
+        f"GRANT SELECT ON nozdormu_test.t TO {runner}",
+        *(grant.format(role=runner) for grant in RUNNER_GRANTS),
+        f"SET ROLE {runner}",
+    )
+    assert [e.label for e in apply(ledger_conn, Changeset("app", [Step("noop", "SELECT 1")]))] == ["noop"]
+    epochs.register(ledger_conn, "nozdormu_test", "t")
+    epochs.snapshot(ledger_conn, "first")
+    epochs.snapshot(ledger_conn, "second")
+    assert epochs.as_of(ledger_conn, "first", "nozdormu_test", "t").rows == ({"id": 1},)
+    assert [e.name for e in epochs.delete(ledger_conn, ["first"])] == ["first"]
+    epochs.unregister(ledger_conn, "nozdormu_test", "t")
+    _run(ledger_conn, "RESET ROLE")
+    assert _query(ledger_conn, "SELECT DISTINCT recorded_by FROM caverns.ledger WHERE changeset = 'app'") == [(runner,)]
 
 
 # --- the ledger's own rules ----------------------------------------------------------------
@@ -210,6 +432,8 @@ def test_a_ledger_of_the_previous_release_upgrades_with_install(
     assert [(e.version, e.label, e.outcome) for e in entries] == [
         (2, "fingerprint", "applied"),
         (3, "epochs", "applied"),
+        (4, "privileges", "applied"),
+        (5, "fingerprint_server", "applied"),
     ]
     assert _query(ledger_conn, LEDGER_ROWS) == OWN_ROWS
     assert _exists(ledger_conn, "caverns.fingerprint")
@@ -247,6 +471,107 @@ def test_the_fingerprint_table_refuses_an_inconsistent_row(
         message,
         (version, digest),
     )
+
+
+# --- fingerprint_server, Caverns' fifth own step -------------------------------------------
+
+SERVER_VERSION_NUM = "SELECT current_setting('server_version_num')::integer"
+RECORDED_SERVER_VERSIONS = "SELECT version, server_version FROM caverns.fingerprint ORDER BY version"
+
+
+def _latest(conn: Any) -> tuple[int, Any] | None:
+    """The newest recorded fingerprint as `latest` reads it."""
+    with conn.cursor() as cursor:
+        found = fingerprint_store.latest(cursor)
+    conn.rollback()
+    return found
+
+
+def test_the_fingerprint_server_check_is_false_until_the_step_and_true_after(
+    ledger_conn: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    check = fingerprint_store.FINGERPRINT_SERVER_SQL
+    assert _query(ledger_conn, check) == [(False,)]  # false, not an error, without the table
+    _install_own_steps(ledger_conn, monkeypatch, 4)
+    assert _query(ledger_conn, check) == [(False,)]
+    install(ledger_conn)
+    assert _query(ledger_conn, check) == [(True,)]
+    assert _query(ledger_conn, nozdormu._PRIVILEGES_REVOKED_SQL) == [(True,)]  # an added column grants nothing
+    assert _query(ledger_conn, PUBLIC_ACL_ROWS) == [(0, 0)]
+
+
+def test_the_fingerprint_server_column_refuses_a_version_that_is_not_positive(ledger_conn: Any) -> None:
+    install(ledger_conn)
+    _refused(
+        ledger_conn,
+        "INSERT INTO caverns.fingerprint (version, schemas, document, hash, server_version)"
+        " VALUES (1, '{}', '{}', %s, 0)",
+        "violates check constraint",
+        (ZEROS,),
+    )
+
+
+def test_a_capture_and_the_recorded_row_carry_the_servers_version(ledger_conn: Any) -> None:
+    install(ledger_conn)
+    server = _query(ledger_conn, SERVER_VERSION_NUM)[0][0]
+    assert server >= 180000  # PostgreSQL 18, the version the tests run on
+    assert take_fingerprint(ledger_conn).server_version == server
+    apply(ledger_conn, FIRST_TWO)
+    version, recorded = _latest(ledger_conn) or pytest.fail("no fingerprint was recorded")
+    assert recorded.server_version == server
+    assert _query(ledger_conn, RECORDED_SERVER_VERSIONS) == [(version, server)]
+    baseline(ledger_conn, Changeset("other", [Step("x", "SELECT 1")]))
+    assert [row[1] for row in _query(ledger_conn, RECORDED_SERVER_VERSIONS)] == [server, server]
+
+
+def test_the_server_version_is_outside_the_hash(ledger_conn: Any) -> None:
+    install(ledger_conn)
+    apply(ledger_conn, FIRST_TWO)
+    recorded = _latest(ledger_conn)
+    assert recorded is not None
+    live = take_fingerprint(ledger_conn)
+    assert (live.document, live.hash) == (recorded[1].document, recorded[1].hash)
+    assert fingerprint_store.hash_document(live.document) == live.hash
+
+
+def test_an_installation_of_the_previous_release_gets_the_fingerprint_server_step_with_install(
+    ledger_conn: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _install_own_steps(ledger_conn, monkeypatch, 4)
+    assert _query(ledger_conn, LEDGER_ROWS) == OWN_ROWS[:4]
+    # A fingerprint recorded by that release: the columns it knew.
+    _execute(
+        ledger_conn,
+        "INSERT INTO caverns.fingerprint (version, schemas, document, hash) VALUES (4, '{public}', '{}', %s)",
+        (ZEROS,),
+    )
+    with pytest.raises(LedgerNotInstalled, match="call install"):
+        preflight(ledger_conn, APP)
+    with pytest.raises(LedgerNotInstalled, match="out of date.*call install"):
+        infinite.drift(ledger_conn)
+    _assert_idle(ledger_conn)
+    entries = install(ledger_conn)
+    assert [(e.version, e.changeset, e.label, e.outcome) for e in entries] == OWN_ROWS[4:]  # exactly this step
+    assert entries[0].checksum == nozdormu._OWN_CHANGESET.steps[4].checksum
+    assert _query(ledger_conn, LEDGER_ROWS) == OWN_ROWS
+    assert _query(ledger_conn, RECORDED_SERVER_VERSIONS) == [(4, None)]
+    old = _latest(ledger_conn)
+    assert old is not None and old[1].server_version is None and old[1].hash == ZEROS  # the old row reads back
+    assert install(ledger_conn) == []  # installing twice writes nothing the second time
+    assert _query(ledger_conn, LEDGER_ROWS) == OWN_ROWS
+    apply(ledger_conn, FIRST_TWO)  # a new apply records the version
+    server = _query(ledger_conn, SERVER_VERSION_NUM)[0][0]
+    assert _query(ledger_conn, RECORDED_SERVER_VERSIONS) == [(4, None), (7, server)]
+    assert infinite.drift(ledger_conn).differences == ()
+
+
+def test_install_accepts_the_fingerprint_server_step_when_the_column_is_already_there(
+    ledger_conn: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _install_own_steps(ledger_conn, monkeypatch, 4)
+    _execute(ledger_conn, nozdormu._FINGERPRINT_SERVER_DDL_SQL)  # a restore that kept the column but not the row
+    entries = install(ledger_conn)
+    assert [(e.label, e.outcome) for e in entries] == [("fingerprint_server", "accepted")]
 
 
 # --- preflight -----------------------------------------------------------------------------
@@ -313,10 +638,14 @@ def test_preflight_trusts_the_ledger_over_a_check(ledger_conn: Any) -> None:
     assert _statuses(ledger_conn)["schema"] is Status.APPLIED
 
 
-def test_preflight_covers_the_steps_up_to_the_baseline(ledger_conn: Any) -> None:
+def test_preflight_marks_a_step_before_the_baseline_that_has_no_row(ledger_conn: Any) -> None:
     install(ledger_conn)
-    _record(ledger_conn, TABLE, "baseline")
-    assert _statuses(ledger_conn) == {"schema": Status.APPLIED, "table": Status.APPLIED, "index": Status.PENDING}
+    _record(ledger_conn, TABLE, "baseline")  # one row only: the schema step has none of its own
+    assert _statuses(ledger_conn) == {
+        "schema": Status.BEFORE_BASELINE,
+        "table": Status.APPLIED,
+        "index": Status.PENDING,
+    }
 
 
 def test_preflight_refuses_a_baseline_at_a_step_the_changeset_lacks(ledger_conn: Any) -> None:
@@ -458,7 +787,7 @@ def test_apply_runs_a_whole_changeset_on_an_empty_database(ledger_conn: Any) -> 
     install(ledger_conn)
     entries = apply(ledger_conn, APP)
     assert [(e.changeset, e.label, e.outcome) for e in entries] == [("app", s.label, "applied") for s in APP.steps]
-    assert [e.version for e in entries] == [4, 5, 6]
+    assert [e.version for e in entries] == [6, 7, 8]
     assert [e.checksum for e in entries] == [s.checksum for s in APP.steps]
     assert all(e.duration_ms is not None and e.duration_ms >= 0 and e.error is None for e in entries)
     assert _exists(ledger_conn, "nozdormu_test.t") and _exists(ledger_conn, "nozdormu_test.t_id")
@@ -577,8 +906,8 @@ def test_apply_refuses_a_bad_acknowledgement(ledger_conn: Any, kwargs: dict[str,
     assert _query(ledger_conn, APP_ROWS) == [("schema", "applied"), ("table", "applied")]
 
 
-READ_ONLY_SESSION_SQL = "SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY"
-READ_WRITE_SESSION_SQL = "SET SESSION CHARACTERISTICS AS TRANSACTION READ WRITE"
+READ_ONLY_GRANTS = ("GRANT USAGE ON SCHEMA caverns TO {role}", "GRANT SELECT ON ALL TABLES IN SCHEMA caverns TO {role}")
+UNRECORDABLE = Changeset("app", [Step("boom", "SELECT 1 / 0")])
 BAD = Step(
     "bad",
     "CREATE TABLE nozdormu_test.bad (id int); SELECT 1 / 0",
@@ -593,14 +922,36 @@ def test_a_failing_step_is_rolled_back_recorded_and_raised(ledger_conn: Any) -> 
     with pytest.raises(StepFailed) as failed:
         apply(ledger_conn, FAILING)
     _assert_idle(ledger_conn)
-    assert (failed.value.label, failed.value.version) == ("bad", 5)
+    assert (failed.value.label, failed.value.version) == ("bad", 7)
     assert isinstance(failed.value.__cause__, DRIVER_ERRORS)
     assert _query(ledger_conn, APP_ROWS) == [("schema", "applied"), ("bad", "failed")]
     row = _query(ledger_conn, "SELECT version, error, duration_ms FROM caverns.ledger WHERE outcome = 'failed'")[0]
-    assert row[0] == 5 and "division by zero" in row[1] and row[2] >= 0
+    assert row[0] == 7 and row[1] == "22012: division by zero" and row[2] >= 0
     assert not _exists(ledger_conn, "nozdormu_test.bad")  # rolled back with its transaction
     assert not _exists(ledger_conn, "nozdormu_test.later")  # later steps did not run
     assert _statuses(ledger_conn, FAILING) == {"schema": Status.APPLIED, "bad": Status.PENDING, "later": Status.PENDING}
+
+
+def _failed_error(conn: Any, step: Step) -> str | None:
+    """The `error` of the failed row that `step` leaves in a changeset after the schema step."""
+    install(conn)
+    with pytest.raises(StepFailed) as failed:
+        apply(conn, Changeset("app", [SCHEMA, step]))
+    assert isinstance(failed.value.__cause__, DRIVER_ERRORS)
+    return _query(conn, "SELECT error FROM caverns.ledger WHERE outcome = 'failed'")[0][0]
+
+
+def test_a_failed_row_keeps_the_sqlstate_and_the_primary_message(ledger_conn: Any) -> None:
+    missing = Step("missing", "SELECT 1 FROM nozdormu_test.missing")
+    assert _failed_error(ledger_conn, missing) == '42P01: relation "nozdormu_test.missing" does not exist'
+
+
+def test_a_failed_row_drops_the_detail_hint_and_context(ledger_conn: Any) -> None:
+    raising = Step(
+        "raising",
+        "DO $$ BEGIN RAISE EXCEPTION 'boom' USING DETAIL = 'secret detail', HINT = 'h'; END $$",
+    )
+    assert _failed_error(ledger_conn, raising) == "P0001: boom"
 
 
 def test_a_failed_step_can_be_fixed_and_applied(ledger_conn: Any) -> None:
@@ -624,20 +975,23 @@ def test_a_failing_own_step_raises_a_caverns_error_and_records_nothing(
     assert not _exists(ledger_conn, "caverns.ledger")  # the connection is usable and nothing was written
 
 
-def test_a_failure_that_cannot_be_recorded_raises_a_caverns_error(ledger_conn: Any) -> None:
-    install(ledger_conn)
-    _execute(ledger_conn, "CREATE SCHEMA nozdormu_test")
-    _execute(ledger_conn, READ_ONLY_SESSION_SQL)
-    try:
-        with pytest.raises(CavernsError, match="could not be recorded") as refused:
-            apply(ledger_conn, Changeset("app", [Step("ro", "CREATE TABLE nozdormu_test.ro_t ()")]))
-    finally:
-        _execute(ledger_conn, READ_WRITE_SESSION_SQL)
+def _as_a_role_that_cannot_write_the_ledger(conn: Any, role: str) -> None:
+    """Install, then become *role*, which may read the ledger but not append to it: a failed row cannot be recorded."""
+    install(conn)
+    _run(conn, *(grant.format(role=role) for grant in READ_ONLY_GRANTS), f"SET ROLE {role}")
+
+
+def test_a_failure_that_cannot_be_recorded_raises_a_caverns_error(
+    ledger_conn: Any, roles: tuple[str, str, str]
+) -> None:
+    _as_a_role_that_cannot_write_the_ledger(ledger_conn, roles[2])
+    with pytest.raises(CavernsError, match="could not be recorded") as refused:
+        apply(ledger_conn, UNRECORDABLE)
     _assert_idle(ledger_conn)
     assert not isinstance(refused.value, StepFailed)
     assert isinstance(refused.value.__cause__, DRIVER_ERRORS)
+    _run(ledger_conn, "RESET ROLE")
     assert _query(ledger_conn, APP_ROWS) == []
-    assert not _exists(ledger_conn, "nozdormu_test.ro_t")
 
 
 def test_apply_skips_a_step_another_runner_applied_after_preflight(ledger_conn: Any) -> None:
@@ -664,25 +1018,6 @@ RACE_STEP = Step("race", "CREATE TABLE nozdormu_test.race_t ()")
 RACE = Changeset("race", [RACE_STEP])
 RACE_ROWS = "SELECT label, outcome FROM caverns.ledger WHERE changeset = 'race' ORDER BY version"
 REPEATABLE_READ_SQL = "SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL REPEATABLE READ"
-# pg_locks shows a bigint advisory key as its high (classid) and low (objid) 32 bits.
-LOCK_KEY_HIGH = _connection.ADVISORY_LOCK_KEY >> 32
-LOCK_KEY_LOW = _connection.ADVISORY_LOCK_KEY & 0xFFFFFFFF
-WAITING_LOCKS_SQL = (
-    "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND NOT granted AND classid = %s AND objid = %s"
-)
-WAIT_SECONDS = 10.0
-POLL_SECONDS = 0.02
-
-
-def _wait_for_a_waiting_lock(conn: Any) -> None:
-    deadline = time.monotonic() + WAIT_SECONDS
-    with conn.cursor() as cursor:
-        while time.monotonic() < deadline:
-            cursor.execute(WAITING_LOCKS_SQL, (LOCK_KEY_HIGH, LOCK_KEY_LOW))
-            if cursor.fetchone()[0] == 1:
-                return
-            time.sleep(POLL_SECONDS)
-    pytest.fail(f"no runner waited for the advisory lock within {WAIT_SECONDS} s")
 
 
 def test_a_runner_waits_for_the_lock_and_reads_the_ledger_after_it(ledger_conn: Any, second_conn: Any) -> None:
@@ -702,7 +1037,7 @@ def test_a_runner_waits_for_the_lock_and_reads_the_ledger_after_it(ledger_conn: 
     runner = threading.Thread(target=run, daemon=True)
     runner.start()
     try:
-        _wait_for_a_waiting_lock(second_conn)
+        wait_for_a_waiting_lock(second_conn)
         with second_conn.cursor() as cursor:  # the other runner's work, under the lock it holds
             cursor.execute(RACE_STEP.sql)
             nozdormu._insert(cursor, RACE.name, RACE_STEP, "applied")
@@ -713,6 +1048,255 @@ def test_a_runner_waits_for_the_lock_and_reads_the_ledger_after_it(ledger_conn: 
     assert not runner.is_alive()
     assert result == {"entries": []}
     assert _query(ledger_conn, RACE_ROWS) == [("race", "applied")]
+
+
+# --- lock timeout --------------------------------------------------------------------------
+
+HOLD_LOCK_SQL = "SELECT pg_advisory_lock(%s::bigint)"
+RELEASE_LOCK_SQL = "SELECT pg_advisory_unlock(%s::bigint)"
+SEEN_STEP = Step("seen", "CREATE TABLE nozdormu_test.seen AS SELECT current_setting('lock_timeout') AS v")
+
+
+def _hold_caverns_lock(conn: Any) -> None:
+    """Another session takes Caverns' advisory lock for its session, as a running Caverns write would."""
+    _execute(conn, HOLD_LOCK_SQL, (_connection.ADVISORY_LOCK_KEY,))
+
+
+def _release_caverns_lock(conn: Any) -> None:
+    conn.rollback()
+    _execute(conn, RELEASE_LOCK_SQL, (_connection.ADVISORY_LOCK_KEY,))
+
+
+def test_apply_gives_up_waiting_for_caverns_lock_with_a_caverns_error(ledger_conn: Any, second_conn: Any) -> None:
+    install(ledger_conn)
+    _hold_caverns_lock(second_conn)
+    try:
+        started = time.monotonic()
+        with pytest.raises(CavernsError, match=r"advisory lock: gave up waiting after 0\.2 seconds") as refused:
+            apply(ledger_conn, APP, lock_timeout=0.2)
+        assert time.monotonic() - started < WAIT_SECONDS
+    finally:
+        _release_caverns_lock(second_conn)
+    assert not isinstance(refused.value, StepFailed)
+    assert _connection.sqlstate(refused.value.__cause__) == "55P03"  # type: ignore[arg-type]
+    _assert_idle(ledger_conn)
+    assert _query(ledger_conn, APP_ROWS) == []
+    assert not _exists(ledger_conn, "nozdormu_test.t")
+    assert [e.label for e in apply(ledger_conn, APP, lock_timeout=0.2)] == ["schema", "table", "index"]
+
+
+def test_the_lock_timeout_message_names_whole_seconds_without_a_decimal(ledger_conn: Any, second_conn: Any) -> None:
+    _hold_caverns_lock(second_conn)
+    try:
+        with ledger_conn.cursor() as cursor, pytest.raises(CavernsError, match="after 1 second "):
+            _connection.lock(cursor, lock_timeout=1.0)
+    finally:
+        ledger_conn.rollback()
+        _release_caverns_lock(second_conn)
+
+
+def test_lock_with_no_argument_bounds_the_wait_by_the_default(ledger_conn: Any) -> None:
+    with _connection.transaction(ledger_conn) as cursor:
+        _connection.lock(cursor)
+        cursor.execute("SELECT current_setting('lock_timeout')")
+        assert cursor.fetchone() == ("5s",)
+    assert _query(ledger_conn, "SHOW lock_timeout") == [("0",)]  # transaction-local: the session's own is back
+
+
+@pytest.mark.parametrize(
+    ("option", "seen", "after"),
+    [(None, "7s", "7s"), (0.2, "200ms", "7s"), (0.001, "1ms", "7s"), ("default", "5s", "7s")],
+)
+def test_apply_sets_the_lock_timeout_for_each_step_only(ledger_conn: Any, option: Any, seen: str, after: str) -> None:
+    install(ledger_conn)
+    _execute(ledger_conn, "SET lock_timeout = '7s'")
+    changeset = Changeset("app", [SCHEMA, SEEN_STEP])
+    if option == "default":
+        apply(ledger_conn, changeset)
+    else:
+        apply(ledger_conn, changeset, lock_timeout=option)
+    assert _query(ledger_conn, "SELECT v FROM nozdormu_test.seen") == [(seen,)]
+    assert _query(ledger_conn, "SHOW lock_timeout") == [(after,)]
+
+
+def test_a_step_that_waits_for_a_lock_fails_with_the_lock_error_recorded(ledger_conn: Any, second_conn: Any) -> None:
+    install(ledger_conn)
+    apply(ledger_conn, FIRST_TWO)
+    reading = Changeset("app", [SCHEMA, TABLE, Step("read", "SELECT count(*) FROM nozdormu_test.t")])
+    with second_conn.cursor() as cursor:
+        cursor.execute("LOCK TABLE nozdormu_test.t IN ACCESS EXCLUSIVE MODE")  # held by an open transaction
+    try:
+        with pytest.raises(StepFailed) as failed:
+            apply(ledger_conn, reading, lock_timeout=0.2)
+    finally:
+        second_conn.rollback()
+    assert isinstance(failed.value.__cause__, DRIVER_ERRORS)
+    assert _connection.sqlstate(failed.value.__cause__) == "55P03"
+    rows = _query(
+        ledger_conn, "SELECT label, outcome, error FROM caverns.ledger WHERE changeset = 'app' ORDER BY version"
+    )
+    assert [(r[0], r[1]) for r in rows] == [("schema", "applied"), ("table", "applied"), ("read", "failed")]
+    assert rows[2][2].startswith("55P03: ")
+    assert [e.label for e in apply(ledger_conn, reading)] == ["read"]  # the step is pending again
+
+
+HELD_SECONDS = 0.5
+
+
+def _release_caverns_lock_when_a_runner_has_waited(holder: Any, outcome: dict[str, Any]) -> threading.Thread:
+    """Release the advisory lock *holder* has taken, but only after a runner is seen waiting for it for a while.
+
+    Deterministic: the thread polls `pg_locks` until a waiter is queued, then lets HELD_SECONDS pass (several
+    times any `lock_timeout` the tests use) before it unlocks, so a wait bounded by that timeout has certainly
+    failed by then. The caller must not use *holder* until the thread has joined.
+    """
+
+    def release() -> None:
+        try:
+            wait_for_a_waiting_lock(holder)
+            time.sleep(HELD_SECONDS)
+            _release_caverns_lock(holder)
+        except BaseException as error:  # reported by the test
+            outcome["error"] = error
+
+    thread = threading.Thread(target=release, daemon=True)
+    thread.start()
+    return thread
+
+
+def _write_planned_step(conn: Any, label: str, *, first: bool, lock_timeout: float | None) -> Any:
+    """What `apply` does for one planned, pending step of APP: `_write_step` in the step's own transaction."""
+    status = next(s for s in preflight(conn, APP) if s.step.label == label)
+    return nozdormu._write_step(
+        conn, APP, status, "applied", record_fingerprint=True, first=first, last=True, lock_timeout=lock_timeout
+    )
+
+
+def test_a_later_step_waits_for_caverns_lock_without_a_timeout(ledger_conn: Any, second_conn: Any) -> None:
+    """After an earlier step committed, the run's next wait for the lock outlasts `lock_timeout`, then goes on.
+
+    The run is cut at the step: a second session cannot be made to take the lock between two steps of a real
+    `apply`, so the per-step writer is called as `apply` calls it for its second step.
+    """
+    install(ledger_conn)
+    apply(ledger_conn, Changeset("app", [SCHEMA]))
+    _hold_caverns_lock(second_conn)
+    outcome: dict[str, Any] = {}
+    releaser = _release_caverns_lock_when_a_runner_has_waited(second_conn, outcome)
+    try:
+        entry = _write_planned_step(ledger_conn, "table", first=False, lock_timeout=0.1)
+    finally:
+        releaser.join(WAIT_SECONDS)
+    assert "error" not in outcome
+    assert (entry.label, entry.outcome) == ("table", "applied")
+    assert _query(ledger_conn, APP_ROWS) == [("schema", "applied"), ("table", "applied")]
+    assert _exists(ledger_conn, "nozdormu_test.t")
+    stored = _query(ledger_conn, "SELECT count(*) FROM caverns.fingerprint WHERE version = %s", (entry.version,))
+    assert stored == [(1,)]
+
+
+def test_the_first_step_still_gives_up_waiting_for_caverns_lock(ledger_conn: Any, second_conn: Any) -> None:
+    install(ledger_conn)
+    _hold_caverns_lock(second_conn)
+    try:
+        with pytest.raises(CavernsError, match=r"advisory lock: gave up waiting after 0\.2 seconds"):
+            _write_planned_step(ledger_conn, "schema", first=True, lock_timeout=0.2)
+    finally:
+        _release_caverns_lock(second_conn)
+    _assert_idle(ledger_conn)
+    assert _query(ledger_conn, APP_ROWS) == []
+    assert not _exists(ledger_conn, "nozdormu_test")
+
+
+def test_a_failure_is_recorded_after_waiting_for_caverns_lock_without_a_timeout(
+    ledger_conn: Any, second_conn: Any
+) -> None:
+    install(ledger_conn)
+    _hold_caverns_lock(second_conn)
+    outcome: dict[str, Any] = {}
+    releaser = _release_caverns_lock_when_a_runner_has_waited(second_conn, outcome)
+    try:
+        failed = nozdormu._record_failure(
+            ledger_conn, APP, SCHEMA, ValueError("boom"), 1, record_fingerprint=False, lock_timeout=0.1
+        )
+    finally:
+        releaser.join(WAIT_SECONDS)
+    assert "error" not in outcome
+    assert failed.label == "schema"
+    assert _query(ledger_conn, "SELECT label, outcome, error FROM caverns.ledger WHERE changeset = 'app'") == [
+        ("schema", "failed", "boom")
+    ]
+
+
+def test_a_later_steps_own_lock_wait_is_still_bounded(ledger_conn: Any, second_conn: Any) -> None:
+    install(ledger_conn)
+    apply(ledger_conn, FIRST_TWO)
+    reading = Changeset(
+        "app", [SCHEMA, TABLE, Step("noop", "SELECT 1"), Step("read", "SELECT count(*) FROM nozdormu_test.t")]
+    )
+    with second_conn.cursor() as cursor:
+        cursor.execute("LOCK TABLE nozdormu_test.t IN ACCESS EXCLUSIVE MODE")
+    outcome: dict[str, Any] = {}
+
+    def run() -> None:
+        try:
+            apply(ledger_conn, reading, lock_timeout=0.2)
+        except BaseException as error:  # reported below
+            outcome["error"] = error
+
+    runner = threading.Thread(target=run, daemon=True)
+    runner.start()
+    try:
+        runner.join(WAIT_SECONDS)
+        hung = runner.is_alive()
+    finally:
+        second_conn.rollback()  # releases the table, so a hung run ends
+        runner.join(WAIT_SECONDS)
+    assert not hung, "the step's own lock wait was not bounded"
+    failed = outcome.get("error")
+    assert isinstance(failed, StepFailed)
+    assert _connection.sqlstate(failed.__cause__) == "55P03"  # type: ignore[arg-type]
+    rows = _query(ledger_conn, "SELECT label, outcome FROM caverns.ledger WHERE changeset = 'app' ORDER BY version")
+    assert rows[-2:] == [("noop", "applied"), ("read", "failed")]  # `read` is the run's second step
+
+
+def test_the_wait_after_a_skipped_first_step_is_still_bounded(
+    ledger_conn: Any, second_conn: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A first planned step already applied by the time it is written writes no row: the next wait is bounded."""
+    install(ledger_conn)
+    statuses = preflight(ledger_conn, APP)
+    apply(ledger_conn, Changeset("app", [SCHEMA]))  # another runner got there first
+    real = nozdormu._write_step
+    calls: list[str] = []
+
+    def write(*args: Any, **kwargs: Any) -> Any:
+        entry = real(*args, **kwargs)
+        calls.append(args[2].step.label)
+        if len(calls) == 1:
+            assert entry is None  # skipped: nothing written
+            _hold_caverns_lock(second_conn)
+        return entry
+
+    monkeypatch.setattr(nozdormu, "_write_step", write)
+    try:
+        with pytest.raises(CavernsError, match=r"advisory lock: gave up waiting after 0\.2 seconds"):
+            nozdormu._apply_statuses(
+                ledger_conn, APP, statuses, frozenset(), frozenset(), record_fingerprint=True, lock_timeout=0.2
+            )
+    finally:
+        _release_caverns_lock(second_conn)
+    assert calls == ["schema"]  # the second call raised while waiting
+    assert _query(ledger_conn, APP_ROWS) == [("schema", "applied")]
+
+
+def test_a_lock_timeout_that_is_not_valid_is_refused_before_anything_runs(ledger_conn: Any) -> None:
+    install(ledger_conn)
+    for value in (0, -1, True, float("nan"), float("inf"), "5", 1e10, 10**400, 1e-9, 0.0005):
+        with pytest.raises(ChangesetError, match="lock_timeout"):
+            apply(ledger_conn, APP, lock_timeout=value)  # type: ignore[arg-type]
+    apply(ledger_conn, APP, lock_timeout=0.001)  # one millisecond is a valid timeout
+    assert _query(ledger_conn, APP_ROWS) == [("schema", "applied"), ("table", "applied"), ("index", "applied")]
 
 
 def test_a_percent_sign_in_a_step_is_literal_on_both_drivers(ledger_conn: Any) -> None:
@@ -766,14 +1350,21 @@ def test_baseline_refuses_a_connection_with_autocommit_on(ledger_conn: Any) -> N
         ledger_conn.autocommit = False
 
 
-def test_baseline_records_one_row_for_the_last_step_and_runs_nothing(ledger_conn: Any) -> None:
+def test_baseline_records_a_row_per_step_and_runs_nothing(ledger_conn: Any) -> None:
     install(ledger_conn)
     entry = baseline(ledger_conn, APP)
     assert (entry.changeset, entry.label, entry.outcome) == ("app", "index", "baseline")
     assert entry.checksum == INDEX.checksum
     assert FINGERPRINT.fullmatch(entry.fingerprint or "")
     assert (entry.duration_ms, entry.error, entry.caverns_version) == (None, None, __version__)
-    assert _query(ledger_conn, APP_ROWS) == [("index", "baseline")]
+    assert _query(ledger_conn, APP_ROWS) == [("schema", "baseline"), ("table", "baseline"), ("index", "baseline")]
+    rows = _query(
+        ledger_conn, "SELECT label, checksum, fingerprint FROM caverns.ledger WHERE changeset = 'app' ORDER BY version"
+    )
+    assert [(label, checksum) for label, checksum, _ in rows] == [(step.label, step.checksum) for step in APP.steps]
+    assert {fingerprint for _, _, fingerprint in rows} == {entry.fingerprint}  # one hash on every row
+    # The fingerprint is stored once, at the last row's version.
+    assert _query(ledger_conn, "SELECT version FROM caverns.fingerprint") == [(entry.version,)]
     assert not _exists(ledger_conn, "nozdormu_test.t")
     assert set(_statuses(ledger_conn).values()) == {Status.APPLIED}
     assert apply(ledger_conn, APP) == []
@@ -784,8 +1375,65 @@ def test_baseline_through_a_step_leaves_the_later_steps_pending(ledger_conn: Any
     _existing_database(ledger_conn)
     entry = baseline(ledger_conn, APP, through="table")
     assert (entry.label, entry.checksum) == ("table", TABLE.checksum)
+    assert _query(ledger_conn, APP_ROWS) == [("schema", "baseline"), ("table", "baseline")]
     assert _statuses(ledger_conn) == {"schema": Status.APPLIED, "table": Status.APPLIED, "index": Status.PENDING}
     assert [(e.label, e.outcome) for e in apply(ledger_conn, APP)] == [("index", "applied")]
+
+
+def _baselined_with_a_step_inserted_before(conn: Any) -> tuple[Changeset, Step]:
+    """Baseline `APP`, then return a changeset with a new step in front of the baseline's step."""
+    install(conn)
+    baseline(conn, APP)
+    early = Step("early", "CREATE TABLE nozdormu_test.early (id int)")
+    return Changeset("app", [SCHEMA, early, TABLE, INDEX]), early
+
+
+def test_a_step_inserted_before_the_baseline_is_before_the_baseline_and_refused(ledger_conn: Any) -> None:
+    changeset, early = _baselined_with_a_step_inserted_before(ledger_conn)
+    assert _statuses(ledger_conn, changeset) == {
+        "schema": Status.APPLIED,
+        "early": Status.BEFORE_BASELINE,
+        "table": Status.APPLIED,
+        "index": Status.APPLIED,
+    }
+    with pytest.raises(PreflightRefused) as refused:
+        apply(ledger_conn, changeset)
+    assert [(s.step, s.status) for s in refused.value.statuses] == [(early, Status.BEFORE_BASELINE)]
+    _assert_idle(ledger_conn)
+    assert len(_query(ledger_conn, APP_ROWS)) == 3
+
+
+def test_reapply_runs_a_step_before_the_baseline_and_records_applied(ledger_conn: Any) -> None:
+    changeset, early = _baselined_with_a_step_inserted_before(ledger_conn)
+    _execute(ledger_conn, SCHEMA.sql)
+    entries = apply(ledger_conn, changeset, reapply=["early"])
+    assert [(e.label, e.outcome) for e in entries] == [("early", "applied")]
+    assert _exists(ledger_conn, "nozdormu_test.early")
+    assert _statuses(ledger_conn, changeset)["early"] is Status.APPLIED
+
+
+def test_accept_records_a_step_before_the_baseline_without_running_it(ledger_conn: Any) -> None:
+    changeset, early = _baselined_with_a_step_inserted_before(ledger_conn)
+    _execute(ledger_conn, SCHEMA.sql)
+    entries = apply(ledger_conn, changeset, accept=["early"])
+    assert [(e.label, e.outcome, e.checksum) for e in entries] == [("early", "accepted", early.checksum)]
+    assert not _exists(ledger_conn, "nozdormu_test.early")
+    assert _statuses(ledger_conn, changeset)["early"] is Status.APPLIED
+
+
+def test_naming_an_applied_step_in_reapply_or_accept_is_refused(ledger_conn: Any) -> None:
+    changeset, _ = _baselined_with_a_step_inserted_before(ledger_conn)
+    for named in ({"reapply": ["table"]}, {"accept": ["table"]}):
+        with pytest.raises(PreflightRefused):
+            apply(ledger_conn, changeset, **named)
+        _assert_idle(ledger_conn)
+
+
+def test_an_edited_step_before_the_baseline_is_a_conflict(ledger_conn: Any) -> None:
+    install(ledger_conn)
+    baseline(ledger_conn, APP)
+    edited = Changeset("app", [Step("schema", "CREATE SCHEMA nozdormu_test -- edited"), TABLE, INDEX])
+    assert _statuses(ledger_conn, edited)["schema"] is Status.CONFLICT
 
 
 def test_baseline_refuses_a_step_the_changeset_lacks(ledger_conn: Any) -> None:
@@ -801,7 +1449,7 @@ def test_a_second_baseline_is_refused(ledger_conn: Any) -> None:
     with pytest.raises(BaselineRefused, match="already has ledger rows"):
         baseline(ledger_conn, APP, through="table")
     _assert_idle(ledger_conn)
-    assert _query(ledger_conn, APP_ROWS) == [("index", "baseline")]
+    assert _query(ledger_conn, APP_ROWS) == [("schema", "baseline"), ("table", "baseline"), ("index", "baseline")]
 
 
 def test_a_baseline_is_refused_for_a_changeset_that_was_applied(ledger_conn: Any) -> None:
@@ -894,9 +1542,9 @@ def test_the_default_schemas_are_every_one_but_the_system_ones_and_caverns(ledge
 def test_apply_records_one_fingerprint_at_the_last_ledger_row(ledger_conn: Any) -> None:
     install(ledger_conn)
     entries = apply(ledger_conn, FIRST_TWO)
-    assert [e.version for e in entries] == [4, 5]
+    assert [e.version for e in entries] == [6, 7]
     live = take_fingerprint(ledger_conn)
-    assert _query(ledger_conn, FINGERPRINT_ROWS) == [(5, list(live.schemas), live.hash)]
+    assert _query(ledger_conn, FINGERPRINT_ROWS) == [(7, list(live.schemas), live.hash)]
     assert _query(ledger_conn, "SELECT document FROM caverns.fingerprint") == [(live.document,)]
     assert "nozdormu_test" in live.schemas and live.document["nozdormu_test"]["table"] == {"t": {"kind": "r"}}
 
@@ -918,21 +1566,19 @@ def test_a_failing_step_records_the_fingerprint_with_its_failed_row(ledger_conn:
     install(ledger_conn)
     with pytest.raises(StepFailed) as failed:
         apply(ledger_conn, FAILING)
-    assert failed.value.version == 5
+    assert failed.value.version == 7
     live = take_fingerprint(ledger_conn)  # the failed step was rolled back: this is what the first step left
-    assert _query(ledger_conn, FINGERPRINT_ROWS) == [(5, list(live.schemas), live.hash)]
+    assert _query(ledger_conn, FINGERPRINT_ROWS) == [(7, list(live.schemas), live.hash)]
     assert "nozdormu_test" in live.schemas and live.document["nozdormu_test"]["table"] == {}
 
 
-def test_a_failure_that_cannot_be_recorded_records_no_fingerprint(ledger_conn: Any) -> None:
-    install(ledger_conn)
-    _execute(ledger_conn, "CREATE SCHEMA nozdormu_test")
-    _execute(ledger_conn, READ_ONLY_SESSION_SQL)
-    try:
-        with pytest.raises(CavernsError, match="could not be recorded"):
-            apply(ledger_conn, Changeset("app", [Step("ro", "CREATE TABLE nozdormu_test.ro_t ()")]))
-    finally:
-        _execute(ledger_conn, READ_WRITE_SESSION_SQL)
+def test_a_failure_that_cannot_be_recorded_records_no_fingerprint(
+    ledger_conn: Any, roles: tuple[str, str, str]
+) -> None:
+    _as_a_role_that_cannot_write_the_ledger(ledger_conn, roles[2])
+    with pytest.raises(CavernsError, match="could not be recorded"):
+        apply(ledger_conn, UNRECORDABLE)
+    _run(ledger_conn, "RESET ROLE")
     assert _query(ledger_conn, FINGERPRINT_ROWS) == []
 
 
@@ -976,7 +1622,7 @@ def test_apply_warns_of_drift_before_it_runs(ledger_conn: Any, caplog: pytest.Lo
         apply(ledger_conn, APP)
     warnings = [r.getMessage() for r in caplog.records if r.name == "caverns_of_time.nozdormu"]
     assert warnings == ["drift before applying changeset app: added column nozdormu_test.t.note"]
-    assert [row[0] for row in _query(ledger_conn, FINGERPRINT_ROWS)] == [5, 6]  # the run went ahead
+    assert [row[0] for row in _query(ledger_conn, FINGERPRINT_ROWS)] == [7, 8]  # the run went ahead
     caplog.clear()
     with caplog.at_level(logging.WARNING):  # the new fingerprint holds the column: no difference left
         apply(ledger_conn, Changeset("app", [*APP.steps, Step("more", "CREATE TABLE nozdormu_test.more ()")]))
@@ -987,7 +1633,7 @@ def test_apply_warns_of_drift_before_it_runs(ledger_conn: Any, caplog: pytest.Lo
 
 
 def _history_ledger(conn: Any) -> None:
-    """The ledger with its own rows (1 to 3), then app's three steps (4 to 6) and one other changeset's row."""
+    """The ledger with its own rows (1 to 5), then app's three steps (6 to 8) and one other changeset's row."""
     install(conn)
     apply(conn, APP)
     _execute(
@@ -1001,10 +1647,11 @@ def _history_ledger(conn: Any) -> None:
 def test_history_is_the_whole_ledger_newest_first(ledger_conn: Any) -> None:
     _history_ledger(ledger_conn)
     entries = history(ledger_conn)
-    assert [e.version for e in entries] == [7, 6, 5, 4, 3, 2, 1]
+    assert [e.version for e in entries] == [9, 8, 7, 6, 5, 4, 3, 2, 1]
     assert [(e.changeset, e.label) for e in entries] == [
         ("other", "x"), ("app", "index"), ("app", "table"), ("app", "schema"),
-        ("caverns", "epochs"), ("caverns", "fingerprint"), ("caverns", "ledger"),
+        ("caverns", "fingerprint_server"), ("caverns", "privileges"), ("caverns", "epochs"),
+        ("caverns", "fingerprint"), ("caverns", "ledger"),
     ]  # fmt: skip
     _assert_idle(ledger_conn)
 
@@ -1012,15 +1659,21 @@ def test_history_is_the_whole_ledger_newest_first(ledger_conn: Any) -> None:
 def test_history_of_one_changeset(ledger_conn: Any) -> None:
     _history_ledger(ledger_conn)
     assert [e.label for e in history(ledger_conn, changeset="app")] == ["index", "table", "schema"]
-    assert [e.label for e in history(ledger_conn, changeset="caverns")] == ["epochs", "fingerprint", "ledger"]
+    assert [e.label for e in history(ledger_conn, changeset="caverns")] == [
+        "fingerprint_server",
+        "privileges",
+        "epochs",
+        "fingerprint",
+        "ledger",
+    ]
     assert history(ledger_conn, changeset="nobody") == []
 
 
 def test_history_limit_keeps_the_newest_rows(ledger_conn: Any) -> None:
     _history_ledger(ledger_conn)
-    assert [e.version for e in history(ledger_conn, limit=2)] == [7, 6]
-    assert [e.version for e in history(ledger_conn, changeset="app", limit=1)] == [6]
-    assert len(history(ledger_conn, limit=100)) == 7
+    assert [e.version for e in history(ledger_conn, limit=2)] == [9, 8]
+    assert [e.version for e in history(ledger_conn, changeset="app", limit=1)] == [8]
+    assert len(history(ledger_conn, limit=100)) == 9
 
 
 def test_history_refuses_a_ledger_that_is_not_installed(ledger_conn: Any) -> None:

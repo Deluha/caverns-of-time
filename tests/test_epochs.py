@@ -1,10 +1,17 @@
-"""Epochs against PostgreSQL 18, on both supported drivers: the epoch tables and the registry of tracked tables."""
+"""Epochs against PostgreSQL 18, on both supported drivers: the epoch tables and the registry of tracked tables.
+
+Also the writable check every write makes (a read-only session is tested for real; the standby branch of
+`check_writable` shares its code path and cannot be reached without a replica, so it is not tested here) and the
+session lock's failed release.
+"""
 
 from __future__ import annotations
 
 import logging
+import re
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import replace
 from typing import Any
 
@@ -34,13 +41,19 @@ from caverns_of_time.epochs import (
 )
 from caverns_of_time.errors import CavernsError, ChangesetError, EpochNotFound, EpochRefused, LedgerNotInstalled
 from caverns_of_time.nozdormu import Changeset, install, preflight
-from tests.test_nozdormu_ledger import WAIT_SECONDS, _wait_for_a_waiting_lock
+from tests.conftest import RUNNER_GRANTS, WAIT_SECONDS, throwaway_roles, wait_for_a_waiting_lock
 
 DRIVER_ERRORS = (psycopg.Error, psycopg2.Error)
 SCHEMA = "nozdormu_test"
 EPOCH_TABLES = ["epoch", "epoch_deletion", "epoch_row", "epoch_source", "epoch_table"]
 LEDGER_ROWS = "SELECT version, label, outcome FROM caverns.ledger WHERE changeset = 'caverns' ORDER BY version"
-OWN_ROWS = [(1, "ledger", "applied"), (2, "fingerprint", "applied"), (3, "epochs", "applied")]
+OWN_ROWS = [
+    (1, "ledger", "applied"),
+    (2, "fingerprint", "applied"),
+    (3, "epochs", "applied"),
+    (4, "privileges", "applied"),
+    (5, "fingerprint_server", "applied"),
+]
 APP = Changeset("app", [nozdormu.Step("one", "SELECT 1")])
 
 
@@ -123,7 +136,11 @@ def test_a_database_installed_before_epochs_gets_the_step_with_install(
     _assert_idle(ledger_conn)
     assert [e.label for e in nozdormu.history(ledger_conn)] == ["fingerprint", "ledger"]  # the old rows still read
     entries = install(ledger_conn)
-    assert [(e.version, e.label, e.outcome) for e in entries] == [(3, "epochs", "applied")]
+    assert [(e.version, e.label, e.outcome) for e in entries] == [
+        (3, "epochs", "applied"),
+        (4, "privileges", "applied"),
+        (5, "fingerprint_server", "applied"),
+    ]
     assert _query(ledger_conn, LEDGER_ROWS) == OWN_ROWS
     assert _tables_exist(ledger_conn) == EPOCH_TABLES
     assert len(preflight(ledger_conn, APP)) == len(APP.steps)
@@ -595,9 +612,9 @@ def test_snapshot_logs_what_it_took(ledger_conn: Any, caplog: pytest.LogCaptureF
     top = max(e.version for e in nozdormu.history(ledger_conn))
     with caplog.at_level(logging.INFO, logger=epochs.__name__):
         snapshot(ledger_conn, "logged")
-    assert [r.getMessage() for r in caplog.records] == [
-        f"took epoch logged at ledger version {top}: 1 rows in 1 tables"
-    ]
+    estimate, took = [r.getMessage() for r in caplog.records]
+    assert re.fullmatch(r"snapshot logged: about [1-9]\d* bytes in 1 tables", estimate)
+    assert took == f"took epoch logged at ledger version {top}: 1 rows in 1 tables"
 
 
 def test_snapshot_of_an_empty_table_records_it_with_no_rows(ledger_conn: Any) -> None:
@@ -794,6 +811,182 @@ def test_snapshot_copies_the_rows_of_a_partitioned_table(ledger_conn: Any) -> No
     assert [(row["id"], row["n"]) for row in rows] == [(1, 10), (3, 30), (12, 20)]
 
 
+# --- row-level security, size and key size --------------------------------------------------
+
+RLS_TABLE = (
+    f"CREATE TABLE {SCHEMA}.rls (id int PRIMARY KEY, name text)",
+    f"INSERT INTO {SCHEMA}.rls VALUES (1, 'a'), (2, 'b'), (3, 'c')",
+    f"ALTER TABLE {SCHEMA}.rls ENABLE ROW LEVEL SECURITY",
+    f"CREATE POLICY only_one ON {SCHEMA}.rls USING (id = 1)",
+)
+
+
+@pytest.fixture
+def rls_roles(ledger_conn: Any) -> Iterator[tuple[str, str, str]]:
+    """Three roles, dropped after: a reader, the table's owner and one with BYPASSRLS."""
+    with throwaway_roles(
+        ledger_conn, ("rls_reader", "NOLOGIN"), ("rls_owner", "NOLOGIN"), ("rls_bypass", "NOLOGIN BYPASSRLS")
+    ) as made:
+        reader, owner, bypass = made
+        yield reader, owner, bypass
+
+
+def _rls_setup(conn: Any, roles: tuple[str, str, str], *extra: str) -> None:
+    """Caverns installed, the `rls` table (owned by the owner, with a policy) registered, the roles granted."""
+    owner = roles[1]
+    _installed_with_tables(conn, *RLS_TABLE, f"ALTER TABLE {SCHEMA}.rls OWNER TO {owner}", *extra)
+    register(conn, SCHEMA, "rls")
+    for role in roles:
+        _execute(
+            conn,
+            f"GRANT USAGE ON SCHEMA {SCHEMA} TO {role}",
+            f"GRANT SELECT ON {SCHEMA}.rls TO {role}",
+            *(grant.format(role=role) for grant in RUNNER_GRANTS),
+        )
+
+
+@contextmanager
+def _as_role(conn: Any, role: str) -> Iterator[None]:
+    _execute(conn, f"SET ROLE {role}")
+    try:
+        yield
+    finally:
+        conn.rollback()
+        _execute(conn, "RESET ROLE")
+
+
+def test_snapshot_refuses_a_table_with_row_level_security_the_role_does_not_bypass(
+    ledger_conn: Any, rls_roles: tuple[str, str, str]
+) -> None:
+    _rls_setup(ledger_conn, rls_roles)
+    reader = rls_roles[0]
+    with _as_role(ledger_conn, reader), pytest.raises(EpochRefused) as refused:
+        snapshot(ledger_conn, "rls")
+    assert str(refused.value) == (
+        f"table {SCHEMA}.rls has row-level security and role {reader} does not bypass it: "
+        f"a snapshot would copy only the rows {reader} can see"
+    )
+    _nothing_written(ledger_conn)
+
+
+def test_snapshot_accepts_the_owner_of_a_row_level_security_table_without_force(
+    ledger_conn: Any, rls_roles: tuple[str, str, str]
+) -> None:
+    _rls_setup(ledger_conn, rls_roles)
+    with _as_role(ledger_conn, rls_roles[1]):
+        taken = snapshot(ledger_conn, "owner")
+    assert [t.row_count for t in taken.tables] == [3]
+    assert [key for key, _ in _stored(ledger_conn, taken.epoch, "rls")] == [{"id": 1}, {"id": 2}, {"id": 3}]
+
+
+def test_snapshot_refuses_the_owner_of_a_row_level_security_table_with_force(
+    ledger_conn: Any, rls_roles: tuple[str, str, str]
+) -> None:
+    _rls_setup(ledger_conn, rls_roles, f"ALTER TABLE {SCHEMA}.rls FORCE ROW LEVEL SECURITY")
+    owner = rls_roles[1]
+    with _as_role(ledger_conn, owner), pytest.raises(EpochRefused, match=f"has row-level security and role {owner} "):
+        snapshot(ledger_conn, "forced")
+    _nothing_written(ledger_conn)
+
+
+def test_snapshot_accepts_a_role_with_bypassrls_and_a_superuser(
+    ledger_conn: Any, rls_roles: tuple[str, str, str]
+) -> None:
+    _rls_setup(ledger_conn, rls_roles, f"ALTER TABLE {SCHEMA}.rls FORCE ROW LEVEL SECURITY")
+    with _as_role(ledger_conn, rls_roles[2]):
+        assert [t.row_count for t in snapshot(ledger_conn, "bypass").tables] == [3]
+    assert [t.row_count for t in snapshot(ledger_conn, "super").tables] == [3]  # the test connection's superuser
+
+
+def test_snapshot_leaves_row_security_as_the_session_had_it(ledger_conn: Any) -> None:
+    _installed_with_tables(ledger_conn, ONE)
+    register(ledger_conn, SCHEMA, "one")
+    snapshot(ledger_conn, "pinned")
+    assert _query(ledger_conn, "SHOW row_security") == [("on",)]
+
+
+def test_snapshot_refuses_above_max_bytes_and_writes_nothing(ledger_conn: Any) -> None:
+    _installed_with_tables(ledger_conn, ONE, TWO, f"INSERT INTO {SCHEMA}.one VALUES (1, 'x')")
+    register(ledger_conn, SCHEMA, "one")
+    register(ledger_conn, SCHEMA, "two")
+    with pytest.raises(
+        EpochRefused,
+        match=r"snapshot 'small' would copy about [1-9]\d* bytes from 2 tables, above max_bytes 1: "
+        r"pass a larger max_bytes, or None for no limit",
+    ):
+        snapshot(ledger_conn, "small", max_bytes=1)
+    _nothing_written(ledger_conn)
+
+
+def test_snapshot_accepts_any_size_with_no_max_bytes(ledger_conn: Any) -> None:
+    _installed_with_tables(ledger_conn, ONE)
+    register(ledger_conn, SCHEMA, "one")
+    assert snapshot(ledger_conn, "unbounded", max_bytes=None).name == "unbounded"
+
+
+def test_snapshot_estimates_a_partitioned_table_by_its_partitions(
+    ledger_conn: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    _installed_with_tables(
+        ledger_conn,
+        f"CREATE TABLE {SCHEMA}.parts (id int PRIMARY KEY, n int) PARTITION BY RANGE (id)",
+        f"CREATE TABLE {SCHEMA}.parts_low PARTITION OF {SCHEMA}.parts FOR VALUES FROM (0) TO (10)",
+        f"INSERT INTO {SCHEMA}.parts VALUES (1, 10)",
+    )
+    register(ledger_conn, SCHEMA, "parts")
+    expected = _query(ledger_conn, f"SELECT pg_table_size('{SCHEMA}.parts_low')")[0][0]
+    with caplog.at_level(logging.INFO, logger=epochs.__name__):
+        snapshot(ledger_conn, "parts")
+    assert f"snapshot parts: about {expected} bytes in 1 tables" in [r.getMessage() for r in caplog.records]
+    with pytest.raises(EpochRefused, match="above max_bytes"):
+        snapshot(ledger_conn, "parts again", max_bytes=expected - 1)
+
+
+@pytest.mark.parametrize("value", [0, -1, True, 1.5, "1"])
+def test_snapshot_refuses_a_max_bytes_that_is_not_valid(ledger_conn: Any, value: Any) -> None:
+    _installed_with_tables(ledger_conn, ONE)
+    register(ledger_conn, SCHEMA, "one")
+    with pytest.raises(ChangesetError, match="max_bytes must be None or a positive integer"):
+        snapshot(ledger_conn, "bad", max_bytes=value)
+    _nothing_written(ledger_conn)
+
+
+def test_snapshot_refuses_a_key_too_large_for_an_index_entry_before_writing_a_row(ledger_conn: Any) -> None:
+    _installed_with_tables(
+        ledger_conn,
+        ONE,
+        f"CREATE TABLE {SCHEMA}.wide (k text, v int)",  # no index of its own: the key is only registered
+        f"INSERT INTO {SCHEMA}.one VALUES (1, 'x')",
+        f"INSERT INTO {SCHEMA}.wide SELECT string_agg(md5(i::text), ''), 1 FROM generate_series(1, 94) i",
+    )
+    register(ledger_conn, SCHEMA, "one")
+    register(ledger_conn, SCHEMA, "wide", key=["k"])
+    with pytest.raises(
+        EpochRefused,
+        match=rf"table {SCHEMA}\.wide has a key of about 3\d{{3}} bytes, above the 2704-byte limit of an index entry: "
+        r"declare a shorter key",
+    ):
+        snapshot(ledger_conn, "wide")  # `one` sorts first: nothing of it is kept either
+    _nothing_written(ledger_conn)
+    _execute(ledger_conn, f"UPDATE {SCHEMA}.wide SET k = left(k, 2000)")
+    assert [t.row_count for t in snapshot(ledger_conn, "wide").tables] == [1, 1]
+
+
+def test_the_key_size_read_streams_the_rows_and_the_copy_materializes_its_source(ledger_conn: Any) -> None:
+    """The key-size read must not hold every row's jsonb: its plan has no CTE; the copy reads its source thrice."""
+    _installed_with_tables(ledger_conn, ONE)
+
+    def plan(template: str, *arguments: Any) -> str:
+        placeholders = ", ".join(["%s::text"] * 3 + ["%s::text[]"] + ["%s::bigint"] * len(arguments))
+        (composed,) = _query(
+            ledger_conn, f"SELECT format({placeholders})", (template, SCHEMA, "one", ["id"], *arguments)
+        )[0]
+        return "\n".join(row[0] for row in _query(ledger_conn, f"EXPLAIN {composed}"))
+
+    assert "CTE" not in plan(epochs._KEY_SIZE_TEMPLATE)
+    assert "CTE source" in plan(epochs._COPY_TEMPLATE, 1)
+
+
 VALUES = (
     f"CREATE TABLE {SCHEMA}.vals (ts timestamptz PRIMARY KEY, iv interval, f float8, bt bytea, tr tstzrange, m money)",
     f"INSERT INTO {SCHEMA}.vals VALUES ('2026-11-22 17:06:45+01', '1 day 02:03:04', 0.1::float8 + 0.2::float8,"
@@ -868,7 +1061,7 @@ def test_snapshot_waits_for_the_lock_and_sees_what_the_holder_committed(ledger_c
     runner = threading.Thread(target=run, daemon=True)
     runner.start()
     try:
-        _wait_for_a_waiting_lock(second_conn)
+        wait_for_a_waiting_lock(second_conn)
         with second_conn.cursor() as cursor:  # the other runner's work, under the lock it holds
             cursor.execute(f"INSERT INTO {SCHEMA}.one VALUES (2, 'y')")
         second_conn.commit()
@@ -880,31 +1073,209 @@ def test_snapshot_waits_for_the_lock_and_sees_what_the_holder_committed(ledger_c
     assert [t.row_count for t in result["epoch"].tables] == [2]
 
 
+def test_snapshot_gives_up_waiting_for_caverns_lock_with_a_caverns_error(ledger_conn: Any, second_conn: Any) -> None:
+    _installed_with_tables(ledger_conn, ONE)
+    register(ledger_conn, SCHEMA, "one")
+    _query(second_conn, "SELECT pg_advisory_lock(%s::bigint)", (_connection.ADVISORY_LOCK_KEY,))
+    try:
+        with pytest.raises(CavernsError, match=r"advisory lock: gave up waiting after 0\.2 seconds"):
+            snapshot(ledger_conn, "late", lock_timeout=0.2)
+    finally:
+        second_conn.rollback()
+        _query(second_conn, "SELECT pg_advisory_unlock(%s::bigint)", (_connection.ADVISORY_LOCK_KEY,))
+    _assert_idle(ledger_conn)
+    assert _query(ledger_conn, ADVISORY_LOCKS) == [(0,)]
+    assert catalog(ledger_conn) == []  # nothing written, and no lock left behind
+    assert snapshot(ledger_conn, "late", lock_timeout=0.2).name == "late"
+
+
+def test_snapshot_gives_up_waiting_for_a_source_table_with_the_drivers_error(
+    ledger_conn: Any, second_conn: Any
+) -> None:
+    _installed_with_tables(ledger_conn, ONE)
+    register(ledger_conn, SCHEMA, "one")
+    with second_conn.cursor() as cursor:
+        cursor.execute(f"LOCK TABLE {SCHEMA}.one IN ACCESS EXCLUSIVE MODE")
+    try:
+        with pytest.raises(DRIVER_ERRORS) as refused:
+            snapshot(ledger_conn, "blocked", lock_timeout=0.2)
+    finally:
+        second_conn.rollback()
+    assert _connection.sqlstate(refused.value) == "55P03"
+    assert not isinstance(refused.value, CavernsError)
+    _assert_idle(ledger_conn)
+    assert _query(ledger_conn, ADVISORY_LOCKS) == [(0,)]
+    assert catalog(ledger_conn) == []
+    assert snapshot(ledger_conn, "blocked").name == "blocked"
+
+
+@pytest.mark.parametrize(("option", "seen"), [(None, "7s"), (0.2, "200ms"), ("default", "5s")])
+def test_snapshot_sets_the_lock_timeout_in_its_transaction_only(
+    ledger_conn: Any, monkeypatch: pytest.MonkeyPatch, option: Any, seen: str
+) -> None:
+    _installed_with_tables(ledger_conn, ONE)
+    register(ledger_conn, SCHEMA, "one")
+    _execute(ledger_conn, "SET lock_timeout = '7s'")
+    original = _connection.set_lock_timeout
+    observed: list[str] = []
+
+    def watch(cursor: Any, seconds: float | None) -> None:
+        original(cursor, seconds)
+        cursor.execute("SELECT current_setting('lock_timeout')")
+        observed.append(cursor.fetchone()[0])
+
+    monkeypatch.setattr(epochs, "set_lock_timeout", watch)
+    if option == "default":
+        snapshot(ledger_conn, "a")
+    else:
+        snapshot(ledger_conn, "a", lock_timeout=option)
+    assert observed == [seen]
+    assert _query(ledger_conn, "SHOW lock_timeout") == [("7s",)]
+
+
+def test_snapshot_refuses_a_lock_timeout_that_is_not_valid(ledger_conn: Any) -> None:
+    install(ledger_conn)
+    for value in (0, -1, True, float("nan"), float("inf"), "5", 1e10):
+        with pytest.raises(ChangesetError, match="lock_timeout"):
+            snapshot(ledger_conn, "a", lock_timeout=value)  # type: ignore[arg-type]
+    _assert_idle(ledger_conn)
+
+
 def test_session_lock_is_held_in_the_block_and_released_after_it(ledger_conn: Any) -> None:
-    with _connection.session_lock(ledger_conn):
+    with _connection.session_lock(ledger_conn, committed="the work is done"):
         assert _query(ledger_conn, ADVISORY_LOCKS) == [(1,)]
     assert _query(ledger_conn, ADVISORY_LOCKS) == [(0,)]
 
 
 def test_session_lock_is_released_when_the_block_raises(ledger_conn: Any) -> None:
-    with pytest.raises(ZeroDivisionError), _connection.session_lock(ledger_conn):
+    with pytest.raises(ZeroDivisionError), _connection.session_lock(ledger_conn, committed="the work is done"):
         raise ZeroDivisionError
     assert _query(ledger_conn, ADVISORY_LOCKS) == [(0,)]
 
 
 def test_session_lock_that_cannot_be_taken_raises_the_drivers_error(second_conn: Any) -> None:
     second_conn.close()  # the lock statement fails; the best-effort release fails too, and is not what is raised
-    with pytest.raises(DRIVER_ERRORS), _connection.session_lock(second_conn):
+    with pytest.raises(DRIVER_ERRORS), _connection.session_lock(second_conn, committed="the work is done"):
         pytest.fail("the block must not run")
 
 
-def test_session_lock_that_cannot_be_released_after_the_block_warns_and_returns(
-    ledger_conn: Any, second_conn: Any, caplog: pytest.LogCaptureFixture
+def test_session_lock_that_cannot_be_released_after_the_block_raises_a_caverns_error(
+    ledger_conn: Any, second_conn: Any
 ) -> None:
-    with caplog.at_level(logging.WARNING, logger=_connection.__name__), _connection.session_lock(second_conn):
+    with (
+        pytest.raises(
+            CavernsError, match=r"^epoch 'x' was committed, but releasing Caverns' advisory lock failed \(.+\): "
+        ) as failed,
+        _connection.session_lock(second_conn, committed="epoch 'x' was committed"),
+    ):
         second_conn.close()  # the block's work is done; releasing the lock now fails (the server frees it)
-    assert [r.getMessage().split(":")[0] for r in caplog.records] == ["could not release Caverns' advisory lock"]
+    assert isinstance(failed.value.__cause__, DRIVER_ERRORS)  # chained from the driver's error
+    assert str(failed.value).endswith(
+        "Caverns needs a direct connection or a session-mode pooler, not a transaction-mode one"
+    )
     assert _query(ledger_conn, ADVISORY_LOCKS) == [(0,)]
+
+
+def test_session_lock_that_was_not_held_at_release_raises_a_caverns_error(ledger_conn: Any) -> None:
+    """What a transaction-mode pooler does: the unlock reaches a session that never held the lock."""
+    with (
+        pytest.raises(CavernsError, match="the lock was not held") as failed,
+        _connection.session_lock(ledger_conn, committed="epoch 'x' was committed"),
+    ):
+        assert _query(ledger_conn, "SELECT pg_advisory_unlock(%s::bigint)", (_connection.ADVISORY_LOCK_KEY,)) == [
+            (True,)
+        ]
+    assert str(failed.value) == (
+        "epoch 'x' was committed, but releasing Caverns' advisory lock failed (the lock was not held): "
+        "Caverns needs a direct connection or a session-mode pooler, not a transaction-mode one"
+    )
+    assert _query(ledger_conn, ADVISORY_LOCKS) == [(0,)]
+
+
+def test_session_lock_whose_block_raised_stays_quiet_when_the_lock_was_not_held(ledger_conn: Any) -> None:
+    with pytest.raises(ZeroDivisionError), _connection.session_lock(ledger_conn, committed="the work is done"):
+        _query(ledger_conn, "SELECT pg_advisory_unlock(%s::bigint)", (_connection.ADVISORY_LOCK_KEY,))
+        raise ZeroDivisionError
+
+
+def test_a_successful_snapshot_returns_and_holds_no_lock(ledger_conn: Any) -> None:
+    _installed_with_tables(ledger_conn, f"CREATE TABLE {SCHEMA}.one (id int PRIMARY KEY)")
+    register(ledger_conn, SCHEMA, "one")
+    assert snapshot(ledger_conn, "nightly").name == "nightly"
+    assert _query(ledger_conn, ADVISORY_LOCKS) == [(0,)]
+
+
+# --- the writable check ---------------------------------------------------------------------
+
+READ_ONLY_MESSAGE = (
+    r"the session is read-only \(default_transaction_read_only is on\): Caverns needs a session that can write"
+)
+WRITE_COUNTS = (
+    "SELECT (SELECT count(*) FROM caverns.ledger), (SELECT count(*) FROM caverns.epoch_table),"
+    " (SELECT count(*) FROM caverns.epoch), (SELECT count(*) FROM caverns.epoch_deletion),"
+    " (SELECT count(*) FROM caverns.epoch_row), (SELECT count(*) FROM caverns.fingerprint)"
+)
+
+
+@pytest.fixture
+def read_only_session(ledger_conn: Any) -> Iterator[Callable[[], None]]:
+    """A function that turns `default_transaction_read_only` on for the session; it is reset after the test."""
+
+    def turn_on() -> None:
+        _execute(ledger_conn, "SET default_transaction_read_only = on")
+
+    try:
+        yield turn_on
+    finally:
+        ledger_conn.rollback()
+        _execute(ledger_conn, "RESET default_transaction_read_only")  # the fixture's teardown drops schemas
+
+
+def test_check_writable_passes_on_a_primary_with_a_session_that_can_write(ledger_conn: Any) -> None:
+    # The standby branch reads the same statement and refuses the same way; a test would need a replica.
+    _connection.check_writable(ledger_conn)
+    _assert_idle(ledger_conn)
+
+
+def test_install_refuses_a_read_only_session_and_writes_nothing(
+    ledger_conn: Any, read_only_session: Callable[[], None]
+) -> None:
+    read_only_session()
+    with pytest.raises(CavernsError, match=READ_ONLY_MESSAGE):
+        install(ledger_conn)
+    _assert_idle(ledger_conn)
+    assert _query(ledger_conn, "SELECT to_regnamespace('caverns') IS NULL") == [(True,)]
+
+
+def test_every_other_write_refuses_a_read_only_session_and_writes_nothing(
+    ledger_conn: Any, read_only_session: Callable[[], None]
+) -> None:
+    _installed_with_tables(ledger_conn, f"CREATE TABLE {SCHEMA}.one (id int PRIMARY KEY)")
+    register(ledger_conn, SCHEMA, "one")
+    snapshot(ledger_conn, "kept")
+    before = _query(ledger_conn, WRITE_COUNTS)
+    read_only_session()
+    writes: list[Callable[[], object]] = [
+        lambda: nozdormu.apply(ledger_conn, APP),
+        lambda: nozdormu.baseline(ledger_conn, APP),
+        lambda: register(ledger_conn, SCHEMA, "one"),
+        lambda: unregister(ledger_conn, SCHEMA, "one"),
+        lambda: snapshot(ledger_conn, "refused"),
+        lambda: delete(ledger_conn, ["kept"]),
+    ]
+    for write in writes:
+        with pytest.raises(CavernsError, match=READ_ONLY_MESSAGE):
+            write()
+        _assert_idle(ledger_conn)
+    assert _query(ledger_conn, WRITE_COUNTS) == before
+    assert _query(ledger_conn, ADVISORY_LOCKS) == [(0,)]
+    # What only reads still works.
+    assert [s.step.label for s in preflight(ledger_conn, APP)] == ["one"]
+    assert [e.label for e in nozdormu.history(ledger_conn, changeset="caverns")][-1] == "ledger"
+    assert [e.name for e in catalog(ledger_conn)] == ["kept"]
+    assert [t.table for t in tracked(ledger_conn)] == ["one"]
+    assert [e.name for e in delete(ledger_conn, ["kept"], dry_run=True)] == ["kept"]
+    assert _query(ledger_conn, WRITE_COUNTS) == before
 
 
 # --- catalog --------------------------------------------------------------------------------
@@ -1650,7 +2021,7 @@ def test_delete_waits_for_the_lock_and_deletes_after_the_holder_commits(ledger_c
     runner = threading.Thread(target=run, daemon=True)
     runner.start()
     try:
-        _wait_for_a_waiting_lock(second_conn)
+        wait_for_a_waiting_lock(second_conn)
         with second_conn.cursor() as cursor:  # nothing is deleted while the other runner holds the lock
             cursor.execute("SELECT count(*) FROM caverns.epoch_deletion")
             assert cursor.fetchone() == (0,)

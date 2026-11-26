@@ -17,17 +17,21 @@ from typing import Any
 
 from caverns_of_time import __version__, _connection
 from caverns_of_time._connection import (
+    DEFAULT_LOCK_TIMEOUT,
     EPOCHS_EXISTS_SQL,
     Connection,
     Cursor,
     check_connection,
+    check_writable,
     lock,
     pin_output_settings,
     pin_search_path,
     read_only,
     session_lock,
+    set_lock_timeout,
     transaction,
     validate_limit,
+    validate_lock_timeout,
     validate_name,
 )
 from caverns_of_time.errors import ChangesetError, EpochNotFound, EpochRefused, LedgerNotInstalled
@@ -53,6 +57,9 @@ __all__ = [
 ]
 
 _log = logging.getLogger(__name__)
+
+# The most bytes `snapshot` accepts to copy unless the caller passes another `max_bytes`.
+DEFAULT_MAX_BYTES = 1024**3
 
 # NOTE: hard rule 3 forbids composing a statement, so `caverns.epoch_table` and its column list are spelled
 # literally in each `*_SQL` constant here; every name a consumer supplies is a bound parameter.
@@ -102,29 +109,71 @@ _INSERT_EPOCH_SQL = (
     "INSERT INTO caverns.epoch (name, ledger_version, caverns_version) SELECT %s, max(version), %s FROM caverns.ledger"
     " RETURNING epoch, name, ledger_version, taken_at, taken_by, caverns_version"
 )
-# NOTE: hard rule 3 forbids composing a statement in Python, so PostgreSQL composes the copy: this template is
-# bound as a value to `format`, which quotes the identifiers (%I) and the literals (%L); its arguments are, in
-# order: 1 schema, 2 table, 3 epoch, 4 schema, 5 table, 6 key columns. The source rows are read once (MATERIALIZED)
-# for both the copy and the counts, each with its key (a jsonb object of the key columns' values) computed once;
-# `ON CONFLICT DO NOTHING` drops a repeated key, which the counts then reveal. A key with a JSON null value is
-# counted over the source, so a repeated null key is a null key, not a duplicate; `e.value = 'null'::jsonb` is
-# an exact test (an array holding a null is not a null). `t.*` is the whole row even when the table has a
-# column named `t` (a bare `t` would be that column).
-_COPY_TEMPLATE = """
-WITH source AS MATERIALIZED (
-    SELECT r.row, (SELECT jsonb_object_agg(k, r.row -> k) FROM unnest(%6$L::text[]) AS k) AS key
+# NOTE: hard rule 3 forbids composing a statement in Python, so PostgreSQL composes the copy and the key-size read:
+# each template is bound as a value to `format`, which quotes the identifiers (%I) and the literals (%L). Their shared
+# `source` reads the source rows, each with its key (a jsonb object of the key columns' values) computed once; its
+# arguments are, in order: 1 schema, 2 table, 3 key columns. `t.*` is the whole row even when the table has a column
+# named `t` (a bare `t` would be that column). The copy reads `source` three times, so it MATERIALIZEs it; the
+# key-size read reads it once, and NOT MATERIALIZED lets it stream instead of holding every row's jsonb.
+_SOURCE_QUERY = """(
+    SELECT r.row, (SELECT jsonb_object_agg(k, r.row -> k) FROM unnest(%3$L::text[]) AS k) AS key
     FROM %1$I.%2$I t CROSS JOIN LATERAL (SELECT to_jsonb(t.*) AS row) r
-),
+)"""
+# The copy adds argument 4, the epoch. `ON CONFLICT DO NOTHING` drops a repeated key, which the counts then reveal.
+# A key with a JSON null value is counted over the source, so a repeated null key is a null key, not a duplicate;
+# `e.value = 'null'::jsonb` is an exact test (an array holding a null is not a null).
+_COPY_TEMPLATE = (
+    "WITH source AS MATERIALIZED "
+    + _SOURCE_QUERY
+    + """,
 inserted AS (
     INSERT INTO caverns.epoch_row (epoch, schema_name, table_name, key, row)
-    SELECT %3$s, %4$L, %5$L, s.key, s.row FROM source s
+    SELECT %4$s, %1$L, %2$L, s.key, s.row FROM source s
     ON CONFLICT DO NOTHING
     RETURNING 1
 )
 SELECT (SELECT count(*) FROM source), (SELECT count(*) FROM inserted),
        (SELECT count(*) FROM source s WHERE EXISTS (SELECT 1 FROM jsonb_each(s.key) e WHERE e.value = 'null'::jsonb))
 """
-_COMPOSE_COPY_SQL = "SELECT format(%s::text, %s::text, %s::text, %s::bigint, %s::text, %s::text, %s::text[])"
+)
+_COMPOSE_COPY_SQL = "SELECT format(%s::text, %s::text, %s::text, %s::text[], %s::bigint)"
+# What an `epoch_row` primary-key entry holds besides the epoch and the key's jsonb: the two names, as stored.
+# NULL for a table without rows.
+_KEY_SIZE_TEMPLATE = (
+    "WITH source AS NOT MATERIALIZED "
+    + _SOURCE_QUERY
+    + """
+SELECT max(pg_column_size(s.key)) + pg_column_size(%1$L::text) + pg_column_size(%2$L::text) FROM source s
+"""
+)
+_COMPOSE_KEY_SIZE_SQL = "SELECT format(%s::text, %s::text, %s::text, %s::text[])"
+# Beside the key and the names an index entry holds the epoch (a bigint, 8), a tuple header (8) and alignment padding
+# (an allowance, 16).
+_ENTRY_OVERHEAD = 8 + 8 + 16
+_BLOCK_SIZE_SQL = "SELECT current_setting('block_size')::int"
+# A partitioned table has no storage of its own (`pg_table_size` is 0): its partitions are summed; a table that is
+# not partitioned has no partition tree. `format` quotes the names.
+_ESTIMATE_SQL = """
+SELECT coalesce(sum(pg_table_size(p.relid)), 0)::bigint
+FROM unnest(%s::text[], %s::text[]) AS t (schema_name, table_name)
+CROSS JOIN LATERAL (SELECT format('%%I.%%I', t.schema_name, t.table_name)::regclass AS oid) c
+CROSS JOIN LATERAL (
+    SELECT c.oid AS relid UNION ALL SELECT relid FROM pg_partition_tree(c.oid) WHERE relid <> c.oid
+) p
+"""
+# True when a snapshot of the table would copy only the rows the role can see: the table has row-level security and
+# the role neither is a superuser, has BYPASSRLS, nor owns it without FORCE (an owner is subject to it when forced).
+_ROW_SECURITY_SQL = """
+SELECT c.relrowsecurity AND NOT r.rolsuper AND NOT r.rolbypassrls
+       AND (c.relforcerowsecurity OR NOT pg_has_role(current_user, c.relowner, 'USAGE')), r.rolname::text
+FROM pg_class c
+JOIN pg_namespace n ON n.oid = c.relnamespace
+CROSS JOIN pg_roles r
+WHERE n.nspname = %s AND c.relname = %s AND c.relkind IN ('r', 'p') AND r.rolname = current_user
+"""
+# With row security off, PostgreSQL raises an error instead of filtering the rows a policy would hide: a backstop to
+# `_ROW_SECURITY_SQL`. Transaction-local, like the other pins.
+_PIN_ROW_SECURITY_SQL = "SELECT set_config('row_security', 'off', true)"
 _INSERT_SOURCE_SQL = (
     "INSERT INTO caverns.epoch_source (epoch, schema_name, table_name, key, columns, row_count)"
     " VALUES (%s, %s, %s, %s::text[], %s::jsonb, %s)"
@@ -370,9 +419,11 @@ def register(connection: Connection, schema: str, table: str, *, key: Sequence[s
     The names are exact PostgreSQL names, case-sensitive. The same key again writes nothing; another key
     replaces the stored one and logs a warning. Raises `ChangesetError` for a bad *schema*, *table* or *key*,
     `LedgerNotInstalled` before `install()` and `EpochRefused` for a table that does not exist or is not a table,
-    a key column it lacks, or no *key* on a table without a primary key.
+    a key column it lacks, or no *key* on a table without a primary key. A standby or a read-only session is
+    refused with `CavernsError`.
     """
     check_connection(connection)
+    check_writable(connection)
     _validate_table(schema, table)
     columns = _validate_key(key)
     with transaction(connection) as cursor:
@@ -398,9 +449,11 @@ def unregister(connection: Connection, schema: str, table: str) -> None:
     """Opt *table* of *schema* out of later epochs; the epochs already taken keep its rows.
 
     Raises `ChangesetError` for a bad *schema* or *table*, `LedgerNotInstalled` before `install()` and
-    `EpochRefused` for a table that is not registered.
+    `EpochRefused` for a table that is not registered. A standby or a read-only session is refused with
+    `CavernsError`.
     """
     check_connection(connection)
+    check_writable(connection)
     _validate_table(schema, table)
     with transaction(connection) as cursor:
         lock(cursor)
@@ -453,7 +506,7 @@ def _read_epochs(cursor: Cursor, rows: Sequence[Sequence[Any]]) -> list[Epoch]:
 def _copy_rows(cursor: Cursor, epoch: int, tracked_table: TrackedTable) -> int:
     """Copy the table's rows into `caverns.epoch_row` under *epoch*; the number of rows, or `EpochRefused`."""
     schema, table, key = tracked_table.schema, tracked_table.table, list(tracked_table.key)
-    cursor.execute(_COMPOSE_COPY_SQL, (_COPY_TEMPLATE, schema, table, epoch, schema, table, key))
+    cursor.execute(_COMPOSE_COPY_SQL, (_COPY_TEMPLATE, schema, table, key, epoch))
     composed = cursor.fetchone()
     assert composed is not None  # a SELECT without FROM returns its row
     cursor.execute(composed[0])
@@ -468,7 +521,74 @@ def _copy_rows(cursor: Cursor, epoch: int, tracked_table: TrackedTable) -> int:
     return int(read)
 
 
-def snapshot(connection: Connection, name: str) -> Epoch:
+def _validate_max_bytes(value: object) -> None:
+    """A size limit: None (no limit) or a positive integer, never a bool."""
+    if value is None:
+        return
+    if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+        raise ChangesetError(f"max_bytes must be None or a positive integer, not {value!r}")
+
+
+def _check_row_security(cursor: Cursor, schema: str, table: str) -> None:
+    """Refuse a table whose row-level security would hide rows from the current role: a copy would be partial."""
+    cursor.execute(_ROW_SECURITY_SQL, (schema, table))
+    found = cursor.fetchone()
+    if found is not None and found[0]:
+        role = found[1]
+        raise EpochRefused(
+            f"table {schema}.{table} has row-level security and role {role} does not bypass it: "
+            f"a snapshot would copy only the rows {role} can see"
+        )
+
+
+def _check_size(cursor: Cursor, name: str, registered: Sequence[TrackedTable], max_bytes: int | None) -> None:
+    """Log the bytes the registered tables occupy and refuse a snapshot above *max_bytes* (None: no limit)."""
+    cursor.execute(_ESTIMATE_SQL, ([t.schema for t in registered], [t.table for t in registered]))
+    found = cursor.fetchone()
+    assert found is not None  # an aggregate returns its row
+    estimate = int(found[0])
+    _log.info("snapshot %s: about %s bytes in %d tables", name, estimate, len(registered))
+    if max_bytes is not None and estimate > max_bytes:
+        raise EpochRefused(
+            f"snapshot {name!r} would copy about {estimate} bytes from {len(registered)} tables, "
+            f"above max_bytes {max_bytes}: pass a larger max_bytes, or None for no limit"
+        )
+
+
+def _btree_entry_limit(cursor: Cursor) -> int:
+    """The most bytes an index entry may take: a third of a page less its header, rounded down to 8, less 8."""
+    cursor.execute(_BLOCK_SIZE_SQL)
+    found = cursor.fetchone()
+    assert found is not None  # a SELECT without FROM returns its row
+    return int((found[0] - 56) // 3 // 8 * 8 - 8)
+
+
+def _check_key_size(cursor: Cursor, tracked_table: TrackedTable, limit: int) -> None:
+    """Refuse a table whose largest key would not fit in the index entry of `epoch_row`'s primary key."""
+    schema, table = tracked_table.schema, tracked_table.table
+    cursor.execute(_COMPOSE_KEY_SIZE_SQL, (_KEY_SIZE_TEMPLATE, schema, table, list(tracked_table.key)))
+    composed = cursor.fetchone()
+    assert composed is not None  # a SELECT without FROM returns its row
+    cursor.execute(composed[0])
+    found = cursor.fetchone()
+    assert found is not None  # an aggregate returns its row
+    if found[0] is None:  # no rows
+        return
+    size = int(found[0]) + _ENTRY_OVERHEAD
+    if size > limit:
+        raise EpochRefused(
+            f"table {schema}.{table} has a key of about {size} bytes, above the {limit}-byte limit of an index entry: "
+            "declare a shorter key"
+        )
+
+
+def snapshot(
+    connection: Connection,
+    name: str,
+    *,
+    lock_timeout: float | None = DEFAULT_LOCK_TIMEOUT,
+    max_bytes: int | None = DEFAULT_MAX_BYTES,
+) -> Epoch:
     """Copy every registered table into a new epoch called *name*, tagged with the latest ledger version.
 
     The tables are read in one REPEATABLE READ transaction that starts after Caverns' advisory lock is held, so
@@ -476,11 +596,31 @@ def snapshot(connection: Connection, name: str) -> Epoch:
     `extra_float_digits` 1, hex bytea, `ISO, MDY` dates, `C` money) whatever the session's; a refusal writes
     nothing. Raises `ChangesetError` for a bad *name*, `LedgerNotInstalled` before `install()` and `EpochRefused`
     for a name that is taken (a deleted epoch's too), no registered table, a registered table or key column that no
-    longer exists, and a key with duplicates or nulls.
+    longer exists, a table with row-level security the current role does not bypass (it owns the table without
+    `FORCE`, has `BYPASSRLS` or is a superuser), a key with duplicates or nulls and a key too large for an index
+    entry; each refusal comes before any row is copied.
+
+    *max_bytes* (None: no limit; else a positive integer) bounds the estimate of the registered tables' size
+    (`pg_table_size`, logged at INFO): a larger one raises `EpochRefused`. `ChangesetError` for a bad one.
+
+    *lock_timeout* is the seconds the call waits for Caverns' advisory lock (a timeout raises `CavernsError`) and,
+    in the copying transaction, for the lock on each source table (a timeout there raises the driver's error, after
+    the rollback); None keeps the session's own `lock_timeout`, a number must be positive.
+
+    A standby or a read-only session is refused with `CavernsError`. When the epoch is committed but releasing the
+    session-level advisory lock fails (or the lock was not held: a transaction-mode pooler), `CavernsError` says so;
+    the epoch stands.
     """
     check_connection(connection)
+    check_writable(connection)
     validate_name("epoch name", name)
-    with session_lock(connection), transaction(connection, repeatable_read=True) as cursor:
+    validate_lock_timeout(lock_timeout)
+    _validate_max_bytes(max_bytes)
+    with (
+        session_lock(connection, committed=f"epoch {name!r} was committed", lock_timeout=lock_timeout),
+        transaction(connection, repeatable_read=True) as cursor,
+    ):
+        set_lock_timeout(cursor, lock_timeout)
         _require_installed(cursor)
         pin_output_settings(cursor)  # first: a driver reads a timestamptz only in an ISO `DateStyle`
         cursor.execute(_EPOCH_NAME_SQL, (name,))
@@ -492,17 +632,27 @@ def snapshot(connection: Connection, name: str) -> Epoch:
         if not registered:
             raise EpochRefused("no table is registered: call register() first")
         pin_search_path(cursor)
+        cursor.execute(_PIN_ROW_SECURITY_SQL)
         cursor.execute(_INSERT_EPOCH_SQL, (name, __version__))
         created = cursor.fetchone()
         assert created is not None  # an INSERT ... RETURNING always returns its row
+        columns_of: dict[tuple[str, str], list[Column]] = {}
         for tracked_table in registered:
-            schema, table, key = tracked_table.schema, tracked_table.table, tracked_table.key
+            schema, table = tracked_table.schema, tracked_table.table
             live = _live_columns(cursor, schema, table)
             if not live:
                 raise EpochRefused(f"{schema}.{table} is registered but does not exist")
-            _check_key(schema, table, key, live)
+            _check_key(schema, table, tracked_table.key, live)
+            _check_row_security(cursor, schema, table)
+            columns_of[(schema, table)] = live
+        _check_size(cursor, name, registered, max_bytes)
+        entry_limit = _btree_entry_limit(cursor)
+        for tracked_table in registered:
+            _check_key_size(cursor, tracked_table, entry_limit)
+        for tracked_table in registered:
+            schema, table, key = tracked_table.schema, tracked_table.table, tracked_table.key
             row_count = _copy_rows(cursor, created[0], tracked_table)
-            columns = json.dumps([{"name": c.name, "type": c.type} for c in live])
+            columns = json.dumps([{"name": c.name, "type": c.type} for c in columns_of[(schema, table)]])
             cursor.execute(_INSERT_SOURCE_SQL, (created[0], schema, table, list(key), columns, row_count))
         (taken_epoch,) = _read_epochs(cursor, [(*created, None)])
     rows = sum(table.row_count for table in taken_epoch.tables)
@@ -687,9 +837,12 @@ def delete(connection: Connection, names: Collection[str], *, dry_run: bool = Fa
     validated and resolved the same way, in one read-only transaction without the lock, and the epochs that would
     be deleted are returned (`deleted_at` None); nothing is written. Raises `ChangesetError` for *names* that is not
     a non-empty collection of valid names (a bare string or None included), `LedgerNotInstalled` before
-    `install()`, `EpochNotFound` for an unknown epoch and `EpochRefused` for an epoch that is already deleted.
+    `install()`, `EpochNotFound` for an unknown epoch and `EpochRefused` for an epoch that is already deleted. Without
+    *dry_run* a standby or a read-only session is refused with `CavernsError`.
     """
     check_connection(connection)
+    if not dry_run:
+        check_writable(connection)
     wanted = _connection.names("names", names)
     if not wanted:
         raise ChangesetError("names is empty")

@@ -11,8 +11,9 @@ from pathlib import Path
 import pytest
 
 from caverns_of_time import _connection, _fingerprint, epochs, nozdormu
+from caverns_of_time._fingerprint import Fingerprint
 from caverns_of_time.errors import ChangesetError
-from caverns_of_time.nozdormu import Changeset, LedgerEntry, Status, Step
+from caverns_of_time.nozdormu import Changeset, LedgerEntry, Status, Step, StepStatus
 
 SQL = "CREATE TABLE t (id int);"
 
@@ -224,6 +225,15 @@ def test_the_ledger_column_lists_are_the_ledger_entry_fields() -> None:
     assert returning.group(1).split(", ") == columns
 
 
+def test_the_fingerprint_column_lists_are_the_version_and_the_fingerprint_fields() -> None:
+    columns = ["version", *(field.name for field in fields(Fingerprint))]
+    select = re.fullmatch(r"SELECT (.+?) FROM caverns\.fingerprint .*", _fingerprint._LATEST_FINGERPRINT_SQL)
+    insert = re.fullmatch(r"INSERT INTO caverns\.fingerprint \((.+?)\) VALUES .*", _fingerprint._RECORD_FINGERPRINT_SQL)
+    assert select and insert
+    assert select.group(1).split(", ") == columns
+    assert insert.group(1).split(", ") == columns
+
+
 @pytest.mark.parametrize(
     "table", ["ledger", "fingerprint", "epoch_table", "epoch_source", "epoch_row", "epoch_deletion"]
 )
@@ -241,15 +251,25 @@ def test_every_sql_constant_names_the_own_tables_in_the_own_schema(table: str) -
             assert qualifier == nozdormu._OWN_CHANGESET_NAME, name
 
 
-def test_the_own_changeset_is_the_ledger_fingerprint_and_epochs_steps() -> None:
-    assert [step.label for step in nozdormu._OWN_CHANGESET.steps] == ["ledger", "fingerprint", "epochs"]
+def test_the_own_changeset_is_the_ledger_fingerprint_epochs_privileges_and_fingerprint_server_steps() -> None:
+    labels = [step.label for step in nozdormu._OWN_CHANGESET.steps]
+    assert labels == ["ledger", "fingerprint", "epochs", "privileges", "fingerprint_server"]
     assert all(step.check for step in nozdormu._OWN_CHANGESET.steps)
 
 
-def test_the_released_ledger_step_is_byte_identical() -> None:
-    """Its checksum is in every consumer's ledger: an edit of the statement would read as a conflict."""
-    released = "6ccdacf3430bfa341afd4f7f0d7fdba8a76c5ce344b58109387a38ca7ab1251b"
-    assert nozdormu._OWN_CHANGESET.steps[0].checksum == released
+# Each own step's checksum, pinned: it is in every consumer's ledger, so an edit of a statement would read
+# as a conflict and `install` would refuse after a release. A new own step adds its line here.
+_OWN_STEP_CHECKSUMS = {
+    "ledger": "6ccdacf3430bfa341afd4f7f0d7fdba8a76c5ce344b58109387a38ca7ab1251b",
+    "fingerprint": "69a4b5b9fe688d80e5089127f8f2c022dcdeb5d1aee13279a7ab0bd62bc8ba31",
+    "epochs": "d35779e89163f27f628f153510a5030bac36a37e58ad9bdf59dcb4cb5ecb8b2f",
+    "privileges": "e5c174e922f0240159a9531d986e7c6257df73bfa3d53ba61e94dcd149eaab76",
+    "fingerprint_server": "83988cb43b79b838e7d58659a1cee8003bcf20e3670b5025bd6f2bc0d8bde5fb",
+}
+
+
+def test_every_own_step_is_byte_identical_to_its_pinned_checksum() -> None:
+    assert {step.label: step.checksum for step in nozdormu._OWN_CHANGESET.steps} == _OWN_STEP_CHECKSUMS
 
 
 def test_the_default_schemas_query_leaves_out_the_own_schema_by_its_name() -> None:
@@ -312,17 +332,60 @@ def test_a_failed_row_does_not_count() -> None:
     assert _decide([_entry(1, A, "failed")], {"a"})[0] == ("a", Status.UNKNOWN, None)
 
 
-def test_the_baseline_covers_its_step_and_every_step_before_it() -> None:
-    assert _decide([_entry(1, B, "baseline")]) == [
+def test_baseline_rows_decide_their_steps_as_applied() -> None:
+    assert _decide([_entry(1, A, "baseline"), _entry(2, B, "baseline")]) == [
         ("a", Status.APPLIED, 1),
+        ("b", Status.APPLIED, 2),
+        ("c", Status.PENDING, None),
+    ]
+
+
+def test_a_step_before_the_baseline_without_a_row_is_before_the_baseline() -> None:
+    assert _decide([_entry(1, B, "baseline")]) == [
+        ("a", Status.BEFORE_BASELINE, 1),
         ("b", Status.APPLIED, 1),
         ("c", Status.PENDING, None),
     ]
 
 
+def test_a_step_before_the_baseline_skips_its_check() -> None:
+    assert _decide([_entry(1, B, "baseline")], {"a"})[0] == ("a", Status.BEFORE_BASELINE, 1)
+
+
 def test_a_row_of_a_step_before_the_baseline_wins_over_the_baseline() -> None:
     entries = [_entry(1, B, "baseline"), _entry(2, A, checksum="0" * 64)]
     assert _decide(entries)[0] == ("a", Status.CONFLICT, 2)
+    assert _decide([_entry(1, B, "baseline"), _entry(2, A)])[0] == ("a", Status.APPLIED, 2)
+
+
+def test_a_failed_row_before_the_baseline_does_not_lift_the_status() -> None:
+    assert _decide([_entry(1, B, "baseline"), _entry(2, A, "failed")])[0] == ("a", Status.BEFORE_BASELINE, 1)
+
+
+@pytest.mark.parametrize(
+    ("status", "reapply", "accept", "allowed"),
+    [
+        (Status.CONFLICT, True, False, True),
+        (Status.BEFORE_BASELINE, True, False, True),
+        (Status.UNKNOWN, True, False, False),
+        (Status.PENDING, True, False, False),
+        (Status.APPLIED, True, False, False),
+        (Status.CONFLICT, False, True, True),
+        (Status.UNKNOWN, False, True, True),
+        (Status.BEFORE_BASELINE, False, True, True),
+        (Status.PENDING, False, True, False),
+        (Status.APPLIED, False, True, False),
+        (Status.CONFLICT, False, False, False),
+        (Status.UNKNOWN, False, False, False),
+        (Status.BEFORE_BASELINE, False, False, False),
+        (Status.PENDING, False, False, True),
+        (Status.APPLIED, False, False, True),
+    ],
+)
+def test_which_statuses_a_run_may_go_on_past(status: Status, reapply: bool, accept: bool, allowed: bool) -> None:
+    given = StepStatus(A, status, None)
+    reapplied, accepted = frozenset({"a"} if reapply else ()), frozenset({"a"} if accept else ())
+    assert nozdormu._acknowledged(given, reapplied, accepted) is allowed
 
 
 def test_a_baseline_at_a_step_the_changeset_lacks_is_an_error() -> None:
@@ -335,3 +398,60 @@ def test_a_baseline_at_a_step_the_changeset_lacks_is_an_error() -> None:
 def test_a_collection_of_names_is_not_none_or_a_string(values: object) -> None:
     with pytest.raises(ChangesetError, match="must be a collection of names"):
         _connection.names("accept", values)  # type: ignore[arg-type]
+
+
+def test_an_error_without_a_code_records_the_first_line_of_its_text() -> None:
+    assert nozdormu._recorded_error(ValueError("first\nsecond")) == "first"
+    assert nozdormu._recorded_error(ValueError("")) == "ValueError"
+
+
+@pytest.mark.parametrize("value", [None, 0.001, 0.2, 1, 5, 5.0, 2147483, 2147483.647])
+def test_a_lock_timeout_that_is_none_or_a_positive_number_is_accepted(value: object) -> None:
+    _connection.validate_lock_timeout(value)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        0,
+        0.0,
+        -1,
+        True,
+        False,
+        float("nan"),
+        float("inf"),
+        float("-inf"),
+        "5",
+        1e10,
+        [5],
+        10**400,
+        -(10**400),
+        1e-9,
+        0.0009,
+    ],
+)
+def test_a_lock_timeout_that_is_not_a_positive_number_is_refused(value: object) -> None:
+    with pytest.raises(ChangesetError, match="lock_timeout"):
+        _connection.validate_lock_timeout(value)
+
+
+def test_the_default_lock_timeout_is_five_seconds() -> None:
+    assert _connection.DEFAULT_LOCK_TIMEOUT == 5.0
+
+
+class _CodedError(Exception):
+    def __init__(self, **attributes: object) -> None:
+        super().__init__("coded")
+        for name, value in attributes.items():
+            setattr(self, name, value)
+
+
+def test_the_sqlstate_is_read_from_either_drivers_attribute() -> None:
+    assert _connection.sqlstate(_CodedError(sqlstate="55P03")) == "55P03"
+    assert _connection.sqlstate(_CodedError(pgcode="22012")) == "22012"
+    assert _connection.sqlstate(_CodedError(sqlstate=None, pgcode="22012")) == "22012"
+
+
+@pytest.mark.parametrize("error", [ValueError("x"), _CodedError(sqlstate=""), _CodedError(sqlstate=5)])
+def test_an_error_without_a_text_sqlstate_has_none(error: BaseException) -> None:
+    assert _connection.sqlstate(error) is None

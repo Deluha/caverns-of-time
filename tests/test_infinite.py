@@ -93,7 +93,12 @@ def test_the_hash_ignores_key_order_and_sees_content() -> None:
 def test_infinite_re_exports_the_fingerprint_type() -> None:
     assert infinite.Fingerprint is _fingerprint.Fingerprint
     assert sorted(infinite.__all__) == ["Difference", "Drift", "Fingerprint", "drift", "fingerprint"]
-    assert [field.name for field in dataclasses.fields(Fingerprint)] == ["schemas", "document", "hash"]
+    assert [field.name for field in dataclasses.fields(Fingerprint)] == [
+        "schemas",
+        "document",
+        "hash",
+        "server_version",
+    ]
 
 
 # --- the document's shape ------------------------------------------------------------------
@@ -281,6 +286,51 @@ def test_the_extension_goes_with_its_schema(conn: Any) -> None:
     _run(conn, f"CREATE SCHEMA {EXT_SCHEMA}", f"CREATE EXTENSION citext SCHEMA {EXT_SCHEMA}")
     _run(conn, *TEST_DROPS)
     assert _query(conn, "SELECT count(*) FROM pg_extension WHERE extname = 'citext'") == [(0,)]
+
+
+# Session settings that change how the catalogs print a definition (a constant, an identifier, a string literal).
+PRINTING_SETTINGS = {
+    "DateStyle": "'SQL, DMY'",
+    "TimeZone": "'Asia/Tokyo'",
+    "IntervalStyle": "'iso_8601'",
+    "extra_float_digits": "0",
+    "bytea_output": "'escape'",
+    "quote_all_identifiers": "on",
+    "standard_conforming_strings": "off",
+}
+DEFINITIONS = (
+    f"SELECT pg_get_viewdef('{SCHEMA}.v'::regclass), (SELECT string_agg(pg_get_expr(adbin, adrelid), ';'"
+    f" ORDER BY adnum) FROM pg_attrdef WHERE adrelid = '{SCHEMA}.t'::regclass)"
+)
+
+
+def test_the_hash_does_not_depend_on_the_sessions_printing_settings(conn: Any) -> None:
+    _created(
+        conn,
+        f"CREATE TABLE {SCHEMA}.t (plain integer, d date DEFAULT '2024-03-04',"
+        " ts timestamptz DEFAULT '2024-03-04 05:06:07+00', i interval DEFAULT '1 day 2 hours',"
+        " f float8 DEFAULT '0.30000000000000004', b bytea DEFAULT '\\xdeadbeef', s text DEFAULT 'a\\b')",
+        f"CREATE VIEW {SCHEMA}.v AS SELECT DATE '2024-03-04' AS d, TIMESTAMPTZ '2024-03-04 05:06:07+00' AS ts,"
+        " INTERVAL '1 day 2 hours' AS i, '0.30000000000000004'::float8 AS f, '\\xdeadbeef'::bytea AS b,"
+        " 'a\\b'::text AS s",
+    )
+    first = _fp(conn)
+    plain = _query(conn, DEFINITIONS)
+    shown = {name: _query(conn, f"SHOW {name}") for name in PRINTING_SETTINGS}
+    _run(conn, *(f"SET {name} = {value}" for name, value in PRINTING_SETTINGS.items()))
+    try:
+        changed = _query(conn, "SELECT " + ", ".join(f"current_setting('{name}')" for name in PRINTING_SETTINGS))
+        assert changed[0] != tuple(row[0][0] for row in shown.values())  # the settings took effect
+        assert _query(conn, DEFINITIONS) != plain  # and they do change how the catalogs print these objects
+        second = _fp(conn)
+        assert (
+            _query(conn, "SELECT " + ", ".join(f"current_setting('{name}')" for name in PRINTING_SETTINGS)) == changed
+        )
+    finally:
+        _run(conn, *(f"RESET {name}" for name in PRINTING_SETTINGS))
+    assert (second.document, second.hash) == (first.document, first.hash)
+    assert first.document[SCHEMA]["column"]["t.plain"]["type"] == "integer"  # printed unquoted
+    assert {name: _query(conn, f"SHOW {name}") for name in PRINTING_SETTINGS} == shown
 
 
 def test_the_document_does_not_depend_on_the_search_path(conn: Any) -> None:

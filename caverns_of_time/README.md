@@ -14,7 +14,7 @@ difference of two epochs and their deletion).
 |---|---|
 | `__init__.py` | `__version__`, read from the installed distribution's metadata |
 | `errors.py` | The exception types, all in one module |
-| `_connection.py` | Shared private plumbing, not a component: the `Connection` and `Cursor` protocols, the connection guard, the transaction helpers, the advisory lock every Caverns write takes (`ADVISORY_LOCK_KEY`, `lock`; `session_lock` for a REPEATABLE READ `transaction`), the name and limit validation (`validate_name`, `validate_limit`), the pinned search path (`pin_search_path`), the one-statement check runner and the collection-of-names guard |
+| `_connection.py` | Shared private plumbing, not a component: the `Connection` and `Cursor` protocols, the connection guard and the writable check (`check_connection`, `check_writable`), the transaction helpers, the advisory lock every Caverns write takes (`ADVISORY_LOCK_KEY`, `lock`; `session_lock` for a REPEATABLE READ `transaction`, whose failed release is a `CavernsError`) and its lock timeout (`DEFAULT_LOCK_TIMEOUT`, `set_lock_timeout`), the SQLSTATE reader `sqlstate`, the name, limit and lock timeout validation (`validate_name`, `validate_limit`, `validate_lock_timeout`), the pinned search path and settings (`pin_search_path`, `pin_output_settings`, `pin_definition_settings`), the one-statement check runner and the collection-of-names guard |
 | `_fingerprint.py` | Shared private fingerprint machinery, not a component: `Fingerprint`, the catalog queries, the document and its hash, the default, watched and missing schemas, `Difference`, `restrict` and `compare`, and the storage of fingerprints in `caverns.fingerprint` (`record`, `latest`) |
 | `console.py` | The console helpers: status lines with their icons, tables and JSON, the confirmation prompt (`confirm`, `interactive`); the only module that prints or reads |
 | `chromie.py` | Chromie: the `chromie` command's parsing, connection configuration and dispatch (command flow only) |
@@ -35,15 +35,42 @@ sub-directories, is a step in file-name order, labelled with the file name minus
 readable from one file (`Step.from_file`).
 
 **Nozdormu, the ledger.** Every recorded change is a row of `caverns.ledger`. Caverns creates it itself:
-`install(connection)` applies Caverns' own changeset (named `caverns`, three steps: `ledger`, then `fingerprint`,
-the table of recorded fingerprints, then `epochs`, the epoch tables) and records each step as a ledger row, in the same transaction as its DDL.
+`install(connection)` applies Caverns' own changeset (named `caverns`, five steps: `ledger`, then `fingerprint`,
+the table of recorded fingerprints, then `epochs`, the epoch tables, then `privileges`, below, then `fingerprint_server`,
+the fingerprint table's `server_version` column) and records each step as a ledger row, in the same transaction as its DDL.
 Installing again writes nothing and returns `[]`. Until the ledger exists, reading it behaves as an empty
-ledger; that is how the own changeset bootstraps. A database installed before the `fingerprint` or the `epochs`
-step existed lacks its row: call `install()` again after upgrading, which applies each missing step as a pending
-step; until then `preflight`, `apply` and `baseline` raise `LedgerNotInstalled` (`history` needs only
+ledger; that is how the own changeset bootstraps. A database installed before the `fingerprint`, the `epochs`, the
+`privileges` or the `fingerprint_server` step existed lacks its row: call `install()` again after upgrading, which applies each missing step
+as a pending step; until then `preflight`, `apply` and `baseline` raise `LedgerNotInstalled` (`history` needs only
 the ledger table and keeps working), and so do the epoch functions until `epochs` is applied. `drift` raises it before
 the `fingerprint` step; before the `epochs` step it does so only given a changeset (its `preflight` runs first):
-without one it checks only `caverns.fingerprint`. `install` records no fingerprint.
+without one it checks only `caverns.fingerprint` and its `server_version` column (`LedgerNotInstalled`: "the fingerprint table is out of date", until `install()` adds it). `install` records no fingerprint.
+
+**Nozdormu, privileges.** The own step `privileges` revokes every privilege of `PUBLIC` on the schema `caverns`,
+on its tables, its sequences and its functions (`REVOKE ALL ... FROM PUBLIC`); its check is that `PUBLIC` holds none
+of them. A function is executable by `PUBLIC` unless revoked, so a later own step that adds a function revokes it
+itself (a test asserts that `PUBLIC` can execute no function of `caverns` after `install`); Caverns sets no default
+privileges. Only the schema's owner and the roles it grants to can use the ledger afterwards. Before applying
+anything `install` also refuses, with a `CavernsError` and nothing written, a `caverns` schema, or a relation in it,
+owned by a role whose privileges the current role does not inherit (`schema caverns is owned by role
+alice, whose privileges role bob does not inherit: run install as alice or a member that inherits its privileges`; a member granted `WITH INHERIT
+FALSE` is refused too, as it cannot `REVOKE` or `ALTER`); a schema owned by a role the current role is a member of
+that inherits its privileges is accepted. The grants a role needs to run `apply`, `baseline`, `register`, `unregister`, `snapshot` and
+`delete` (it need not own anything, and an identity sequence needs no grant of its own):
+
+```sql
+GRANT USAGE ON SCHEMA caverns TO runner;
+GRANT SELECT, INSERT ON caverns.ledger, caverns.fingerprint, caverns.epoch, caverns.epoch_source,
+    caverns.epoch_row, caverns.epoch_deletion TO runner;
+GRANT SELECT, INSERT, UPDATE, DELETE ON caverns.epoch_table TO runner;  -- the mutable registry
+GRANT DELETE ON caverns.epoch_row TO runner;                           -- `delete` removes a deleted epoch's rows
+```
+
+Reading (`preflight`, `history`, `drift`, `catalog`, `as_of`, `diff`) needs `USAGE` and `SELECT` only. `install`
+runs as the schema's owner or a member of the owner's role that inherits its privileges. The append-only triggers guard against mistakes, not
+against the schema's owner or a superuser, who can drop or disable them. **Upgrade:** run `install()` once after
+upgrading, as the owner; it applies `privileges`, after which a role that used the schema only through `PUBLIC` needs
+the grants above.
 
 **Nozdormu, preflight.** `preflight(connection, changeset)` reports one `StepStatus` (step, status and the
 ledger row that decided it, if any) per step in changeset order and writes nothing: it runs in one
@@ -51,20 +78,22 @@ read-only transaction that is always rolled back. It decides the ledger first, t
 
 | Status | When |
 |---|---|
-| `applied` | the latest non-failed row matches, or the step is before the baseline's step, or is the baseline's step with an unchanged checksum |
+| `applied` | the latest non-failed row (a `baseline` row included) has the step's checksum |
 | `conflict` | the latest row of the step that is not `failed` has another checksum (the SQL was edited) |
 | `pending` | no such row, and the step has no check or its check is false |
 | `unknown` | no such row, but the check is true: the effect is present and nothing recorded it |
+| `before_baseline` | no such row, and the step sits at or before the baseline's step: it was added after the baseline was taken, so nothing says whether the database has its effect; its check is not run |
 
 A `failed` row never decides a status. A step's check runs only when the ledger is silent about the step.
 A check is exactly one statement: psycopg 3 refuses a second result set (`ChangesetError`), psycopg2
 cannot report one, so there the rule is documented rather than detected.
 
-A step inserted before the baseline's step counts as applied and never runs: add new steps after it. A
+A step inserted before the baseline's step is `before_baseline`, not applied: `apply` refuses the run until the
+step is acknowledged (below); add new steps after the baseline's step to avoid it. A
 `baseline` row whose step the changeset no longer has makes preflight and apply refuse (`ChangesetError`);
 because the ledger is append-only, the way out is a new changeset name. Keep the baseline's step in the changeset.
 
-**Nozdormu, apply.** `apply(connection, changeset, *, reapply=(), accept=())` runs preflight, then walks the
+**Nozdormu, apply.** `apply(connection, changeset, *, reapply=(), accept=(), lock_timeout=5.0)` runs preflight, then walks the
 steps in changeset order: `applied` is skipped, `pending` runs. Each write transaction starts at READ
 COMMITTED whatever the session's isolation level, so that what is read under the lock is current. Each step
 is its own transaction: take the ledger's advisory lock, read the ledger again (a step another runner
@@ -77,6 +106,23 @@ step's own error. That happens when the failed step was Caverns' own `ledger` st
 that cannot create the schema), so there is no ledger to record into, or when the `failed` row cannot be
 written (a read-only session). A connection lost during a step raises the driver's error and records
 nothing. The rows written are returned and logged.
+
+*Lock timeout.* `lock_timeout` is the seconds one step's transaction waits for a lock its SQL needs, and the
+run bounds its wait for Caverns' lock until it has written a row: the transaction sets `lock_timeout` to it (transaction-local, so the
+session's own setting is untouched afterwards) before it takes Caverns' advisory lock, and the step's SQL runs under
+it. It is `5.0` by default; a number from 0.001 s to 2147483.647 s (rounded to milliseconds; a smaller or larger
+one, NaN, infinity or an int too large for a float is refused), else `ChangesetError`; `None` leaves the session's own `lock_timeout` in force. A timeout on such a wait for
+Caverns' lock (another Caverns run holds it) raises `CavernsError` naming the lock, with the transaction rolled back
+and nothing written. Once the run has written a row, its later waits for Caverns' lock have no timeout
+(`lock_timeout` is set after the lock is held), so a run is never stopped between its rows and its fingerprint; the
+failure record's wait is never bounded, even before any row, so a `failed` row is never lost to a busy lock. The waits
+of every step's own SQL stay bounded. With `None`, every wait is left to the session's own `lock_timeout`. A timeout inside a step fails the step like any other error: rolled back, a `failed` row whose error
+is `55P03: <message>` and `StepFailed`, the step `pending` again. `install` follows the same rule, with the fixed
+default; `baseline`, `register`, `unregister` and `delete` always use the default too, and take no parameter.
+
+*Search path.* A step's SQL and its check run under the connection's own `search_path`, which Caverns does not pin:
+schema-qualify every object a step creates or touches, or the step builds in whatever schema the session's path
+names first.
 
 A run that writes ledger rows stores one fingerprint in `caverns.fingerprint` (below), in the transaction of
 its last ledger row: the last planned step's transaction when that step writes a row, or, when a step fails,
@@ -95,13 +141,13 @@ refuses, and says nothing when no fingerprint is recorded. The warning only reac
 `install` takes the same path for Caverns' own changeset; when the ledger table exists without its row (a
 schema-only restore) it records its own step as `accepted` without running it, and logs a warning.
 
-A `conflict` or `unknown` step refuses the whole run before anything is executed or written
+A `conflict`, `unknown` or `before_baseline` step refuses the whole run before anything is executed or written
 (`PreflightRefused`, listing the steps) unless the caller acknowledges it:
 
 | Argument | Allowed for | Effect |
 |---|---|---|
-| `reapply` | `conflict` | run the edited SQL, record a new `applied` row; the old row stays |
-| `accept` | `conflict`, `unknown` | record an `accepted` row with the current checksum, run nothing |
+| `reapply` | `conflict`, `before_baseline` | run the step's SQL, record a new `applied` row; an old row stays |
+| `accept` | `conflict`, `unknown`, `before_baseline` | record an `accepted` row with the current checksum, run nothing |
 
 Naming a step in any other status is a `PreflightRefused`; naming a label the changeset lacks, or one
 label in both, is a `ChangesetError`. Preferred practice: add a new step rather than edit one that has
@@ -109,20 +155,24 @@ been applied. Statements that cannot run inside a transaction (`CREATE INDEX CON
 unsupported in v0.1: such a step fails and is recorded as a failed step.
 
 **Nozdormu, baseline.** `baseline(connection, changeset, *, through=None, schemas=None)` adopts a database
-that already holds a changeset's effects. It writes one `baseline` row (label: the `through` step, by
-default the last; that step's checksum; a fingerprint) and executes nothing; from then on every step up to
-and including `through` is `applied`, the later ones follow the normal rules. It runs in one transaction
-under the advisory lock and is refused (`BaselineRefused`) when the changeset already has any ledger row.
+that already holds a changeset's effects. It writes one `baseline` row per step from the first through the `through` step (default the last), in
+changeset order, each with its own step's checksum and the same fingerprint hash, and executes nothing; from
+then on every step up to and including `through` is `applied`, the later ones follow the normal rules, and a
+step added before `through` later is `before_baseline`. It runs in one transaction under the advisory lock and is refused (`BaselineRefused`) when the changeset already has any ledger row.
 The fingerprint is the hash of Infinite's fingerprint (below) of the given schemas; without `schemas` it
 covers every schema except `pg_*`, `information_schema` and `caverns`, never an earlier baseline's set. A
 named schema that does not exist is refused. The baseline also stores the fingerprint in
-`caverns.fingerprint`, in the same transaction, at the baseline row's version, which makes its schemas the
-watched schemas.
+`caverns.fingerprint`, in the same transaction, once, at the version of the last baseline row (the `through`
+step's), which makes its schemas the watched schemas.
 
 **Infinite, the fingerprint.** `infinite.fingerprint(connection, *, schemas=None)` reads the shape of a
 database's schemas from the system catalogs, in one read-only transaction that writes nothing and is always
 rolled back, with `search_path` pinned to `pg_catalog` so that type, default and definition texts print the same
-whatever the session's path. The document is keyed by schema, then by kind, then by object name; every schema
+whatever the session's path, and with the settings that shape how a catalog prints a definition pinned for the
+transaction (the caller's session is untouched): `TimeZone` `UTC`, `IntervalStyle` `postgres`, `extra_float_digits` 1,
+`bytea_output` `hex`, `DateStyle` `ISO, MDY`, `lc_monetary` `C`, `quote_all_identifiers` `off` and
+`standard_conforming_strings` `on`. A hash does not depend on the session that took it, and a hash recorded under default
+settings is unchanged. The document is keyed by schema, then by kind, then by object name; every schema
 named appears with all six kinds, empty when it holds none, so an empty or dropped schema is visible:
 
 | Kind | Key | Value |
@@ -173,6 +223,7 @@ apply run that writes ledger rows and per baseline:
 | `document` | the fingerprint's document (`jsonb`) |
 | `hash` | its SHA-256 (64 lower-case hex digits) |
 | `recorded_at` | `clock_timestamp()` at insert |
+| `server_version` | the server's `server_version_num` when the fingerprint was read (`integer`, positive; added by the own step `fingerprint_server`; null for a row recorded before it). It sits beside the hash, not in it |
 
 It is append-only like the ledger: triggers reject UPDATE, DELETE and TRUNCATE. Truncating the ledger is also
 refused, by the foreign key, unless it cascades, and then by the ledger's trigger.
@@ -191,7 +242,7 @@ returns the stored row; another key replaces the stored one (the row's time and 
 warning through the `caverns_of_time.epochs` logger. `unregister` deletes the registry row only: the epochs
 already taken keep the table's rows. The registry is mutable configuration, so it has no trigger.
 
-**Epochs, snapshot.** `snapshot(connection, name)` copies every registered table into one new epoch: a row of
+**Epochs, snapshot.** `snapshot(connection, name, *, lock_timeout=5.0, max_bytes=1073741824)` copies every registered table into one new epoch: a row of
 `caverns.epoch` (the name, the latest ledger version, the time, the user, the Caverns version), a row of
 `epoch_source` per table (its key, its `columns` as a JSON list of name and type in column order, its row count) and
 a row of `epoch_row` per source row (the key as a JSON object of the key columns' values, the row as `to_jsonb`
@@ -201,7 +252,22 @@ waits) and all tables are read in one consistent view; the lock is released when
 follows the label rules and is unique for good: a deleted epoch keeps its name. A refusal rolls everything back,
 so nothing is written: no registered table, a name taken, a registered table or key column that no longer exists,
 a key with duplicates or with nulls (nulls are checked first, so two rows with a null key report nulls, not duplicates;
-only a key column's own null counts: an array key holding a null element is a valid key). The copy of a table is one statement PostgreSQL composes (hard rule 3):
+only a key column's own null counts: an array key holding a null element is a valid key). Three more refusals come
+before any row is copied, after every registered table and key column is found (the epoch's catalog row is
+inserted first and rolled back with the rest). **Row-level security:** a table with row-level security is refused
+(`EpochRefused`, naming the table and the role) unless the current role is a superuser, has `BYPASSRLS`, or owns the
+table and the table has no `FORCE ROW LEVEL SECURITY`, because a copy would hold only the rows the role can see;
+`row_security` is also set `off` in the snapshot's transaction, so PostgreSQL raises an error instead of filtering
+if a policy applies anyway. **Size:** the `pg_table_size` of the registered tables (a partitioned table counts its
+partitions) is logged at INFO (`snapshot NAME: about N bytes in M tables`); above `max_bytes` (default 1 GiB, a
+positive integer, `None` for no limit; anything else is a `ChangesetError`) the snapshot is refused (`EpochRefused`).
+The estimate is the tables' size on disk, not the size of the copy, which `jsonb` can make larger or smaller.
+**Key size:** the largest `epoch_row` primary-key entry a table would need (its key as stored, the schema and table
+names, the epoch, an index entry header and an alignment allowance) must fit the btree entry limit derived from the
+server's `block_size` (2,704 bytes on 8 kB pages); a longer key is refused with the table named, where the copy would
+otherwise fail with the driver's own error. The size is measured uncompressed, so the check is conservative: a long
+but compressible key that an index could have stored compressed is refused too. Declare a shorter key. Checking it
+reads each table once more, streaming (it does not hold the rows). The copy of a table is one statement PostgreSQL composes (hard rule 3):
 `format` quotes the schema and table names and the key as literals from a template bound as a value, never built in
 Python. A value's type is not in the row: JSON holds numbers, strings, booleans, nulls, arrays and objects, so
 read a value's type from the epoch's `columns` (`Column.type`, printed by `format_type` with the search path
@@ -209,8 +275,18 @@ pinned to `pg_catalog`, so a user type is schema-qualified). The values are prin
 pins for its transaction, so an epoch does not depend on the session that took it: `TimeZone` `UTC` (a timestamptz
 ends `+00:00`), `IntervalStyle` `postgres`, `extra_float_digits` 1, `bytea_output` `hex`, `DateStyle` `ISO, MDY` and
 `lc_monetary` `C`; the caller's own settings are untouched afterwards. If releasing the advisory lock fails
-after the epoch is committed, the snapshot still returns, with a warning (`could not release Caverns' advisory lock: <error>`) through the
-`caverns_of_time._connection` logger. `catalog(connection, *, limit=None)` lists the epochs
+after the epoch is committed (an error, or `pg_advisory_unlock` returns false because the session did not hold the
+lock), `snapshot` raises a `CavernsError` instead of returning: "epoch 'nightly' was committed, but releasing Caverns'
+advisory lock failed (<reason>): Caverns needs a direct connection or a session-mode pooler, not a transaction-mode
+one". The epoch is committed and stands. The session-level lock needs a connection that stays one session: connect
+directly or through a session-mode pooler. `lock_timeout` (as for `apply`: seconds, default `5.0`, `None` keeps the
+session's own) bounds the wait for Caverns' advisory lock, where a timeout raises `CavernsError`, and, set at the
+start of the REPEATABLE READ transaction, the wait for each source table's lock: a timeout there rolls the copy
+back and raises the driver's own error (SQLSTATE `55P03`), untranslated. **The cost of the long transaction:** the
+copy is one REPEATABLE READ transaction for as long as the copy takes, so it holds back vacuum's horizon (dead rows
+the whole database produces meanwhile are not reclaimed) and holds an `AccessShare` lock on every registered table
+(blocking DDL that needs a stronger lock, such as `ALTER TABLE` or `TRUNCATE`, until it ends). Schedule a large
+snapshot for a quiet period; copying in batches is not supported yet. `catalog(connection, *, limit=None)` lists the epochs
 newest first, deleted ones included, each with its tables.
 
 **Epochs, as of.** `as_of(connection, epoch, schema, table, *, limit=None)` reads one table of an epoch back: the
@@ -420,8 +496,17 @@ With nothing found: `✅ No drift — the live schema matches the fingerprint at
   `SET`, transaction-level locks). A psycopg 3 connection inside `with conn.transaction():` is unsupported,
   because Caverns must commit and roll back itself. A step's SQL and check run exactly as written, with no parameters, so a
   `%` in them is literal.
+- Every write (`install`, `apply`, `baseline`, `register`, `unregister`, `snapshot` and `delete` without `dry_run`)
+  also refuses, with a `CavernsError` and before it writes anything, a database that is a standby
+  (`pg_is_in_recovery()`: "the database is a standby (in recovery): Caverns writes only to a primary") and a
+  session that cannot write (`transaction_read_only` is `on`, as when `default_transaction_read_only` is set:
+  "the session is read-only (default_transaction_read_only is on): Caverns needs a session that can write"). The
+  read-only functions (`preflight`, `history`, `drift`, `fingerprint`, `tracked`, `catalog`, `as_of`, `diff`
+  and `delete` with `dry_run`) are not checked.
 - `install(connection) -> list[LedgerEntry]`: the rows written, one per own step not yet applied, `[]` when
-  Caverns is already installed; an `accepted` row for an own step whose table exists without its row.
+  Caverns is already installed; an `accepted` row for an own step whose table exists without its row. Raises
+  `CavernsError` for a `caverns` schema or relation owned by a role whose privileges the current
+  role does not inherit.
 - The ledger, `caverns.ledger`, one row per recorded event:
 
   | Column | Holds |
@@ -431,7 +516,7 @@ With nothing found: `✅ No drift — the live schema matches the fingerprint at
   | `checksum` | the step's checksum (64 lower-case hex digits) |
   | `outcome` | `applied`, `failed`, `baseline` or `accepted` |
   | `fingerprint` | required on `baseline`, else null |
-  | `error` | the database error, present exactly on `failed` |
+  | `error` | on `failed` only: the SQLSTATE and the primary message (`<SQLSTATE>: <message>`), never the DETAIL, HINT or CONTEXT; an error without a SQLSTATE keeps the first line of its text. Step SQL must not carry secrets: a primary message can quote a literal of the failing statement. |
   | `duration_ms` | how long the step ran, when it ran |
   | `recorded_at`, `recorded_by` | `clock_timestamp()` and `current_user` at insert |
   | `caverns_version` | the package version that wrote the row |
@@ -440,7 +525,7 @@ With nothing found: `✅ No drift — the live schema matches the fingerprint at
   reject UPDATE, DELETE and TRUNCATE (hard rule 5); a correction is a new row. `LedgerEntry` carries these
   columns in this order.
 - `preflight(connection, changeset) -> list[StepStatus]` and `Status` (`applied`, `pending`, `unknown`,
-  `conflict`). A check that does not return exactly one row with one boolean column, or raises a database
+  `conflict`, `before_baseline`). A check that does not return exactly one row with one boolean column, or raises a database
   error, is a `ChangesetError` naming the step; so is a `baseline` row at a step the changeset lacks.
   `LedgerNotInstalled` is raised when Caverns' own changeset is not fully applied (call `install` first,
   also after an upgrade that added an own step).
@@ -453,17 +538,21 @@ With nothing found: `✅ No drift — the live schema matches the fingerprint at
   `LedgerNotInstalled` when the ledger table does not exist, and `ChangesetError` for an invalid changeset name or a
   *limit* that is not an integer from 1 to 9223372036854775807, the bigint maximum (a `bool` is not one).
   `chromie log --limit` takes 0 to the same maximum.
-- `apply(connection, changeset, *, reapply=(), accept=()) -> list[LedgerEntry]`: the rows written, in order
-  (`[]` when nothing is to do). A bare string for `reapply` or `accept`, or a label in both, is a `ChangesetError`.
+- `apply(connection, changeset, *, reapply=(), accept=(), lock_timeout=5.0) -> list[LedgerEntry]`: the rows written, in order
+  (`[]` when nothing is to do). A bare string for `reapply` or `accept`, a label in both, or a `lock_timeout` that is not
+  `None` or a number from 0.001 to 2147483.647 (a `bool` is not one) is a `ChangesetError`; a wait for Caverns' lock that times out before the run wrote a row is a `CavernsError`, nothing written.
   Raises `PreflightRefused` (attribute `statuses`, the offending steps), `StepFailed` (attributes `label`
   and `version`, the failed row's ledger version; its `__cause__` is the driver's error), a plain
   `CavernsError` (its `__cause__` is the step's error) when a failed step cannot be recorded, and the
   errors of `preflight`. A run that writes rows stores a fingerprint and may log drift warnings (see apply).
-- `baseline(connection, changeset, *, through=None, schemas=None) -> LedgerEntry`: the row written. Raises
+- `baseline(connection, changeset, *, through=None, schemas=None) -> LedgerEntry`: the `through` step's row (one
+  row is written per step up to it). Raises
   `BaselineRefused` (the changeset has rows; a named schema that does not exist) and `ChangesetError` (a
   `through` the changeset lacks, a bare string for `schemas`, an empty `schemas`). It stores the fingerprint.
-- `infinite.fingerprint(connection, *, schemas=None) -> Fingerprint`: `Fingerprint(schemas, document, hash)`, a
-  frozen dataclass of the sorted, unique schema names (a tuple), the document and its SHA-256 hex; without
+- `infinite.fingerprint(connection, *, schemas=None) -> Fingerprint`: `Fingerprint(schemas, document, hash, server_version)`, a
+  frozen dataclass of the sorted, unique schema names (a tuple), the document, its SHA-256 hex and the server's
+  `server_version_num` read in the same transaction (`int | None`: None only for a row recorded before the
+  `fingerprint_server` step; the hash covers the document alone); without
   `schemas`, the watched ones. It runs in one read-only transaction and writes nothing. Raises `ChangesetError` for a bare string, a name that is not a string
   or an empty collection for `schemas`, and for a named schema that does not exist; the connection is checked as
   for every public function.
@@ -472,7 +561,7 @@ With nothing found: `✅ No drift — the live schema matches the fingerprint at
   schemas compared (a tuple), the `Difference(kind, name, change)` values (`kind` one of the six kinds, `change`
   `added`, `removed` or `changed`) and the `StepStatus` values of the disagreements, each a tuple. Read-only
   transactions, nothing written. Raises `LedgerNotInstalled` before
-  `install()` (the fingerprint table does not exist; given a *changeset*, also before the `epochs` step, by its
+  `install()` (the fingerprint table does not exist or lacks its `server_version` column; given a *changeset*, also before the `epochs` step, by its
   `preflight`), `NoFingerprint` when none is recorded, `ChangesetError`
   for a bad `schemas` or one that is not watched, and the errors of `preflight` for a `changeset`.
 - `epochs.register(connection, schema, table, *, key=None) -> TrackedTable`: opts the table in and returns its
@@ -485,10 +574,11 @@ With nothing found: `✅ No drift — the live schema matches the fingerprint at
   `ChangesetError`, `LedgerNotInstalled` and `EpochRefused` (the table is not registered).
 - `epochs.tracked(connection) -> list[TrackedTable]`: the registry ordered by schema and table, in one read-only
   transaction that writes nothing. Raises `LedgerNotInstalled`.
-- `epochs.snapshot(connection, name) -> Epoch`: copies every registered table into a new epoch called *name* (a
-  label-style name, unique for good). Raises `ChangesetError` for a bad name, `LedgerNotInstalled` and `EpochRefused`
-  (no registered table, a name taken, a registered table or key column that is gone, a key with duplicates or
-  nulls); a refusal writes nothing. Logs `took epoch NAME at ledger version V: N rows in M tables`.
+- `epochs.snapshot(connection, name, *, lock_timeout=5.0, max_bytes=1073741824) -> Epoch`: copies every registered table into a new epoch called *name* (a
+  label-style name, unique for good). Raises `ChangesetError` for a bad name, `lock_timeout` or `max_bytes`, `CavernsError` when Caverns' lock times out, `LedgerNotInstalled` and `EpochRefused`
+  (no registered table, a name taken, a registered table or key column that is gone, a table with row-level security
+  the role does not bypass, a size above `max_bytes`, a key too large for an index entry, a key with duplicates or
+  nulls); a refusal writes nothing. Logs `snapshot NAME: about N bytes in M tables`, then `took epoch NAME at ledger version V: N rows in M tables`.
 - `epochs.catalog(connection, *, limit=None) -> list[Epoch]`: the epochs newest first, deleted ones included, at
   most *limit* (None: all) in one read-only transaction that writes nothing. Raises `ChangesetError` for a *limit*
   that is not a positive integer up to 9223372036854775807 and `LedgerNotInstalled`.
@@ -533,6 +623,15 @@ With nothing found: `✅ No drift — the live schema matches the fingerprint at
   tables is a new own step (hard rule 6). The DDL of each step is idempotent, and `caverns` is a reserved changeset name.
 - No runtime dependency for the library; the CLI's driver (psycopg 3) is the optional `cli` extra. Adding
   a dependency is an ask-first decision.
+
+## Known limitations
+
+- Caverns writes only to a primary: a standby (in recovery) and a read-only session are refused.
+- Steps and checks run under the session's `search_path`, not a pinned one: schema-qualify them.
+- A snapshot copies in one REPEATABLE READ transaction, so a very large table needs a quiet period and a
+  `max_bytes` to match; copying in batches is not supported yet.
+- Logical replication of the `caverns` schema is unsupported: the ledger, fingerprint and epoch tables are not
+  designed to be replicated, and a subscriber's copy is not a ledger Caverns can write.
 
 ## Extending
 
