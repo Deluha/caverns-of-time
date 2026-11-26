@@ -651,6 +651,19 @@ def test_an_attach_partition_on_a_created_table_is_still_a_lock_hazard_and_ends_
     assert found(sql) == [(L, 2, "ATTACH PARTITION"), (L, 3, "CREATE INDEX without CONCURRENTLY")]
 
 
+def test_a_name_followed_by_uescape_is_never_a_created_table() -> None:
+    index = "CREATE INDEX ON U&\"!0074\" UESCAPE '!' (a)"
+    assert found(f'CREATE TABLE U&"!0074" (a int); {index}') == [(L, 2, "CREATE INDEX without CONCURRENTLY")]
+    assert found(f"CREATE TABLE U&\"!0074\" UESCAPE '!' (a int); {index}") == [
+        (L, 2, "CREATE INDEX without CONCURRENTLY")
+    ]
+
+
+def test_inherit_ends_the_exemption_of_the_created_child() -> None:
+    sql = "CREATE TABLE nt (a int); ALTER TABLE old INHERIT nt; ALTER TABLE nt ADD CONSTRAINT c CHECK (a > 0)"
+    assert found(sql) == [(L, 3, "ADD CONSTRAINT without NOT VALID")]
+
+
 def test_a_partition_created_of_an_old_table_changes_nothing() -> None:
     assert found("CREATE TABLE c PARTITION OF old FOR VALUES FROM (0) TO (10); CREATE INDEX ON c (a)") == []
 

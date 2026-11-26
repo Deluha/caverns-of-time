@@ -361,7 +361,9 @@ A table created earlier in the same SQL (`CREATE [TEMP|UNLOGGED|FOREIGN] TABLE`;
 it may find an old table with data) is new and empty, so a later
 `CREATE INDEX` on it and any later `ALTER TABLE` of it are `safe` until an `ALTER ... RENAME TO`, a `SET SCHEMA` (of
 any object) or a `SET` or `RESET` statement in the SQL, which may put an old table under a created name or change what a
-name refers to, ends the exemption. An `ATTACH PARTITION` is the exception: it is a `lock_hazard` even on a created
+name refers to, ends the exemption; an `ALTER TABLE ... INHERIT name` ends the exemption of `name` (it becomes a
+child of an old table), and a name followed by `UESCAPE` is never matched (its escape character may differ), so it
+is never exempt. An `ATTACH PARTITION` is the exception: it is a `lock_hazard` even on a created
 table, and it ends that table's exemption (the partition attached is an old table). Names are compared as written, an
 unquoted name folded to lower case: `t` and `public.t` are different tables, so `public.t` after `CREATE TABLE t` is
 flagged.
@@ -789,7 +791,8 @@ With nothing found: `✅ No drift — the live schema matches the fingerprint at
   `max_bytes` to match; copying in batches is not supported yet.
 - Murozond reads keywords, not a parse tree, and guards against mistakes, not SQL written to hide a statement from it:
   a construct it does not model is read by its leading keywords, and a `DO` block, a function body and dynamic SQL
-  are never read. Table rewrites and scans it does not flag: a volatile `DEFAULT` on `ADD COLUMN`, `ADD COLUMN ...
+  are never read. Other statements that change name resolution (for example a `GRANT` on a schema earlier in the
+  `search_path`) do not end the created-table exemption. Table rewrites and scans it does not flag: a volatile `DEFAULT` on `ADD COLUMN`, `ADD COLUMN ...
   GENERATED ... AS IDENTITY` and `serial` (a volatile fill), `ADD COLUMN ... REFERENCES` with a default (a foreign-key
   check scan), `ALTER COLUMN ... SET EXPRESSION AS` (PostgreSQL 17+) and `SET ACCESS METHOD`.
 - The drift check runs in its own transaction before the first step: drift made between it and the first step is not

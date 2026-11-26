@@ -154,14 +154,16 @@ def _copy(tokens: Sequence[Token], _created: set[Name]) -> list[Verdict]:
     """`COPY`: a DELETE or MERGE in the parenthesised query is destructive, PROGRAM runs a server command (unknown)."""
     query: Sequence[Token] = []
     if len(tokens) > 1 and _is_punct(tokens[1], "("):
-        close = next(
-            (i for i in range(2, len(tokens)) if _is_punct(tokens[i], ")") and tokens[i].depth == 0), len(tokens)
-        )
-        query = tokens[2:close]
+        query = tokens[2 : _group_end(tokens)]
     verdicts = [(Risk.DESTRUCTIVE, f"COPY with {word}") for word in ("DELETE", "MERGE") if _has_keyword(query, word)]
     if _has_keyword(tokens, "PROGRAM", top=True):
         verdicts.append((Risk.UNKNOWN, "COPY PROGRAM"))
     return verdicts
+
+
+def _group_end(tokens: Sequence[Token]) -> int:
+    """The index of the `)` closing the parenthesised group that opens at index 1 (the end when it never closes)."""
+    return next((i for i in range(2, len(tokens)) if _is_punct(tokens[i], ")") and tokens[i].depth == 0), len(tokens))
 
 
 def _reindex(tokens: Sequence[Token], _created: set[Name]) -> list[Verdict]:
@@ -169,9 +171,7 @@ def _reindex(tokens: Sequence[Token], _created: set[Name]) -> list[Verdict]:
     rest = tokens[1:]
     option = None  # the last CONCURRENTLY option of the list, whose value counts
     if len(tokens) > 1 and _is_punct(tokens[1], "("):
-        close = next(
-            (i for i in range(2, len(tokens)) if _is_punct(tokens[i], ")") and tokens[i].depth == 0), len(tokens)
-        )
+        close = _group_end(tokens)
         options = [o for o in _split_commas(tokens[2:close], depth=1) if o and o[0].keyword == "CONCURRENTLY"]
         option = options[-1][1:] if options else None
         rest = tokens[close + 1 :]
@@ -256,6 +256,9 @@ def _alter_table(tokens: Sequence[Token], created: set[Name]) -> list[Verdict]:
         actions = [action for action in actions if _at(action, 0, "ATTACH", "PARTITION")]
         if actions:
             created.discard(name)
+    for action in actions:  # a created table made a child is no longer a new table
+        if _at(action, 0, "INHERIT"):
+            created.discard(_name(action, 1)[0])
     verdicts = (_table_action(action) for action in actions)
     return [verdict for verdict in verdicts if verdict]
 
@@ -379,6 +382,8 @@ def _name(tokens: Sequence[Token], start: int) -> tuple[Name, int]:
             i += 1
         else:
             break
+    if parts and i < len(tokens) and tokens[i].keyword == "UESCAPE":  # the escape character may differ: never a match
+        return (), i + 2
     return tuple(parts), i
 
 

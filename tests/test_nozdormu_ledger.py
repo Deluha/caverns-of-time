@@ -2148,6 +2148,7 @@ def test_a_non_transactional_step_whose_row_cannot_be_written_raises_a_caverns_e
     assert str(refused.value).endswith(
         "; its effect stands without a row (preflight reads it as unknown with a check, pending without)"
     )
+    assert "\n" not in str(refused.value)
     assert isinstance(refused.value.__cause__, DRIVER_ERRORS)
     _assert_outside_state_restored(ledger_conn)
     _run(ledger_conn, "RESET ROLE")

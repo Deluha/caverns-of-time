@@ -1028,7 +1028,7 @@ def _write_step_outside_transaction(
         except Exception as error:
             raise CavernsError(
                 f"step {step.label!r} of changeset {changeset.name!r} ran outside a transaction, but its ledger "
-                f"row could not be written: {error}; its effect stands without a row "
+                f"row could not be written: {str(error).strip()}; its effect stands without a row "
                 "(preflight reads it as unknown with a check, pending without)"
             ) from error
 
