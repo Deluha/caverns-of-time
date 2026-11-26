@@ -151,6 +151,16 @@ def test_merge_without_delete_is_unknown() -> None:
         ("REINDEX (CONCURRENTLY false) TABLE t", "REINDEX without CONCURRENTLY"),
         ("REINDEX (VERBOSE, CONCURRENTLY off) TABLE t", "REINDEX without CONCURRENTLY"),
         ("REINDEX (CONCURRENTLY 0) TABLE t", "REINDEX without CONCURRENTLY"),
+        ("REINDEX (CONCURRENTLY -0) TABLE t", "REINDEX without CONCURRENTLY"),
+        ("REINDEX (CONCURRENTLY +0) TABLE t", "REINDEX without CONCURRENTLY"),
+        ("REINDEX (CONCURRENTLY E'off') TABLE t", "REINDEX without CONCURRENTLY"),
+        ("REINDEX (CONCURRENTLY $$off$$) TABLE t", "REINDEX without CONCURRENTLY"),
+        ("REINDEX (CONCURRENTLY, CONCURRENTLY off) TABLE t", "REINDEX without CONCURRENTLY"),
+        ("REINDEX (CONCURRENTLY true, CONCURRENTLY false) TABLE t", "REINDEX without CONCURRENTLY"),
+        ("REINDEX (TABLESPACE concurrently) TABLE t", "REINDEX without CONCURRENTLY"),
+        ("CREATE INDEX ON s.concurrently (a)", "CREATE INDEX without CONCURRENTLY"),
+        ("REINDEX TABLE s.concurrently", "REINDEX without CONCURRENTLY"),
+        ("REFRESH MATERIALIZED VIEW s.concurrently", "REFRESH MATERIALIZED VIEW without CONCURRENTLY"),
         ("ALTER TABLE t ADD NOT NULL a", "ADD CONSTRAINT without NOT VALID"),
         ("REFRESH MATERIALIZED VIEW v", "REFRESH MATERIALIZED VIEW without CONCURRENTLY"),
         ("VACUUM FULL t", "VACUUM FULL"),
@@ -192,6 +202,11 @@ def test_lock_hazards(sql: str, reason: str) -> None:
         "REINDEX (CONCURRENTLY) TABLE t",
         "REINDEX (CONCURRENTLY true) TABLE t",
         "REINDEX (CONCURRENTLY on) TABLE t",
+        "REINDEX (CONCURRENTLY 'on') TABLE t",
+        "REINDEX (CONCURRENTLY 1) TABLE t",
+        "REINDEX (VERBOSE, CONCURRENTLY) TABLE t",
+        "REINDEX (CONCURRENTLY false, CONCURRENTLY) TABLE t",
+        "REINDEX (CONCURRENTLY off) TABLE CONCURRENTLY t",
         "REINDEX TABLE CONCURRENTLY off",
         "ALTER TABLE t ADD NOT NULL a NOT VALID",
         "ALTER TABLE t ADD COLUMN c int NOT NULL DEFAULT 0",
@@ -219,6 +234,18 @@ def test_create_table_if_not_exists_does_not_make_a_table_new() -> None:
     assert found(drop) == [(D, 2, "ALTER TABLE DROP COLUMN")]
     index = "CREATE TABLE IF NOT EXISTS public.orders (id int); CREATE INDEX ON public.orders (id)"
     assert found(index) == [(L, 2, "CREATE INDEX without CONCURRENTLY")]
+
+
+def test_a_rename_or_set_schema_ends_the_created_table_exemption() -> None:
+    rename = "CREATE TABLE t2 (a int); ALTER TABLE t2 RENAME TO t_old; ALTER TABLE big RENAME TO t2; "
+    assert found(rename + "ALTER TABLE t2 DROP COLUMN a") == [(D, 4, "ALTER TABLE DROP COLUMN")]
+    move = "CREATE TABLE t2 (a int); ALTER TABLE big SET SCHEMA s; ALTER TABLE t2 DROP COLUMN a"
+    assert found(move) == [(D, 3, "ALTER TABLE DROP COLUMN")]
+    other = "CREATE TABLE t2 (a int); ALTER SCHEMA s RENAME TO public; CREATE INDEX ON t2 (a)"
+    assert found(other) == [(L, 3, "CREATE INDEX without CONCURRENTLY")]
+    # renaming a column is not moving a table
+    column = "CREATE TABLE t2 (a int); ALTER TABLE t2 RENAME COLUMN a TO b; ALTER TABLE t2 DROP COLUMN b"
+    assert found(column) == []
 
 
 def test_a_table_created_later_does_not_exempt_an_earlier_statement() -> None:
@@ -420,6 +447,23 @@ def test_a_dollar_after_a_non_ascii_identifier_character_is_part_of_the_identifi
     ]
 
 
+def test_a_string_continued_after_a_newline_is_one_string() -> None:
+    assert found("INSERT INTO t VALUES ('a'\n'b')") == []
+    assert len(_sql.split("INSERT INTO t VALUES ('a' -- c\n  'b'); INSERT INTO t VALUES (1)")) == 2
+    (statement,) = _sql.split("SELECT 'a'\n'b'")
+    assert [t.text for t in statement.tokens if t.kind is _sql.Kind.STRING] == ["'a'\n'b'"]
+
+
+def test_an_e_string_continuation_keeps_its_backslash_escapes() -> None:
+    assert found("INSERT INTO t VALUES (E'a'\n'\\''); DROP TABLE y; --')") == [(D, 2, "DROP TABLE")]
+
+
+def test_a_non_breaking_space_is_part_of_a_name_not_whitespace() -> None:
+    # PostgreSQL reads `\u00a0$a$` as one identifier, so no dollar quote opens
+    sql = "INSERT INTO t SELECT 1 AS \u00a0$a$; DROP TABLE y; INSERT INTO t SELECT 1 AS \u00a0$a$"
+    assert found(sql) == [(D, 2, "DROP TABLE")]
+
+
 def test_semicolons_inside_parentheses_do_not_split() -> None:
     assert found("INSERT INTO t VALUES (1; DROP TABLE t)") == []
 
@@ -445,6 +489,22 @@ def test_begin_atomic_outside_a_routine_definition_does_not_open_a_body() -> Non
     assert found("INSERT INTO t SELECT begin atomic FROM s; DROP TABLE x") == [(D, 2, "DROP TABLE")]
     assert len(_sql.split("INSERT INTO t SELECT begin atomic FROM s; DROP TABLE x")) == 2
     assert found("CREATE FUNCTION f() RETURNS int AS (begin atomic); DROP TABLE x") == [(D, 2, "DROP TABLE")]
+
+
+def test_begin_atomic_is_read_only_in_a_create_function_or_procedure_statement() -> None:
+    sql = "CREATE VIEW function AS WITH begin AS (SELECT 1 AS a) SELECT a FROM begin atomic; DROP TABLE y; SELECT 1"
+    assert found(sql) == [(D, 2, "DROP TABLE"), (U, 3, "SELECT")]
+    assert len(_sql.split(sql)) == 3
+    assert len(_sql.split("CREATE OR REPLACE FUNCTION f() RETURNS int LANGUAGE sql BEGIN ATOMIC SELECT 1; END")) == 1
+
+
+def test_a_case_or_end_after_a_dot_is_a_name_inside_a_begin_atomic_body() -> None:
+    sql = (
+        'CREATE FUNCTION f() RETURNS int LANGUAGE sql BEGIN ATOMIC SELECT r.case FROM (SELECT 1 AS "case") r; END; '
+        "DROP TABLE y; CREATE FUNCTION g() RETURNS int LANGUAGE sql BEGIN ATOMIC SELECT 1; END"
+    )
+    assert found(sql) == [(D, 2, "DROP TABLE")]
+    assert len(_sql.split(sql)) == 3
 
 
 def test_a_plain_begin_does_not_open_a_body() -> None:

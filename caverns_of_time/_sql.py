@@ -25,6 +25,10 @@ _DOLLAR_TAG = re.compile(r"\$(?:[A-Za-z_\x80-\U0010ffff][A-Za-z0-9_\x80-\U0010ff
 # String prefixes written directly before the quote: only E turns backslash escapes on (B, X, N and U& do not).
 _STRING_PREFIXES = "BbEeNnXx"
 _PUNCTUATION = "(),;"
+# PostgreSQL's whitespace is these six characters; any other character, non-ASCII ones included, belongs to a name
+_WHITESPACE = " \t\n\r\f\v"
+# What PostgreSQL joins two string literals with: a newline among spaces and `--` comments, then the next quote
+_CONTINUATION = re.compile(r"[ \t\f]*(?:--[^\n\r]*)?[\n\r](?:[ \t\n\r\f\v]|--[^\n\r]*[\n\r])*'")
 
 
 class Kind(enum.Enum):
@@ -52,6 +56,11 @@ class Token:
         return self.text.upper() if self.kind is Kind.WORD else ""
 
     @property
+    def is_dot(self) -> bool:
+        """Whether this is the `.` that joins the parts of a name (a word after it is a name, never a keyword)."""
+        return self.kind is Kind.OTHER and self.text == "."
+
+    @property
     def identifier(self) -> str | None:
         """The name a word or quoted identifier stands for (a word folded to lower case), else None."""
         if self.kind is Kind.WORD:
@@ -70,8 +79,9 @@ class Statement:
 def split(sql: str) -> list[Statement]:
     """Split SQL on the `;` outside quotes, comments, parentheses and a `BEGIN ATOMIC ... END` body.
 
-    An empty statement (`;;`) is dropped. Text after an unterminated quote or comment belongs to the statement that
-    opened it. A backslash outside a quote (a psql meta-command) marks its statement broken and lexing goes on.
+    A string literal split by a newline (`'a'` newline `'b'`) is one token. An empty statement (`;;`) is dropped.
+    Text after an unterminated quote or comment belongs to the statement that opened it.
+    A backslash outside a quote (a psql meta-command) marks its statement broken and lexing goes on.
     """
     statements: list[Statement] = []
     tokens: list[Token] = []
@@ -93,7 +103,8 @@ def split(sql: str) -> list[Statement]:
         if kind is Kind.PUNCT and text == "(":
             parens += 1
         if atomic:
-            atomic += (token.keyword == "CASE") - (token.keyword == "END")
+            if not (tokens and tokens[-1].is_dot):  # `r.case` is a name, not a keyword
+                atomic += (token.keyword == "CASE") - (token.keyword == "END")
         elif token.keyword == "ATOMIC" and parens == 0 and tokens and tokens[-1].keyword == "BEGIN":
             atomic = _defines_routine(tokens)
         tokens.append(token)
@@ -103,8 +114,14 @@ def split(sql: str) -> list[Statement]:
 
 
 def _defines_routine(tokens: list[Token]) -> int:
-    """1 when the statement so far is a `CREATE ... FUNCTION` or `PROCEDURE` (only that has a `BEGIN ATOMIC` body)."""
-    return int(tokens[0].keyword == "CREATE" and any(t.keyword in ("FUNCTION", "PROCEDURE") for t in tokens))
+    """1 when the statement so far starts `CREATE [OR REPLACE] FUNCTION` or `PROCEDURE` and its `BEGIN` is at depth 0.
+
+    Only that has a `BEGIN ATOMIC` body, and it is decided by position: a word that merely reads like one, such as a
+    view named `function`, opens nothing.
+    """
+    start = 3 if [t.keyword for t in tokens[1:3]] == ["OR", "REPLACE"] else 1
+    kind = tokens[start].keyword if start < len(tokens) else ""
+    return int(tokens[0].keyword == "CREATE" and kind in ("FUNCTION", "PROCEDURE") and tokens[-1].depth == 0)
 
 
 def _lex(sql: str) -> Iterator[tuple[Kind, str]]:
@@ -119,7 +136,7 @@ def _lex(sql: str) -> Iterator[tuple[Kind, str]]:
 def _scan(sql: str, pos: int) -> tuple[Kind | None, str, int]:
     """Read the token at *pos*: its kind (None for whitespace and comments), its text and where it ends."""
     ch = sql[pos]
-    if ch.isspace():
+    if ch in _WHITESPACE:
         return None, "", pos + 1
     if sql.startswith("--", pos):
         end = sql.find("\n", pos)
@@ -128,7 +145,7 @@ def _scan(sql: str, pos: int) -> tuple[Kind | None, str, int]:
         end = _comment_end(sql, pos)
         return (None, "", end) if end >= 0 else (Kind.BROKEN, UNTERMINATED, len(sql))
     if ch == "'":
-        return _closed(Kind.STRING, sql, pos, _quoted_end(sql, pos, "'", backslash=False))
+        return _closed(Kind.STRING, sql, pos, _string_end(sql, pos, backslash=False))
     if ch == '"':
         kind, text, end = _closed(Kind.QUOTED, sql, pos, _quoted_end(sql, pos, '"', backslash=False))
         return kind, (text[1:-1].replace('""', '"') if kind is Kind.QUOTED else text), end
@@ -146,9 +163,9 @@ def _word(sql: str, start: int, end: int) -> tuple[Kind, str, int]:
     """A word, or the string it prefixes (`E'..'`, `B'..'`, `U&'..'`), which is read as one string token."""
     word = sql[start:end]
     if len(word) == 1 and sql.startswith("'", end) and word in _STRING_PREFIXES:
-        return _closed(Kind.STRING, sql, start, _quoted_end(sql, end, "'", backslash=word in "Ee"))
+        return _closed(Kind.STRING, sql, start, _string_end(sql, end, backslash=word in "Ee"))
     if len(word) == 1 and word in "Uu" and sql.startswith("&'", end):
-        return _closed(Kind.STRING, sql, start, _quoted_end(sql, end + 1, "'", backslash=False))
+        return _closed(Kind.STRING, sql, start, _string_end(sql, end + 1, backslash=False))
     return Kind.WORD, word, end
 
 
@@ -157,6 +174,17 @@ def _closed(kind: Kind, sql: str, start: int, end: int) -> tuple[Kind, str, int]
     if end < 0:
         return Kind.BROKEN, UNTERMINATED, len(sql)
     return kind, sql[start:end], end
+
+
+def _string_end(sql: str, start: int, *, backslash: bool) -> int:
+    """The index after the string literal opening at *start*, or -1; strings split by a newline are one literal.
+
+    The continuation is read like the string it continues, so an `E` string keeps its backslash escapes.
+    """
+    end = _quoted_end(sql, start, "'", backslash=backslash)
+    while end >= 0 and (joint := _CONTINUATION.match(sql, end)):
+        end = _quoted_end(sql, joint.end() - 1, "'", backslash=backslash)
+    return end
 
 
 def _quoted_end(sql: str, start: int, quote: str, *, backslash: bool) -> int:

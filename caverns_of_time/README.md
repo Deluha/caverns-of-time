@@ -126,9 +126,9 @@ session's setting, which is put back afterwards, with autocommit switched off ag
 row (with its fingerprint when it is the run's last, and its acknowledgement) in a transaction, and releases the
 lock, a release that fails raising a `CavernsError` that says the step was recorded. Nothing can be rolled back: a step
 that fails leaves its partial effect (a failed `CREATE INDEX CONCURRENTLY` leaves an invalid index), records a
-`failed` row and raises `StepFailed`, and Caverns logs a warning naming every invalid index in the database (the
-failed row's fingerprint is read after the partial effect, so it holds them). Drop each with `DROP INDEX
-CONCURRENTLY`, which is then drift from that fingerprint, and apply the step again with `on_drift="warn"`. Give such
+`failed` row and raises `StepFailed`, and Caverns logs a warning naming every invalid index in the database (those in
+the watched schemas are in the failed row's fingerprint, which is read after the partial effect). Drop each with `DROP
+INDEX CONCURRENTLY`, which is then drift from that fingerprint, and apply the step again with `on_drift="warn"`. Give such
 a step a check: a crash between the statement and its row leaves the effect without a row, which preflight then reads
 as `unknown` with a check and as `pending` without one. The guard and the acknowledgement apply as for any step.
 
@@ -337,21 +337,23 @@ risky statement or `ALTER TABLE` action, in statement order. `statement` is 1-ba
 cannot leak a literal. A safe statement adds no finding; SQL with no statement at all (only comments, whitespace
 and semicolons) is `unknown` ("no statement"). It runs nothing, takes no connection and reads keywords, not a
 parse tree: a lexer skips comments (`--`, nested `/* */`) and reads `'...'`, `E'...'`, dollar-quoted strings and
-quoted identifiers, splits statements on the `;` outside parentheses and outside a `BEGIN ATOMIC ... END` body, and
-splits `ALTER TABLE` actions on the commas outside parentheses. A string is read as under
-`standard_conforming_strings = on`. An unterminated quote or comment, and a psql `\` command, make their statement
+quoted identifiers, splits statements on the `;` outside parentheses and outside a `BEGIN ATOMIC ... END` body, read
+only in a statement that starts `CREATE [OR REPLACE] FUNCTION` or `PROCEDURE`, and splits `ALTER TABLE` actions on the
+commas outside parentheses. Whitespace is PostgreSQL's six characters (space, tab, newline, carriage return, form feed,
+vertical tab); every non-ASCII character is an identifier character; strings split by a newline (`'a'` newline `'b'`)
+are joined into one. A string is read as under `standard_conforming_strings = on`. An unterminated quote or comment, and a psql `\` command, make their statement
 `unknown`. Function and procedure bodies are strings and are not read.
 
 | Risk | Statements |
 |---|---|
 | `destructive` | every `DROP` (`IF EXISTS`, `DROP INDEX` and `DROP OWNED` included); `ALTER TABLE ... DROP [COLUMN]` and `DROP CONSTRAINT` (a column's `DROP DEFAULT`, `DROP NOT NULL`, `DROP EXPRESSION` and `DROP IDENTITY` are not); an `ALTER` of another object with a `DROP` action; `TRUNCATE`; `DELETE`; a `MERGE` with a `DELETE` |
-| `lock_hazard` | `CREATE [UNIQUE] INDEX` without `CONCURRENTLY`; `ADD CONSTRAINT` without `NOT VALID` (`PRIMARY KEY` or `UNIQUE ... USING INDEX` is safe); `ALTER COLUMN ... TYPE` and `SET DATA TYPE`; `SET NOT NULL`; `REINDEX` and `REFRESH MATERIALIZED VIEW` without `CONCURRENTLY`; `VACUUM FULL`; `CLUSTER`; `LOCK`; `SET TABLESPACE`; `SET LOGGED` and `SET UNLOGGED`; `ATTACH PARTITION`; `DETACH PARTITION` without `CONCURRENTLY`; `ADD COLUMN` with an inline `PRIMARY KEY`, `UNIQUE` or `GENERATED ... STORED` |
+| `lock_hazard` | `CREATE [UNIQUE] INDEX` without `CONCURRENTLY`; `ADD CONSTRAINT` and `ADD NOT NULL` (PostgreSQL 18) without `NOT VALID` (`PRIMARY KEY` or `UNIQUE ... USING INDEX` is safe); `ALTER COLUMN ... TYPE` and `SET DATA TYPE`; `SET NOT NULL`; `REINDEX` (also with `CONCURRENTLY` turned off in its option list: only no value, `true`, `on`, `1` or those as a string leave it on) and `REFRESH MATERIALIZED VIEW` without `CONCURRENTLY` (a `.concurrently` name is not the keyword); `VACUUM FULL`; `CLUSTER`; `LOCK`; `SET TABLESPACE`; `SET LOGGED` and `SET UNLOGGED`; `ATTACH PARTITION`; `DETACH PARTITION` without `CONCURRENTLY`; `ADD COLUMN` with an inline `PRIMARY KEY`, `UNIQUE` or `GENERATED ... STORED` |
 | `unknown` | `DO`, `CALL`, `EXECUTE`, `SELECT`, `WITH`, `MERGE` without a `DELETE`, other `VACUUM`, transaction control, a statement that does not start with a word or starts with any other keyword, and a statement the lexer cannot read to its end |
 | `safe` | `INSERT`, `UPDATE`, `COPY`, `GRANT`, `REVOKE`, `COMMENT`, `SET`, `RESET`, `ANALYZE`; every other `CREATE`, including `CREATE [OR REPLACE] FUNCTION` and `PROCEDURE`; every other `ALTER`, such as a rename, an owner change, `VALIDATE CONSTRAINT`, `SET (...)` and `SET ACCESS METHOD` |
 
 A table created earlier in the same SQL (`CREATE [TEMP|UNLOGGED|FOREIGN] TABLE`; `IF NOT EXISTS` does not count, as
 it may find an old table with data) is new and empty, so a later
-`CREATE INDEX` on it and any later `ALTER TABLE` of it are `safe`. Names are compared as written, an unquoted name
+`CREATE INDEX` on it and any later `ALTER TABLE` of it are `safe` until an `ALTER ... RENAME TO` or `SET SCHEMA` (of any object) in the SQL, which may put an old table under a created name, ends the exemption. Names are compared as written, an unquoted name
 folded to lower case: `t` and `public.t` are different tables, so `public.t` after `CREATE TABLE t` is flagged.
 
 `apply` uses `classify` as its guard (see "Nozdormu, the guard" above); the classifier itself never refuses anything.
@@ -775,14 +777,15 @@ With nothing found: `✅ No drift — the live schema matches the fingerprint at
 - Steps and checks run under the session's `search_path`, not a pinned one: schema-qualify them.
 - A snapshot copies in one REPEATABLE READ transaction, so a very large table needs a quiet period and a
   `max_bytes` to match; copying in batches is not supported yet.
-- Murozond reads keywords, not a parse tree: a construct it does not model is read by its leading keywords, and a
-  `DO` block, a function body and dynamic SQL are never read. A volatile `DEFAULT` on `ADD COLUMN` and
+- Murozond reads keywords, not a parse tree, and guards against mistakes, not SQL written to hide a statement from it:
+  a construct it does not model is read by its leading keywords, and a `DO` block, a function body and dynamic SQL
+  are never read. A volatile `DEFAULT` on `ADD COLUMN` and
   `SET ACCESS METHOD` rewrite a table and are not flagged.
 - The drift check runs in its own transaction before the first step: drift made between it and the first step is not
   seen, and the run's fingerprint absorbs it unrecorded.
 - Murozond reads strings as with `standard_conforming_strings = on` (PostgreSQL's default); `apply` does not check the
   setting, and with it off a backslash in a plain string can hide a statement from the classifier.
-- A run stopped between its rows and its last row (killed, connection lost) leaves the latest fingerprint older than
+- A run stopped after its first row but before its last (killed, connection lost) leaves the latest fingerprint older than
   the ledger; the next `apply` then reads the run's own effect as drift and refuses by default: check `chromie
   drift`, then apply once with `on_drift="warn"`.
 - Logical replication of the `caverns` schema is unsupported: the ledger, fingerprint and epoch tables are not

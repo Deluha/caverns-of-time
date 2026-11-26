@@ -2111,7 +2111,7 @@ def test_a_failing_non_transactional_step_is_recorded_and_warns_of_the_invalid_i
     assert "nozdormu_test.t_uniq" in warnings[0]
     assert warnings[0].endswith(
         "drop each with DROP INDEX CONCURRENTLY, then reapply with on_drift='warn' "
-        "(the failed row's fingerprint holds them)"
+        "(those in watched schemas are in the failed row's fingerprint)"
     )
     stored = _query(ledger_conn, FINGERPRINT_ROWS)
     assert [row[0] for row in stored] == [failed.value.version]

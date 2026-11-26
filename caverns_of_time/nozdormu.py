@@ -918,7 +918,7 @@ def _warn_of_invalid_indexes(connection: Connection, changeset: Changeset, step:
         _log.warning(
             "step %s of changeset %s failed outside a transaction; invalid indexes in the database: %s; "
             "drop each with DROP INDEX CONCURRENTLY, then reapply with on_drift='warn' "
-            "(the failed row's fingerprint holds them)",
+            "(those in watched schemas are in the failed row's fingerprint)",
             step.label,
             changeset.name,
             ", ".join(invalid),
@@ -1231,8 +1231,8 @@ def apply(
     and fingerprint follow in a transaction. A failure cannot be rolled back: it leaves the statement's partial
     effect (an invalid index), records a `failed` row, raises `StepFailed` and logs a warning naming every invalid
     index of the database, to drop with `DROP INDEX CONCURRENTLY` before reapplying with `on_drift="warn"` (the
-    failed row's fingerprint holds them, so dropping them is drift from it). A crash between the statement
-    and its row leaves the effect without a row: give such a step a check.
+    failed row's fingerprint holds those in watched schemas, so dropping them is drift from it). A crash between
+    the statement and its row leaves the effect without a row: give such a step a check.
 
     A standby or a read-only session is refused with `CavernsError`, nothing written.
     """

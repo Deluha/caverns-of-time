@@ -73,7 +73,8 @@ _OBJECT_TYPES = tuple(
 _HARMLESS_DROPS = frozenset({"DEFAULT", "NOT", "EXPRESSION", "IDENTITY"})
 _CONSTRAINT_STARTS = frozenset({"CONSTRAINT", "CHECK", "FOREIGN", "PRIMARY", "UNIQUE", "EXCLUDE"})
 _CREATE_MODIFIERS = frozenset({"GLOBAL", "LOCAL", "TEMP", "TEMPORARY", "UNLOGGED", "UNIQUE", "FOREIGN"})
-_OFF_VALUES = frozenset({"FALSE", "OFF", "0"})  # values that turn a boolean option off
+_ON_WORDS = frozenset({"TRUE", "ON"})  # the only values read as turning a boolean option on (the rest: off)
+_ON_STRINGS = frozenset({"'true'", "'on'", "'1'"})
 _SET_HAZARDS = frozenset({"TABLESPACE", "LOGGED", "UNLOGGED"})
 # `ADD COLUMN` definitions that build an index or rewrite the table: the phrase and its reason.
 _COLUMN_HAZARDS = (
@@ -103,7 +104,8 @@ def classify(sql: str) -> Classification:
 
     A statement that cannot be read to its end, and SQL with no statement, are unknown. A table created earlier in
     the SQL (not by `IF NOT EXISTS`, which may find an old one) is new, so indexing or altering it later in the same
-    SQL is safe (names compared as written, so `t` and `public.t` differ). Strings are read as in
+    SQL is safe (names compared as written, so `t` and `public.t` differ) until an `ALTER ... RENAME TO` or
+    `SET SCHEMA` in the SQL, which may put an old table under a created name. Strings are read as in
     `standard_conforming_strings = on`.
     """
     statements = split(sql)
@@ -145,18 +147,39 @@ def _merge(tokens: Sequence[Token], _created: set[Name]) -> list[Verdict]:
 
 
 def _reindex(tokens: Sequence[Token], _created: set[Name]) -> list[Verdict]:
-    for i, token in enumerate(tokens):
-        if token.keyword == "CONCURRENTLY":
-            value = tokens[i + 1].text.strip("'").upper() if i + 1 < len(tokens) else ""
-            if token.depth == 0 or value not in _OFF_VALUES:  # `(CONCURRENTLY off)` turns it off
-                return []
+    """`REINDEX [(options)] target [CONCURRENTLY] name`: safe when CONCURRENTLY is on, by the keyword or the option."""
+    rest = tokens[1:]
+    option = None  # the last CONCURRENTLY option of the list, whose value counts
+    if len(tokens) > 1 and _is_punct(tokens[1], "("):
+        close = next(
+            (i for i in range(2, len(tokens)) if _is_punct(tokens[i], ")") and tokens[i].depth == 0), len(tokens)
+        )
+        options = [o for o in _split_commas(tokens[2:close], depth=1) if o and o[0].keyword == "CONCURRENTLY"]
+        option = options[-1][1:] if options else None
+        rest = tokens[close + 1 :]
+    if (option is not None and _option_is_on(option)) or _has_keyword(rest, "CONCURRENTLY", top=True):
+        return []
     return [(Risk.LOCK_HAZARD, "REINDEX without CONCURRENTLY")]
+
+
+def _option_is_on(value: Sequence[Token]) -> bool:
+    """Whether the value of a boolean option turns it on: none, TRUE, ON, 1, or the string 'true', 'on' or '1'."""
+    if not value:
+        return True
+    if len(value) > 1:
+        return False
+    token = value[0]
+    if token.kind is Kind.WORD:
+        return token.keyword in _ON_WORDS
+    if token.kind is Kind.STRING:
+        return token.text.lower() in _ON_STRINGS
+    return token.kind is Kind.OTHER and token.text == "1"
 
 
 def _refresh(tokens: Sequence[Token], _created: set[Name]) -> list[Verdict]:
     if not _at(tokens, 0, "REFRESH", "MATERIALIZED", "VIEW"):
         return [(Risk.UNKNOWN, _UNRECOGNISED)]
-    if _has(tokens, "CONCURRENTLY"):
+    if _has_keyword(tokens, "CONCURRENTLY"):
         return []
     return [(Risk.LOCK_HAZARD, "REFRESH MATERIALIZED VIEW without CONCURRENTLY")]
 
@@ -183,7 +206,7 @@ def _create(tokens: Sequence[Token], created: set[Name]) -> list[Verdict]:
 def _create_index(tokens: Sequence[Token], created: set[Name]) -> list[Verdict]:
     """The tokens after `CREATE [UNIQUE] INDEX`: safe when CONCURRENTLY, or on a table created in the same SQL."""
     on = next((i for i, t in enumerate(tokens) if t.keyword == "ON" and t.depth == 0), len(tokens))
-    if _has(tokens[:on], "CONCURRENTLY"):
+    if _has_keyword(tokens[:on], "CONCURRENTLY"):
         return []
     table, _ = _name(tokens, on + (2 if _at(tokens, on + 1, "ONLY") else 1))
     return [] if table in created else [(Risk.LOCK_HAZARD, "CREATE INDEX without CONCURRENTLY")]
@@ -194,7 +217,10 @@ def _create_index(tokens: Sequence[Token], created: set[Name]) -> list[Verdict]:
 
 def _alter(tokens: Sequence[Token], created: set[Name]) -> list[Verdict]:
     is_table = _at(tokens, 1, "TABLE") or _at(tokens, 1, "FOREIGN", "TABLE")
-    return _alter_table(tokens, created) if is_table else _alter_other(tokens)
+    verdicts = _alter_table(tokens, created) if is_table else _alter_other(tokens)
+    if _has(tokens, "RENAME", "TO") or _has(tokens, "SET", "SCHEMA"):  # a table may now be an old one under a new name
+        created.clear()
+    return verdicts
 
 
 def _alter_table(tokens: Sequence[Token], created: set[Name]) -> list[Verdict]:
@@ -300,6 +326,18 @@ def _has(tokens: Sequence[Token], *phrase: str, top: bool = False) -> bool:
     )
 
 
+def _is_punct(token: Token, text: str) -> bool:
+    return token.kind is Kind.PUNCT and token.text == text
+
+
+def _has_keyword(tokens: Sequence[Token], word: str, *, top: bool = False) -> bool:
+    """Whether the keyword *word* is among the tokens (outside parentheses when *top*), not as a name (`s.word`)."""
+    return any(
+        token.keyword == word and (not top or token.depth == 0) and not (i and tokens[i - 1].is_dot)
+        for i, token in enumerate(tokens)
+    )
+
+
 def _object_words(tokens: Sequence[Token], start: int) -> tuple[str, ...]:
     """The object type named from *start* (`MATERIALIZED VIEW`), as keywords; empty when none is."""
     return next((phrase for phrase in _OBJECT_TYPES if _at(tokens, start, *phrase)), ())
@@ -312,19 +350,19 @@ def _name(tokens: Sequence[Token], start: int) -> tuple[Name, int]:
     while i < len(tokens) and (part := tokens[i].identifier) is not None:
         parts.append(part)
         i += 1
-        if i + 1 < len(tokens) and tokens[i].kind is Kind.OTHER and tokens[i].text == ".":
+        if i + 1 < len(tokens) and tokens[i].is_dot:
             i += 1
         else:
             break
     return tuple(parts), i
 
 
-def _split_commas(tokens: Sequence[Token]) -> list[Sequence[Token]]:
-    """Split the tokens at the commas outside parentheses."""
+def _split_commas(tokens: Sequence[Token], depth: int = 0) -> list[Sequence[Token]]:
+    """Split the tokens at the commas at parenthesis *depth* (outside parentheses by default)."""
     actions: list[Sequence[Token]] = []
     begin = 0
     for i, token in enumerate(tokens):
-        if token.kind is Kind.PUNCT and token.text == "," and token.depth == 0:
+        if _is_punct(token, ",") and token.depth == depth:
             actions.append(tokens[begin:i])
             begin = i + 1
     actions.append(tokens[begin:])
