@@ -18,7 +18,7 @@ import os
 import reprlib
 import time
 from collections.abc import Callable, Collection, Sequence
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
 
@@ -59,7 +59,7 @@ from caverns_of_time._fingerprint import (
     watched_schemas,
 )
 from caverns_of_time._fingerprint import latest as latest_fingerprint
-from caverns_of_time._sql import split
+from caverns_of_time._sql import ASCII_WHITESPACE, split
 from caverns_of_time.errors import (
     BaselineRefused,
     CavernsError,
@@ -88,7 +88,6 @@ __all__ = [
 
 _log = logging.getLogger(__name__)
 
-_ASCII_WHITESPACE = " \t\n\r\f\v"
 # The first line of a step's SQL that makes it run outside a transaction (for `CREATE INDEX CONCURRENTLY`, `VACUUM`).
 _NO_TRANSACTION_MARKER = "-- caverns:no-transaction"
 _SQL_SUFFIX = ".sql"
@@ -107,7 +106,7 @@ def _normalised(sql: str) -> str:
 
     ASCII whitespace is space, tab, LF, CR, FF and VT; any other character, NBSP included, is kept.
     """
-    return sql.replace("\r\n", "\n").replace("\r", "\n").strip(_ASCII_WHITESPACE)
+    return sql.replace("\r\n", "\n").replace("\r", "\n").strip(ASCII_WHITESPACE)
 
 
 def _checksum(sql: str) -> str:
@@ -170,7 +169,7 @@ class Step:
     def transactional(self) -> bool:
         """False when the SQL's first line is the `-- caverns:no-transaction` marker."""
         first_line = _normalised(self.sql).split("\n", 1)[0]
-        return first_line.rstrip(_ASCII_WHITESPACE) != _NO_TRANSACTION_MARKER
+        return first_line.rstrip(ASCII_WHITESPACE) != _NO_TRANSACTION_MARKER
 
 
 @dataclass(frozen=True)
@@ -817,10 +816,7 @@ def _record_fingerprint(cursor: Cursor, entry: LedgerEntry) -> None:
 
 def _record_acknowledgement(cursor: Cursor, entry: LedgerEntry, classification: Classification) -> None:
     """Store what the caller acknowledged for *entry*'s step: its risk and findings, at *entry*'s version."""
-    findings = [
-        {"risk": finding.risk.value, "statement": finding.statement, "reason": finding.reason}
-        for finding in classification.findings
-    ]
+    findings = [asdict(finding) for finding in classification.findings]  # a Risk is a StrEnum: written as its value
     cursor.execute(_INSERT_ACKNOWLEDGEMENT_SQL, (entry.version, classification.risk.value, json.dumps(findings)))
 
 
@@ -937,16 +933,17 @@ def _execute_step_outside_transaction(
 ) -> int:
     """Run the step's one statement with autocommit on; its duration in milliseconds.
 
-    Nothing is rolled back on a failure: a `failed` row is recorded, the invalid indexes of the database are
-    warned of and `StepFailed` is raised; when that row cannot be written, `CavernsError` is raised from the
-    database error. The caller holds Caverns' session lock.
+    Nothing is rolled back on a failure: the invalid indexes of the database are warned of, a `failed` row is
+    recorded and `StepFailed` is raised; when that row cannot be written, `CavernsError` is raised from the
+    database error (the warning is logged either way). The caller holds Caverns' session lock.
     """
     started = time.monotonic()
     try:
         with autocommit(connection, lock_timeout=lock_timeout) as cursor:
             cursor.execute(step.sql)
     except Exception as error:
-        failure = _record_failure(
+        _warn_of_invalid_indexes(connection, changeset, step)  # first: recording the failure may raise
+        raise _record_failure(
             connection,
             changeset,
             step,
@@ -956,9 +953,7 @@ def _execute_step_outside_transaction(
             lock_timeout=lock_timeout,
             acknowledgement=acknowledgement,
             drift=drift,
-        )
-        _warn_of_invalid_indexes(connection, changeset, step)
-        raise failure from error
+        ) from error
     return _elapsed_ms(started)
 
 
@@ -999,7 +994,7 @@ def _write_step_outside_transaction(
     The statement runs in autocommit between two transactions: the ledger read and the row write. The wait for
     the session lock follows *first* as in `_write_step`; the row's own lock is taken at once (this session holds
     the session lock) and without a timeout. A crash between the statement and its row leaves the effect without
-    a row.
+    a row, and so does a row that cannot be written: that raises `CavernsError` saying so.
     """
     step = status.step
     committed = f"step {step.label!r} of changeset {changeset.name!r} was recorded"
@@ -1017,18 +1012,25 @@ def _write_step_outside_transaction(
             acknowledgement=acknowledgement,
             drift=drift,
         )
-        with transaction(connection) as cursor:
-            lock(cursor, lock_timeout=lock_timeout, unbounded_wait=True)
-            return _record_row(
-                cursor,
-                changeset,
-                step,
-                _OUTCOME_APPLIED,
-                duration_ms=duration,
-                acknowledgement=acknowledgement,
-                with_fingerprint=consumer and last,
-                drift=drift,
-            )
+        try:
+            with transaction(connection) as cursor:
+                lock(cursor, lock_timeout=lock_timeout, unbounded_wait=True)
+                return _record_row(
+                    cursor,
+                    changeset,
+                    step,
+                    _OUTCOME_APPLIED,
+                    duration_ms=duration,
+                    acknowledgement=acknowledgement,
+                    with_fingerprint=consumer and last,
+                    drift=drift,
+                )
+        except Exception as error:
+            raise CavernsError(
+                f"step {step.label!r} of changeset {changeset.name!r} ran outside a transaction, but its ledger "
+                f"row could not be written: {error}; its effect stands without a row "
+                "(preflight reads it as unknown with a check, pending without)"
+            ) from error
 
 
 def _write_step(

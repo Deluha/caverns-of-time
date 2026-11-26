@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import reprlib
 from collections.abc import Collection, Iterator, Sequence
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from typing import Any, Protocol
 
 from caverns_of_time.errors import CavernsError, ChangesetError
@@ -323,9 +323,13 @@ def autocommit(connection: Connection, *, lock_timeout: float | None) -> Iterato
                 cur.execute(_SESSION_LOCK_TIMEOUT_SQL, (f"{_milliseconds(lock_timeout)}ms",))
             try:
                 yield cur
-            finally:
+            except BaseException:
                 if saved is not None:
-                    cur.execute(_SESSION_LOCK_TIMEOUT_SQL, (saved,))
+                    with suppress(Exception):  # the error already propagating matters more
+                        cur.execute(_SESSION_LOCK_TIMEOUT_SQL, (saved,))
+                raise
+            if saved is not None:
+                cur.execute(_SESSION_LOCK_TIMEOUT_SQL, (saved,))
     finally:
         connection.autocommit = False
 

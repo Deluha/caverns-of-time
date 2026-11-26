@@ -130,7 +130,11 @@ that fails leaves its partial effect (a failed `CREATE INDEX CONCURRENTLY` leave
 the watched schemas are in the failed row's fingerprint, which is read after the partial effect). Drop each with `DROP
 INDEX CONCURRENTLY`, which is then drift from that fingerprint, and apply the step again with `on_drift="warn"`. Give such
 a step a check: a crash between the statement and its row leaves the effect without a row, which preflight then reads
-as `unknown` with a check and as `pending` without one. The guard and the acknowledgement apply as for any step.
+as `unknown` with a check and as `pending` without one; so does a row that cannot be written (a runner role without the
+privilege on `caverns.acknowledgement`, say), which raises a `CavernsError` saying the step ran outside a transaction and
+its effect stands without a row. The invalid-index warning is logged before the failure is recorded, so it appears even
+when that record cannot be written. The guard and the acknowledgement apply as for any step, and a statement that cannot
+run inside a transaction (`CREATE INDEX CONCURRENTLY`) is supported through the `-- caverns:no-transaction` marker.
 
 *Lock timeout.* `lock_timeout` is the seconds one step's transaction waits for a lock its SQL needs, and the
 run bounds its wait for Caverns' lock until it has written a row: the transaction sets `lock_timeout` to it (transaction-local, so the
@@ -209,7 +213,8 @@ returns the same `StepStatus`. The refusals come in this order, all before anyth
 
 An acknowledged step is logged as a warning (`step <label> of changeset <name> runs acknowledged as <risk>`) before it
 runs and recorded in `caverns.acknowledgement`: one row, in the transaction of the step's own ledger row, whether that
-is its `applied` row or, when the step fails, its `failed` row (the failed attempt is acknowledged too). A step that another runner applied first is skipped and writes no acknowledgement.
+is its `applied` row or, when the step fails, its `failed` row (the failed attempt is acknowledged too). A step that
+another runner applied first is skipped and writes no acknowledgement.
 
 **The acknowledgement table.** `caverns.acknowledgement`, created by the own step `acknowledgement`, holds one row per
 acknowledged step that ran:
@@ -225,8 +230,7 @@ It is append-only like the ledger: triggers reject UPDATE, DELETE and TRUNCATE (
 generic trigger function the step creates and revokes from `PUBLIC` itself). It holds the classification, never the SQL.
 **Upgrade:** run `install()` once after upgrading, as the schema's owner; it applies `acknowledgement`. Until then
 `preflight`, `apply` and `baseline` raise `LedgerNotInstalled` (the own changeset is not fully applied), so a runner
-role cannot apply either: grant it the privilege above on `caverns.acknowledgement` after `install`. A statement that cannot run inside a transaction (`CREATE INDEX CONCURRENTLY`) is
-supported through the `-- caverns:no-transaction` marker (see the model and "A step outside a transaction").
+role cannot apply either: grant it the privilege above on `caverns.acknowledgement` after `install`.
 
 **The drift table.** `caverns.drift`, created by the own step `drift`, holds one row per run that proceeded past drift
 (`on_drift="warn"` and at least one difference):
@@ -336,13 +340,15 @@ risky statement or `ALTER TABLE` action, in statement order. `statement` is 1-ba
 `reason` is fixed keyword text (`DROP TABLE`, `ALTER COLUMN TYPE`), never text copied from the SQL, so a finding
 cannot leak a literal. A safe statement adds no finding; SQL with no statement at all (only comments, whitespace
 and semicolons) is `unknown` ("no statement"). It runs nothing, takes no connection and reads keywords, not a
-parse tree: a lexer skips comments (`--`, nested `/* */`) and reads `'...'`, `E'...'`, dollar-quoted strings and
-quoted identifiers, splits statements on the `;` outside parentheses and outside a `BEGIN ATOMIC ... END` body, read
+parse tree: a lexer skips comments (`--` to the next newline or carriage return, nested `/* */`) and reads `'...'`,
+`E'...'`, dollar-quoted strings and quoted identifiers (`U&"..."` is one, kept as written, so never a plain name),
+splits statements on the `;` outside parentheses and outside a `BEGIN ATOMIC ... END` body, read
 only in a statement that starts `CREATE [OR REPLACE] FUNCTION` or `PROCEDURE`, and splits `ALTER TABLE` actions on the
 commas outside parentheses. Whitespace is PostgreSQL's six characters (space, tab, newline, carriage return, form feed,
-vertical tab); every non-ASCII character is an identifier character; strings split by a newline (`'a'` newline `'b'`)
-are joined into one. A string is read as under `standard_conforming_strings = on`. An unterminated quote or comment, and a psql `\` command, make their statement
-`unknown`. Function and procedure bodies are strings and are not read.
+vertical tab); every non-ASCII character is an identifier character, and keywords and unquoted names fold ASCII letters
+only (`ä` is not `Ä`, a keyword spelled with `ı` or `ſ` is no keyword); strings split by a newline (`'a'` newline
+`'b'`) are joined into one. A string is read as under `standard_conforming_strings = on`. An unterminated quote or
+comment, and a psql `\` command, make their statement `unknown`. Function and procedure bodies are strings and are not read.
 
 | Risk | Statements |
 |---|---|
@@ -353,8 +359,12 @@ are joined into one. A string is read as under `standard_conforming_strings = on
 
 A table created earlier in the same SQL (`CREATE [TEMP|UNLOGGED|FOREIGN] TABLE`; `IF NOT EXISTS` does not count, as
 it may find an old table with data) is new and empty, so a later
-`CREATE INDEX` on it and any later `ALTER TABLE` of it are `safe` until an `ALTER ... RENAME TO` or `SET SCHEMA` (of any object) in the SQL, which may put an old table under a created name, ends the exemption. Names are compared as written, an unquoted name
-folded to lower case: `t` and `public.t` are different tables, so `public.t` after `CREATE TABLE t` is flagged.
+`CREATE INDEX` on it and any later `ALTER TABLE` of it are `safe` until an `ALTER ... RENAME TO`, a `SET SCHEMA` (of
+any object) or a `SET` or `RESET` statement in the SQL, which may put an old table under a created name or change what a
+name refers to, ends the exemption. An `ATTACH PARTITION` is the exception: it is a `lock_hazard` even on a created
+table, and it ends that table's exemption (the partition attached is an old table). Names are compared as written, an
+unquoted name folded to lower case: `t` and `public.t` are different tables, so `public.t` after `CREATE TABLE t` is
+flagged.
 
 `apply` uses `classify` as its guard (see "Nozdormu, the guard" above); the classifier itself never refuses anything.
 
@@ -489,8 +499,8 @@ VERSION  CHANGESET  LABEL     OUTCOME  RECORDED_AT (UTC)    BY
 `chromie status DIRECTORY [--changeset NAME]` loads the directory as a changeset (named after the directory unless
 `--changeset` says otherwise) and prints each step's status with the version of the ledger row that decided it
 (`-` when none) and its Murozond risk (`murozond.classify` of the step's SQL: `safe`, or the risk followed by its
-findings' distinct reasons, e.g. `destructive (DROP TABLE)`). Exit 0 when every step is `applied`, 1 when any is not (an error line lists them), 2 on a
-usage error such as a missing directory or a ledger that is not installed. `--format json` prints
+findings' distinct reasons, e.g. `destructive (DROP TABLE)`). Exit 0 when every step is `applied`, 1 when any is not
+(an error line lists them), 2 on a usage error such as a missing directory or a ledger that is not installed. `--format json` prints
 `{"changeset": ..., "steps": [{"label", "status", "version", "risk", "findings": [{"risk", "statement",
 "reason"}]}]}` (`findings` is `[]` for a safe step) with the same exit codes. After the summary line a warning
 lists the steps that would need an acknowledgement to apply: not `applied`, not `unknown` (accepting runs no SQL)
@@ -779,8 +789,9 @@ With nothing found: `✅ No drift — the live schema matches the fingerprint at
   `max_bytes` to match; copying in batches is not supported yet.
 - Murozond reads keywords, not a parse tree, and guards against mistakes, not SQL written to hide a statement from it:
   a construct it does not model is read by its leading keywords, and a `DO` block, a function body and dynamic SQL
-  are never read. A volatile `DEFAULT` on `ADD COLUMN` and
-  `SET ACCESS METHOD` rewrite a table and are not flagged.
+  are never read. Table rewrites and scans it does not flag: a volatile `DEFAULT` on `ADD COLUMN`, `ADD COLUMN ...
+  GENERATED ... AS IDENTITY` and `serial` (a volatile fill), `ADD COLUMN ... REFERENCES` with a default (a foreign-key
+  check scan), `ALTER COLUMN ... SET EXPRESSION AS` (PostgreSQL 17+) and `SET ACCESS METHOD`.
 - The drift check runs in its own transaction before the first step: drift made between it and the first step is not
   seen, and the run's fingerprint absorbs it unrecorded.
 - Murozond reads strings as with `standard_conforming_strings = on` (PostgreSQL's default); `apply` does not check the

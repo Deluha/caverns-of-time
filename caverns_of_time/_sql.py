@@ -10,10 +10,11 @@ from __future__ import annotations
 
 import enum
 import re
+import string
 from collections.abc import Iterator
 from dataclasses import dataclass
 
-__all__ = ["Kind", "Statement", "Token", "split"]
+__all__ = ["ASCII_WHITESPACE", "Kind", "Statement", "Token", "split"]
 
 # The reasons a statement is broken; Murozond reports them as its findings' reasons.
 UNTERMINATED = "unterminated quote or comment"
@@ -26,7 +27,12 @@ _DOLLAR_TAG = re.compile(r"\$(?:[A-Za-z_\x80-\U0010ffff][A-Za-z0-9_\x80-\U0010ff
 _STRING_PREFIXES = "BbEeNnXx"
 _PUNCTUATION = "(),;"
 # PostgreSQL's whitespace is these six characters; any other character, non-ASCII ones included, belongs to a name
-_WHITESPACE = " \t\n\r\f\v"
+ASCII_WHITESPACE = " \t\n\r\f\v"
+# PostgreSQL folds the case of ASCII letters only (A-Z), whatever the encoding; `ı` and `ſ` stay as they are
+_UPPER = str.maketrans(string.ascii_lowercase, string.ascii_uppercase)
+_LOWER = str.maketrans(string.ascii_uppercase, string.ascii_lowercase)
+# A `--` comment ends at the first newline or carriage return
+_LINE_COMMENT = re.compile(r"--[^\n\r]*")
 # What PostgreSQL joins two string literals with: a newline among spaces and `--` comments, then the next quote
 _CONTINUATION = re.compile(r"[ \t\f]*(?:--[^\n\r]*)?[\n\r](?:[ \t\n\r\f\v]|--[^\n\r]*[\n\r])*'")
 
@@ -52,8 +58,8 @@ class Token:
 
     @property
     def keyword(self) -> str:
-        """The upper-cased text of a word, else "" (a quoted identifier is never a keyword)."""
-        return self.text.upper() if self.kind is Kind.WORD else ""
+        """The text of a word with its ASCII letters upper-cased, else "" (a quoted identifier is never a keyword)."""
+        return self.text.translate(_UPPER) if self.kind is Kind.WORD else ""
 
     @property
     def is_dot(self) -> bool:
@@ -62,9 +68,9 @@ class Token:
 
     @property
     def identifier(self) -> str | None:
-        """The name a word or quoted identifier stands for (a word folded to lower case), else None."""
+        """The name a word or quoted identifier stands for (a word's ASCII letters folded to lower case), else None."""
         if self.kind is Kind.WORD:
-            return self.text.lower()
+            return self.text.translate(_LOWER)
         return self.text if self.kind is Kind.QUOTED else None
 
 
@@ -136,11 +142,10 @@ def _lex(sql: str) -> Iterator[tuple[Kind, str]]:
 def _scan(sql: str, pos: int) -> tuple[Kind | None, str, int]:
     """Read the token at *pos*: its kind (None for whitespace and comments), its text and where it ends."""
     ch = sql[pos]
-    if ch in _WHITESPACE:
+    if ch in ASCII_WHITESPACE:
         return None, "", pos + 1
-    if sql.startswith("--", pos):
-        end = sql.find("\n", pos)
-        return None, "", len(sql) if end < 0 else end
+    if comment := _LINE_COMMENT.match(sql, pos):
+        return None, "", comment.end()
     if sql.startswith("/*", pos):
         end = _comment_end(sql, pos)
         return (None, "", end) if end >= 0 else (Kind.BROKEN, UNTERMINATED, len(sql))
@@ -160,12 +165,17 @@ def _scan(sql: str, pos: int) -> tuple[Kind | None, str, int]:
 
 
 def _word(sql: str, start: int, end: int) -> tuple[Kind, str, int]:
-    """A word, or the string it prefixes (`E'..'`, `B'..'`, `U&'..'`), which is read as one string token."""
+    """A word, or the string or name it prefixes (`E'..'`, `B'..'`, `U&'..'`, `U&".."`), read as one token.
+
+    A `U&".."` name keeps its text as written, `U&` and quotes included, so it never equals a plain name.
+    """
     word = sql[start:end]
     if len(word) == 1 and sql.startswith("'", end) and word in _STRING_PREFIXES:
         return _closed(Kind.STRING, sql, start, _string_end(sql, end, backslash=word in "Ee"))
     if len(word) == 1 and word in "Uu" and sql.startswith("&'", end):
         return _closed(Kind.STRING, sql, start, _string_end(sql, end + 1, backslash=False))
+    if len(word) == 1 and word in "Uu" and sql.startswith('&"', end):
+        return _closed(Kind.QUOTED, sql, start, _quoted_end(sql, end + 1, '"', backslash=False))
     return Kind.WORD, word, end
 
 

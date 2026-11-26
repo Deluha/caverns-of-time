@@ -84,6 +84,7 @@ _COLUMN_HAZARDS = (
 )
 _TRANSACTION_CONTROL = ("BEGIN", "START", "COMMIT", "END", "ROLLBACK", "ABORT", "SAVEPOINT", "RELEASE", "PREPARE")
 _SAFE_LEADING = frozenset("INSERT UPDATE COPY GRANT REVOKE COMMENT SET RESET ANALYZE ANALYSE".split())
+_SETTINGS = frozenset({"SET", "RESET"})  # they may change what an unqualified name refers to
 # Statements whose leading keyword alone decides them.
 _FIXED: dict[str, Verdict] = {
     "TRUNCATE": (Risk.DESTRUCTIVE, "TRUNCATE"),
@@ -104,8 +105,9 @@ def classify(sql: str) -> Classification:
 
     A statement that cannot be read to its end, and SQL with no statement, are unknown. A table created earlier in
     the SQL (not by `IF NOT EXISTS`, which may find an old one) is new, so indexing or altering it later in the same
-    SQL is safe (names compared as written, so `t` and `public.t` differ) until an `ALTER ... RENAME TO` or
-    `SET SCHEMA` in the SQL, which may put an old table under a created name. Strings are read as in
+    SQL is safe (names compared as written, so `t` and `public.t` differ) until an `ALTER ... RENAME TO`, a
+    `SET SCHEMA`, or a `SET` or `RESET` statement in the SQL, which may put an old table under a created name; an
+    `ATTACH PARTITION` is never exempt and ends the exemption of its table. Strings are read as in
     `standard_conforming_strings = on`.
     """
     statements = split(sql)
@@ -133,6 +135,8 @@ def _verdicts(statement: Statement, created: set[Name]) -> list[Verdict]:
     if head in _FIXED:
         return [_FIXED[head]]
     if head in _SAFE_LEADING:
+        if head in _SETTINGS:
+            created.clear()
         return []
     handler = _HANDLERS.get(head)
     return handler(tokens, created) if handler else [(Risk.UNKNOWN, _UNRECOGNISED)]
@@ -224,17 +228,21 @@ def _alter(tokens: Sequence[Token], created: set[Name]) -> list[Verdict]:
 
 
 def _alter_table(tokens: Sequence[Token], created: set[Name]) -> list[Verdict]:
-    """ALTER [FOREIGN] TABLE: one verdict per risky action, none for a table created in the same SQL."""
+    """ALTER [FOREIGN] TABLE: one verdict per risky action; for a table created in the same SQL only ATTACH PARTITION
+    counts, and it ends the table's exemption (the partition attached is an old table)."""
     i = 3 if tokens[1].keyword == "FOREIGN" else 2
     if _at(tokens, i, "ALL", "IN"):
         return [(Risk.LOCK_HAZARD, "SET TABLESPACE")]
     i += 2 if _at(tokens, i, "IF", "EXISTS") else 0
     i += 1 if _at(tokens, i, "ONLY") else 0
     name, i = _name(tokens, i)
-    if name in created:
-        return []
     i += 1 if i < len(tokens) and tokens[i].text == "*" else 0
-    verdicts = (_table_action(action) for action in _split_commas(tokens[i:]))
+    actions = _split_commas(tokens[i:])
+    if name in created:
+        actions = [action for action in actions if _at(action, 0, "ATTACH", "PARTITION")]
+        if actions:
+            created.discard(name)
+    verdicts = (_table_action(action) for action in actions)
     return [verdict for verdict in verdicts if verdict]
 
 
@@ -253,8 +261,10 @@ def _table_action(action: Sequence[Token]) -> Verdict | None:
         return Risk.LOCK_HAZARD, f"SET {words[1]}"
     if head == "ATTACH" and words[1] == "PARTITION":
         return Risk.LOCK_HAZARD, "ATTACH PARTITION"
-    if head == "DETACH" and words[1] == "PARTITION" and not {"CONCURRENTLY", "FINALIZE"} & set(words):
-        return Risk.LOCK_HAZARD, "DETACH PARTITION without CONCURRENTLY"
+    if head == "DETACH" and words[1] == "PARTITION":
+        _, after = _name(action, 2)  # CONCURRENTLY and FINALIZE only count after the partition's name
+        if not {"CONCURRENTLY", "FINALIZE"} & set(words[after:]):
+            return Risk.LOCK_HAZARD, "DETACH PARTITION without CONCURRENTLY"
     return None
 
 

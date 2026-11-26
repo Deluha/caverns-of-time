@@ -2118,6 +2118,82 @@ def test_a_failing_non_transactional_step_is_recorded_and_warns_of_the_invalid_i
     _assert_outside_state_restored(ledger_conn, "7s")
 
 
+def _runner_owning_a_table(conn: Any, runner: str, grants: tuple[str, ...]) -> None:
+    """Install, create `nozdormu_test.t` (owned by *runner*, so it may index it) and become *runner* with *grants*."""
+    install(conn)
+    _run(
+        conn,
+        "CREATE SCHEMA nozdormu_test",
+        "CREATE TABLE nozdormu_test.t (id int)",
+        f"ALTER SCHEMA nozdormu_test OWNER TO {runner}",
+        f"ALTER TABLE nozdormu_test.t OWNER TO {runner}",
+        *(grant.format(role=runner) for grant in grants),
+        f"SET ROLE {runner}",
+    )
+
+
+def test_a_non_transactional_step_whose_row_cannot_be_written_raises_a_caverns_error(
+    ledger_conn: Any, roles: tuple[str, str, str]
+) -> None:
+    runner = roles[2]
+    without_acknowledgement = tuple(grant.replace("caverns.acknowledgement, ", "") for grant in RUNNER_GRANTS)
+    _runner_owning_a_table(ledger_conn, runner, without_acknowledgement)
+    indexed = Step("indexed", "-- caverns:no-transaction\nCREATE INDEX t_id_n ON nozdormu_test.t (id)")
+    with pytest.raises(CavernsError) as refused:
+        apply(ledger_conn, Changeset("app", [indexed]), acknowledge=["indexed"])
+    assert not isinstance(refused.value, StepFailed)
+    assert str(refused.value).startswith(
+        "step 'indexed' of changeset 'app' ran outside a transaction, but its ledger row could not be written: "
+    )
+    assert str(refused.value).endswith(
+        "; its effect stands without a row (preflight reads it as unknown with a check, pending without)"
+    )
+    assert isinstance(refused.value.__cause__, DRIVER_ERRORS)
+    _assert_outside_state_restored(ledger_conn)
+    _run(ledger_conn, "RESET ROLE")
+    assert _query(ledger_conn, "SELECT to_regclass('nozdormu_test.t_id_n') IS NOT NULL") == [(True,)]
+    assert _query(ledger_conn, APP_ROWS) == []
+
+
+def test_a_failed_non_transactional_step_that_cannot_be_recorded_still_warns_of_the_invalid_index(
+    ledger_conn: Any, roles: tuple[str, str, str], caplog: pytest.LogCaptureFixture
+) -> None:
+    _runner_owning_a_table(ledger_conn, roles[2], READ_ONLY_GRANTS)
+    _run(ledger_conn, "INSERT INTO nozdormu_test.t VALUES (1), (1)")
+    unique = Step("uniq", "-- caverns:no-transaction\nCREATE UNIQUE INDEX CONCURRENTLY t_uniq ON nozdormu_test.t (id)")
+    with caplog.at_level(logging.WARNING, logger="caverns_of_time.nozdormu"):
+        with pytest.raises(CavernsError, match="could not be recorded") as refused:
+            apply(ledger_conn, Changeset("app", [unique]))
+    assert not isinstance(refused.value, StepFailed)
+    warnings = [r.getMessage() for r in caplog.records if "failed outside a transaction" in r.getMessage()]
+    assert len(warnings) == 1
+    assert "nozdormu_test.t_uniq" in warnings[0]
+    _run(ledger_conn, "RESET ROLE")
+    assert _query(ledger_conn, APP_ROWS) == []
+
+
+def test_autocommit_restores_the_lock_timeout_and_lets_the_blocks_error_propagate(
+    ledger_conn: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class Boom(Exception):
+        pass
+
+    with pytest.raises(Boom):
+        with _connection.autocommit(ledger_conn, lock_timeout=1.0):
+            monkeypatch.setattr(_connection, "_SESSION_LOCK_TIMEOUT_SQL", "SELECT 1 / 0")  # the restore will fail
+            raise Boom
+    assert ledger_conn.autocommit is False
+
+
+def test_autocommit_raises_a_failed_restore_of_the_lock_timeout_when_the_block_succeeded(
+    ledger_conn: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with pytest.raises(DRIVER_ERRORS):
+        with _connection.autocommit(ledger_conn, lock_timeout=1.0):
+            monkeypatch.setattr(_connection, "_SESSION_LOCK_TIMEOUT_SQL", "SELECT 1 / 0")
+    assert ledger_conn.autocommit is False
+
+
 FREE_STEP = Step(
     "free",
     "-- caverns:no-transaction\nCREATE SCHEMA nozdormu_test",

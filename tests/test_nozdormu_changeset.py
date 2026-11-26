@@ -139,6 +139,11 @@ def test_a_non_transactional_step_holds_exactly_one_statement() -> None:
     assert Step("many", "VACUUM a; VACUUM b").transactional  # a transactional step may hold several
 
 
+def test_a_line_comment_ending_in_a_carriage_return_does_not_hide_a_second_statement() -> None:
+    with pytest.raises(ChangesetError, match="not 2"):
+        Step("two", "-- caverns:no-transaction\nCREATE INDEX CONCURRENTLY i ON t (a); -- x\rDROP TABLE v")
+
+
 def test_the_checksum_covers_the_marker() -> None:
     assert Step("x", NO_TX).checksum != Step("x", NO_TX.split("\n", 1)[1]).checksum
 

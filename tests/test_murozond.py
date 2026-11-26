@@ -605,3 +605,62 @@ def test_tokens_expose_keywords_and_identifiers() -> None:
     assert (word.keyword, word.identifier) == ("FOO", "foo")
     assert (quoted.keyword, quoted.identifier) == ("", "Bar")
     assert (string.keyword, string.identifier) == ("", None)
+
+
+# --- the lexer and exemption rules the final review tightened ----------------------------
+
+
+def test_a_line_comment_ends_at_a_carriage_return() -> None:
+    assert found("INSERT INTO t VALUES (1); -- note\rDROP TABLE victim;") == [(D, 2, "DROP TABLE")]
+
+
+def test_an_attach_partition_on_a_created_table_is_still_a_lock_hazard_and_ends_its_exemption() -> None:
+    sql = (
+        "CREATE TABLE p (a int) PARTITION BY RANGE (a); "
+        "ALTER TABLE p ATTACH PARTITION big FOR VALUES FROM (0) TO (10); CREATE INDEX ON p (a)"
+    )
+    assert found(sql) == [(L, 2, "ATTACH PARTITION"), (L, 3, "CREATE INDEX without CONCURRENTLY")]
+
+
+def test_a_partition_created_of_an_old_table_changes_nothing() -> None:
+    assert found("CREATE TABLE c PARTITION OF old FOR VALUES FROM (0) TO (10); CREATE INDEX ON c (a)") == []
+
+
+@pytest.mark.parametrize("statement", ["SET search_path = other", "RESET ALL", "SET LOCAL search_path TO other"])
+def test_a_set_or_reset_ends_the_created_table_exemption(statement: str) -> None:
+    sql = f"CREATE TABLE t (a int); {statement}; ALTER TABLE t DROP COLUMN a"
+    assert found(sql) == [(D, 3, "ALTER TABLE DROP COLUMN")]
+
+
+@pytest.mark.parametrize("partition", ["finalize", "concurrently"])
+def test_a_detach_of_a_partition_named_like_an_option_is_a_lock_hazard(partition: str) -> None:
+    assert found(f"ALTER TABLE p DETACH PARTITION {partition}") == [(L, 1, "DETACH PARTITION without CONCURRENTLY")]
+
+
+@pytest.mark.parametrize("option", ["CONCURRENTLY", "FINALIZE"])
+def test_a_detach_with_an_option_after_the_partition_name_is_safe(option: str) -> None:
+    assert found(f"ALTER TABLE p DETACH PARTITION x {option}") == []
+    assert found(f"ALTER TABLE p DETACH PARTITION s.x {option}") == []
+
+
+def test_a_unicode_escaped_identifier_is_one_token_and_never_a_plain_name() -> None:
+    assert found('CREATE TABLE U&"x" (a int); ALTER TABLE u DROP COLUMN a') == [(D, 2, "ALTER TABLE DROP COLUMN")]
+    assert found('CREATE TABLE u (a int); CREATE INDEX ON U&"victim" (a)') == [
+        (L, 2, "CREATE INDEX without CONCURRENTLY")
+    ]
+    assert found('CREATE TABLE u&"x" (a int); ALTER TABLE u DROP COLUMN a') == [(D, 2, "ALTER TABLE DROP COLUMN")]
+    (statement,) = _sql.split("CREATE TABLE U&\"d\\0061t\" UESCAPE '!'")
+    assert [(t.kind, t.text) for t in statement.tokens[2:]] == [
+        (_sql.Kind.QUOTED, 'U&"d\\0061t"'),
+        (_sql.Kind.WORD, "UESCAPE"),
+        (_sql.Kind.STRING, "'!'"),
+    ]
+
+
+def test_identifiers_fold_ascii_letters_only() -> None:
+    assert found("CREATE TABLE Ä (a int); ALTER TABLE ä DROP COLUMN a") == [(D, 2, "ALTER TABLE DROP COLUMN")]
+
+
+@pytest.mark.parametrize("sql", ["ınsert INTO t VALUES (1)", "ſelect 1", "drıp table t"])
+def test_keywords_fold_ascii_letters_only(sql: str) -> None:
+    assert found(sql) == [(U, 1, "unrecognised statement")]
