@@ -3,10 +3,10 @@
 ## Purpose & scope
 
 The importable package. It is generic: nothing here names a consumer or assumes a consumer's schema
-(hard rule 1). It holds the version, the shared exceptions, the console helpers and, so far, four
-components: Nozdormu, the migration ledger, Chromie, the command line, Infinite, the schema fingerprint, and
+(hard rule 1). It holds the version, the shared exceptions, the console helpers and, so far, five
+components: Nozdormu, the migration ledger, Chromie, the command line, Infinite, the schema fingerprint,
 Epochs, the snapshots of opted-in tables (their registry, the snapshot, the catalog, a table as of an epoch, the
-difference of two epochs and their deletion).
+difference of two epochs and their deletion), and Murozond, the classifier of destructive SQL.
 
 ## Files & entry points
 
@@ -16,10 +16,12 @@ difference of two epochs and their deletion).
 | `errors.py` | The exception types, all in one module |
 | `_connection.py` | Shared private plumbing, not a component: the `Connection` and `Cursor` protocols, the connection guard and the writable check (`check_connection`, `check_writable`), the transaction helpers, the advisory lock every Caverns write takes (`ADVISORY_LOCK_KEY`, `lock`; `session_lock` for a REPEATABLE READ `transaction`, whose failed release is a `CavernsError`) and its lock timeout (`DEFAULT_LOCK_TIMEOUT`, `set_lock_timeout`), the SQLSTATE reader `sqlstate`, the name, limit and lock timeout validation (`validate_name`, `validate_limit`, `validate_lock_timeout`), the pinned search path and settings (`pin_search_path`, `pin_output_settings`, `pin_definition_settings`), the one-statement check runner and the collection-of-names guard |
 | `_fingerprint.py` | Shared private fingerprint machinery, not a component: `Fingerprint`, the catalog queries, the document and its hash, the default, watched and missing schemas, `Difference`, `restrict` and `compare`, and the storage of fingerprints in `caverns.fingerprint` (`record`, `latest`) |
+| `_sql.py` | Shared private SQL reading, not a component: the lexer and the splitter of SQL text into statements of tokens (`split`, `Statement`, `Token`, `Kind`); no database access |
 | `console.py` | The console helpers: status lines with their icons, tables and JSON, the confirmation prompt (`confirm`, `interactive`); the only module that prints or reads |
 | `chromie.py` | Chromie: the `chromie` command's parsing, connection configuration and dispatch (command flow only) |
 | `nozdormu.py` | Nozdormu: the `Step` and `Changeset` model, the checksum, the loaders, the ledger, `install`, `preflight`, `history`, `apply` and `baseline`; it re-exports `Connection`, whose contract lives in `_connection.py` |
 | `infinite.py` | Infinite: `fingerprint` and the `Fingerprint` it returns, `drift` and the `Drift` and `Difference` it returns |
+| `murozond.py` | Murozond: `classify` and the `Classification`, `Finding` and `Risk` it returns; pure, no database and no Nozdormu import |
 | `epochs.py` | Epochs: the registry of tracked tables (`register`, `unregister`, `tracked`, `TrackedTable`) in `caverns.epoch_table`, `snapshot`, `catalog`, `as_of`, `diff`, `delete` and the `Epoch`, `EpochTable`, `Column`, `TableAt` and `EpochDiff` (with `TableDiff`, `ColumnChange`, `RowChange`) they return |
 
 ## How it works
@@ -227,6 +229,29 @@ apply run that writes ledger rows and per baseline:
 
 It is append-only like the ledger: triggers reject UPDATE, DELETE and TRUNCATE. Truncating the ledger is also
 refused, by the foreign key, unless it cascades, and then by the ledger's trigger.
+
+**Murozond, the classifier.** `murozond.classify(sql)` reads SQL text and returns a `Classification`: the worst
+`Risk` found (`destructive` > `lock_hazard` > `unknown` > `safe`) and a `Finding(risk, statement, reason)` for each
+risky statement or `ALTER TABLE` action, in statement order. `statement` is 1-based among the non-empty statements;
+`reason` is fixed keyword text (`DROP TABLE`, `ALTER COLUMN TYPE`), never text copied from the SQL, so a finding
+cannot leak a literal. A safe statement adds no finding; SQL with no statement at all (only comments, whitespace
+and semicolons) is `unknown` ("no statement"). It runs nothing, takes no connection and reads keywords, not a
+parse tree: a lexer skips comments (`--`, nested `/* */`) and reads `'...'`, `E'...'`, dollar-quoted strings and
+quoted identifiers, splits statements on the `;` outside parentheses and outside a `BEGIN ATOMIC ... END` body, and
+splits `ALTER TABLE` actions on the commas outside parentheses. A string is read as under
+`standard_conforming_strings = on`. An unterminated quote or comment, and a psql `\` command, make their statement
+`unknown`. Function and procedure bodies are strings and are not read.
+
+| Risk | Statements |
+|---|---|
+| `destructive` | every `DROP` (`IF EXISTS`, `DROP INDEX` and `DROP OWNED` included); `ALTER TABLE ... DROP [COLUMN]` and `DROP CONSTRAINT` (a column's `DROP DEFAULT`, `DROP NOT NULL`, `DROP EXPRESSION` and `DROP IDENTITY` are not); an `ALTER` of another object with a `DROP` action; `TRUNCATE`; `DELETE`; a `MERGE` with a `DELETE` |
+| `lock_hazard` | `CREATE [UNIQUE] INDEX` without `CONCURRENTLY`; `ADD CONSTRAINT` without `NOT VALID` (`PRIMARY KEY` or `UNIQUE ... USING INDEX` is safe); `ALTER COLUMN ... TYPE` and `SET DATA TYPE`; `SET NOT NULL`; `REINDEX` and `REFRESH MATERIALIZED VIEW` without `CONCURRENTLY`; `VACUUM FULL`; `CLUSTER`; `LOCK`; `SET TABLESPACE`; `SET LOGGED` and `SET UNLOGGED`; `ATTACH PARTITION`; `DETACH PARTITION` without `CONCURRENTLY`; `ADD COLUMN` with an inline `PRIMARY KEY`, `UNIQUE` or `GENERATED ... STORED` |
+| `unknown` | `DO`, `CALL`, `EXECUTE`, `SELECT`, `WITH`, `MERGE` without a `DELETE`, other `VACUUM`, transaction control, a statement that does not start with a word or starts with any other keyword, and a statement the lexer cannot read to its end |
+| `safe` | `INSERT`, `UPDATE`, `COPY`, `GRANT`, `REVOKE`, `COMMENT`, `SET`, `RESET`, `ANALYZE`; every other `CREATE`, including `CREATE [OR REPLACE] FUNCTION` and `PROCEDURE`; every other `ALTER`, such as a rename, an owner change, `VALIDATE CONSTRAINT`, `SET (...)` and `SET ACCESS METHOD` |
+
+A table created earlier in the same SQL (`CREATE [TEMP|UNLOGGED|FOREIGN] TABLE`) is new and empty, so a later
+`CREATE INDEX` on it and any later `ALTER TABLE` of it are `safe`. Names are compared as written, an unquoted name
+folded to lower case: `t` and `public.t` are different tables, so `public.t` after `CREATE TABLE t` is flagged.
 
 **Epochs, the registry.** Epochs are snapshots of opted-in tables, taken under a name and tagged with the ledger
 version; the opt-in registry is `caverns.epoch_table`. `register(connection, schema, table, *,
@@ -615,8 +640,12 @@ With nothing found: `✅ No drift — the live schema matches the fingerprint at
   `EpochTable(schema, table, key, columns, row_count)`: `key` a tuple of column names, `columns` a tuple of
   `Column(name, type)` in column order. All frozen.
 - `TrackedTable(schema, table, key, registered_at, registered_by)`: a frozen dataclass; `key` is a tuple of column names.
+- `murozond.classify(sql) -> Classification`: `Classification(risk, findings)`, a frozen dataclass of the worst
+  `Risk` (`safe`, `destructive`, `lock_hazard` or `unknown`, a `StrEnum` whose values are those strings) and a tuple
+  of `Finding(risk, statement, reason)` values (`risk` never `safe`, `statement` 1-based, `reason` fixed keyword
+  text), in statement order and then action order. It raises nothing for any text, runs no SQL and reads no database.
 - The public names are `Connection`, `LedgerEntry`, `Status`, `StepStatus`, `Step`, `Changeset`, `Fingerprint`,
-  `Difference`, `Drift`, `TrackedTable`, `Epoch`, `EpochTable`, `Column`, `TableAt`, `EpochDiff`, `TableDiff`, `ColumnChange`, `RowChange` and the functions above; the exceptions, all in `caverns_of_time.errors`, are
+  `Difference`, `Drift`, `Classification`, `Finding`, `Risk`, `TrackedTable`, `Epoch`, `EpochTable`, `Column`, `TableAt`, `EpochDiff`, `TableDiff`, `ColumnChange`, `RowChange` and the functions above; the exceptions, all in `caverns_of_time.errors`, are
   `CavernsError` (the base), `ChangesetError`, `LedgerNotInstalled`, `PreflightRefused`, `StepFailed`,
   `BaselineRefused`, `NoFingerprint`, `EpochRefused` and `EpochNotFound`.
 - The own changeset is never edited once released: a change to the ledger, the fingerprint table or the epoch
@@ -630,6 +659,9 @@ With nothing found: `✅ No drift — the live schema matches the fingerprint at
 - Steps and checks run under the session's `search_path`, not a pinned one: schema-qualify them.
 - A snapshot copies in one REPEATABLE READ transaction, so a very large table needs a quiet period and a
   `max_bytes` to match; copying in batches is not supported yet.
+- Murozond reads keywords, not a parse tree: a construct it does not model is read by its leading keywords, and a
+  `DO` block, a function body and dynamic SQL are never read. A volatile `DEFAULT` on `ADD COLUMN` and
+  `SET ACCESS METHOD` rewrite a table and are not flagged.
 - Logical replication of the `caverns` schema is unsupported: the ledger, fingerprint and epoch tables are not
   designed to be replicated, and a subscriber's copy is not a ledger Caverns can write.
 
