@@ -27,12 +27,14 @@ from caverns_of_time._connection import (
     MILLISECONDS,
     Connection,
     Cursor,
+    autocommit,
     check_connection,
     check_writable,
     lock,
     names,
     read_only,
     run_check,
+    session_lock,
     sqlstate,
     transaction,
     validate_limit,
@@ -54,6 +56,7 @@ from caverns_of_time._fingerprint import (
     watched_schemas,
 )
 from caverns_of_time._fingerprint import latest as latest_fingerprint
+from caverns_of_time._sql import split
 from caverns_of_time.errors import (
     BaselineRefused,
     CavernsError,
@@ -82,6 +85,8 @@ __all__ = [
 _log = logging.getLogger(__name__)
 
 _ASCII_WHITESPACE = " \t\n\r\f\v"
+# The first line of a step's SQL that makes it run outside a transaction (for `CREATE INDEX CONCURRENTLY`, `VACUUM`).
+_NO_TRANSACTION_MARKER = "-- caverns:no-transaction"
 _SQL_SUFFIX = ".sql"
 _CHECK_SUFFIX = ".check.sql"
 
@@ -93,13 +98,17 @@ _OUTCOME_ACCEPTED = "accepted"
 _OUTCOME_BASELINE = "baseline"
 
 
-def _checksum(sql: str) -> str:
-    """SHA-256 hex of the SQL as UTF-8, line endings normalised and the outer ASCII whitespace trimmed.
+def _normalised(sql: str) -> str:
+    """The SQL with line endings normalised and the outer ASCII whitespace trimmed.
 
     ASCII whitespace is space, tab, LF, CR, FF and VT; any other character, NBSP included, is kept.
     """
-    normalised = sql.replace("\r\n", "\n").replace("\r", "\n").strip(_ASCII_WHITESPACE)
-    return hashlib.sha256(normalised.encode("utf-8")).hexdigest()
+    return sql.replace("\r\n", "\n").replace("\r", "\n").strip(_ASCII_WHITESPACE)
+
+
+def _checksum(sql: str) -> str:
+    """SHA-256 hex of the normalised SQL as UTF-8."""
+    return hashlib.sha256(_normalised(sql).encode("utf-8")).hexdigest()
 
 
 def _read_text(path: Path) -> str:
@@ -115,6 +124,11 @@ class Step:
 
     A check is SQL returning exactly one row with one boolean column, true when the step's effect
     is already in the database. The checksum covers the SQL only.
+
+    A step whose SQL starts with the line `-- caverns:no-transaction` (after leading whitespace, case-sensitive,
+    trailing whitespace on that line ignored) is not `transactional`: `apply` runs it outside a transaction, for
+    a statement PostgreSQL refuses inside one (`CREATE INDEX CONCURRENTLY`, `VACUUM`). It must hold exactly one
+    statement (`ChangesetError` otherwise). The marker is part of the SQL, so the checksum covers it.
     """
 
     label: str
@@ -132,6 +146,10 @@ class Step:
                 raise ChangesetError(f"step {self.label!r} has a check that is not a string")
             if not self.check.strip():
                 raise ChangesetError(f"step {self.label!r} has an empty check")
+        if not self.transactional and (count := len(split(self.sql))) != 1:
+            raise ChangesetError(
+                f"step {self.label!r} runs outside a transaction and must hold exactly one statement, not {count}"
+            )
 
     @classmethod
     def from_file(cls, path: str | os.PathLike[str], *, label: str | None = None, check: str | None = None) -> Step:
@@ -143,6 +161,12 @@ class Step:
     def checksum(self) -> str:
         """SHA-256 hex of the normalised SQL."""
         return _checksum(self.sql)
+
+    @property
+    def transactional(self) -> bool:
+        """False when the SQL's first line is the `-- caverns:no-transaction` marker."""
+        first_line = _normalised(self.sql).split("\n", 1)[0]
+        return first_line.rstrip(_ASCII_WHITESPACE) != _NO_TRANSACTION_MARKER
 
 
 @dataclass(frozen=True)
@@ -443,6 +467,11 @@ _INSERT_ENTRY_SQL = (
     " VALUES (%s, %s, %s, %s, %s, %s, %s, %s) RETURNING version, changeset, label, checksum, outcome,"
     " fingerprint, error, duration_ms, recorded_at, recorded_by, caverns_version"
 )
+# Every invalid index of the database: what a failed `CREATE INDEX CONCURRENTLY` leaves behind.
+_INVALID_INDEXES_SQL = (
+    "SELECT n.nspname::text || '.' || c.relname::text FROM pg_index x JOIN pg_class c ON c.oid = x.indexrelid"
+    " JOIN pg_namespace n ON n.oid = c.relnamespace WHERE NOT x.indisvalid ORDER BY 1"
+)
 _INSERT_ACKNOWLEDGEMENT_SQL = "INSERT INTO caverns.acknowledgement (version, risk, findings) VALUES (%s, %s, %s::jsonb)"
 
 
@@ -689,19 +718,42 @@ def _record_failure(
             lock(cursor, lock_timeout=lock_timeout, unbounded_wait=True)
             if not _ledger_exists(cursor):
                 raise CavernsError("the ledger does not exist")
-            entry = _insert(
-                cursor, changeset.name, step, _OUTCOME_FAILED, error=_recorded_error(error), duration_ms=duration_ms
+            entry = _record_row(
+                cursor,
+                changeset,
+                step,
+                _OUTCOME_FAILED,
+                error=_recorded_error(error),
+                duration_ms=duration_ms,
+                acknowledgement=acknowledgement,
+                with_fingerprint=record_fingerprint,
             )
-            if acknowledgement is not None:
-                _record_acknowledgement(cursor, entry, acknowledgement)
-            if record_fingerprint:
-                _record_fingerprint(cursor, entry)
     except Exception as record_error:
         raise CavernsError(
             f"step {step.label!r} of changeset {changeset.name!r} failed and could not be recorded: {record_error}"
         ) from error
     _log.warning("step %s of changeset %s failed: ledger version %d", step.label, changeset.name, entry.version)
     return StepFailed(step.label, entry.version)
+
+
+def _record_row(
+    cursor: Cursor,
+    changeset: Changeset,
+    step: Step,
+    outcome: str,
+    *,
+    acknowledgement: Classification | None,
+    with_fingerprint: bool,
+    error: str | None = None,
+    duration_ms: int | None = None,
+) -> LedgerEntry:
+    """The one place a step's ledger row is written, with its acknowledgement and, when asked, the fingerprint."""
+    entry = _insert(cursor, changeset.name, step, outcome, error=error, duration_ms=duration_ms)
+    if acknowledgement is not None:
+        _record_acknowledgement(cursor, entry, acknowledgement)
+    if with_fingerprint:
+        _record_fingerprint(cursor, entry)
+    return entry
 
 
 def _record_fingerprint(cursor: Cursor, entry: LedgerEntry) -> None:
@@ -772,6 +824,130 @@ def _execute_step(
     return _elapsed_ms(started)
 
 
+def _invalid_indexes(connection: Connection) -> list[str]:
+    """Every invalid index of the database (a failed `CREATE INDEX CONCURRENTLY` leaves one), `schema.index`."""
+    with read_only(connection) as cursor:
+        cursor.execute(_INVALID_INDEXES_SQL)
+        return [row[0] for row in cursor.fetchall()]
+
+
+def _warn_of_invalid_indexes(connection: Connection, changeset: Changeset, step: Step) -> None:
+    """Warn of the invalid indexes a step that failed outside a transaction may have left; never raises."""
+    try:
+        invalid = _invalid_indexes(connection)
+    except Exception:
+        return  # the StepFailed matters more than the warning
+    if invalid:
+        _log.warning(
+            "step %s of changeset %s failed outside a transaction; invalid indexes in the database: %s; "
+            "drop each with DROP INDEX CONCURRENTLY before reapplying",
+            step.label,
+            changeset.name,
+            ", ".join(invalid),
+        )
+
+
+def _execute_step_outside_transaction(
+    connection: Connection,
+    changeset: Changeset,
+    step: Step,
+    *,
+    record_fingerprint: bool,
+    lock_timeout: float | None,
+    acknowledgement: Classification | None,
+) -> int:
+    """Run the step's one statement with autocommit on; its duration in milliseconds.
+
+    Nothing is rolled back on a failure: a `failed` row is recorded, the invalid indexes of the database are
+    warned of and `StepFailed` is raised; when that row cannot be written, `CavernsError` is raised from the
+    database error. The caller holds Caverns' session lock.
+    """
+    started = time.monotonic()
+    try:
+        with autocommit(connection, lock_timeout=lock_timeout) as cursor:
+            cursor.execute(step.sql)
+    except Exception as error:
+        failure = _record_failure(
+            connection,
+            changeset,
+            step,
+            error,
+            _elapsed_ms(started),
+            record_fingerprint=record_fingerprint,
+            lock_timeout=lock_timeout,
+            acknowledgement=acknowledgement,
+        )
+        _warn_of_invalid_indexes(connection, changeset, step)
+        raise failure from error
+    return _elapsed_ms(started)
+
+
+def _still_to_write(cursor: Cursor, changeset: Changeset, status: StepStatus) -> bool:
+    """Read the ledger again, under the lock: False when another runner applied the step since preflight.
+
+    A status that changed since preflight raises `PreflightRefused`; an `applied` one means the work is done.
+    """
+    current = _recheck(changeset, status, _read_entries(cursor, changeset.name))
+    if current.status is Status.APPLIED:
+        return False
+    if current.status is not status.status:
+        raise PreflightRefused([current])
+    return True
+
+
+def _warn_acknowledged(changeset: Changeset, step: Step, acknowledgement: Classification | None) -> None:
+    if acknowledgement is not None:
+        _log.warning(
+            "step %s of changeset %s runs acknowledged as %s", step.label, changeset.name, acknowledgement.risk
+        )
+
+
+def _write_step_outside_transaction(
+    connection: Connection,
+    changeset: Changeset,
+    status: StepStatus,
+    *,
+    record_fingerprint: bool,
+    first: bool,
+    last: bool,
+    lock_timeout: float | None,
+    acknowledgement: Classification | None,
+) -> LedgerEntry | None:
+    """Run a non-transactional step under Caverns' session lock, then record it; None when applied elsewhere.
+
+    The statement runs in autocommit between two transactions: the ledger read and the row write. The wait for
+    the session lock follows *first* as in `_write_step`; the row's own lock is taken at once (this session holds
+    the session lock) and without a timeout. A crash between the statement and its row leaves the effect without
+    a row.
+    """
+    step = status.step
+    committed = f"step {step.label!r} of changeset {changeset.name!r} was recorded"
+    with session_lock(connection, committed=committed, lock_timeout=lock_timeout, unbounded_wait=not first):
+        with transaction(connection) as cursor:
+            if not _still_to_write(cursor, changeset, status):
+                return None
+        _warn_acknowledged(changeset, step, acknowledgement)
+        duration = _execute_step_outside_transaction(
+            connection,
+            changeset,
+            step,
+            record_fingerprint=record_fingerprint,
+            lock_timeout=lock_timeout,
+            acknowledgement=acknowledgement,
+        )
+        with transaction(connection) as cursor:
+            lock(cursor, lock_timeout=lock_timeout, unbounded_wait=True)
+            return _record_row(
+                cursor,
+                changeset,
+                step,
+                _OUTCOME_APPLIED,
+                duration_ms=duration,
+                acknowledgement=acknowledgement,
+                with_fingerprint=record_fingerprint and last,
+            )
+
+
 def _write_step(
     connection: Connection,
     changeset: Changeset,
@@ -795,21 +971,29 @@ def _write_step(
     records a fingerprint with its `failed` row, and, when the step is the *last* of the run, so does
     its own row. A step run with an *acknowledgement* (its Murozond classification) writes the acknowledgement
     row in the same transaction as its `applied` or `failed` row; a step another runner applied first writes none.
+
+    A non-transactional step that runs (not an accepted one) takes `_write_step_outside_transaction`: its
+    statement runs outside any transaction and its row follows in a transaction of its own.
     """
     step = status.step
+    if outcome == _OUTCOME_APPLIED and not step.transactional:
+        return _write_step_outside_transaction(
+            connection,
+            changeset,
+            status,
+            record_fingerprint=record_fingerprint,
+            first=first,
+            last=last,
+            lock_timeout=lock_timeout,
+            acknowledgement=acknowledgement,
+        )
     with transaction(connection) as cursor:
         lock(cursor, lock_timeout=lock_timeout, unbounded_wait=not first)
-        current = _recheck(changeset, status, _read_entries(cursor, changeset.name))
-        if current.status is Status.APPLIED:
+        if not _still_to_write(cursor, changeset, status):
             return None
-        if current.status is not status.status:
-            raise PreflightRefused([current])
         duration = None
         if outcome == _OUTCOME_APPLIED:
-            if acknowledgement is not None:
-                _log.warning(
-                    "step %s of changeset %s runs acknowledged as %s", step.label, changeset.name, acknowledgement.risk
-                )
+            _warn_acknowledged(changeset, step, acknowledgement)
             duration = _execute_step(
                 connection,
                 changeset,
@@ -819,12 +1003,15 @@ def _write_step(
                 lock_timeout=lock_timeout,
                 acknowledgement=acknowledgement,
             )
-        entry = _insert(cursor, changeset.name, step, outcome, duration_ms=duration)
-        if acknowledgement is not None:
-            _record_acknowledgement(cursor, entry, acknowledgement)
-        if record_fingerprint and last:
-            _record_fingerprint(cursor, entry)
-        return entry
+        return _record_row(
+            cursor,
+            changeset,
+            step,
+            outcome,
+            duration_ms=duration,
+            acknowledgement=acknowledgement,
+            with_fingerprint=record_fingerprint and last,
+        )
 
 
 def _apply_statuses(
@@ -938,6 +1125,14 @@ def apply(
     written; one inside a step fails the step like any other error (`failed` row `55P03: ...`, `StepFailed`). Once
     the run has written a row, its later waits for Caverns' lock have no timeout, so that a run is never stopped
     between its rows and its fingerprint; the failure record's wait is never bounded, even before any row.
+
+    A step that is not `transactional` (its SQL starts with `-- caverns:no-transaction`) runs outside a
+    transaction, with autocommit on, under Caverns' session advisory lock (a direct connection or a session-mode
+    pooler is required) and *lock_timeout* as the session's lock timeout for its statement; its row, acknowledgement
+    and fingerprint follow in a transaction. A failure cannot be rolled back: it leaves the statement's partial
+    effect (an invalid index), records a `failed` row, raises `StepFailed` and logs a warning naming every invalid
+    index of the database, to drop with `DROP INDEX CONCURRENTLY` before reapplying. A crash between the statement
+    and its row leaves the effect without a row: give such a step a check.
 
     A standby or a read-only session is refused with `CavernsError`, nothing written.
     """

@@ -14,7 +14,7 @@ difference of two epochs and their deletion), and Murozond, the classifier of de
 |---|---|
 | `__init__.py` | `__version__`, read from the installed distribution's metadata |
 | `errors.py` | The exception types, all in one module |
-| `_connection.py` | Shared private plumbing, not a component: the `Connection` and `Cursor` protocols, the connection guard and the writable check (`check_connection`, `check_writable`), the transaction helpers, the advisory lock every Caverns write takes (`ADVISORY_LOCK_KEY`, `lock`; `session_lock` for a REPEATABLE READ `transaction`, whose failed release is a `CavernsError`) and its lock timeout (`DEFAULT_LOCK_TIMEOUT`, `set_lock_timeout`), the SQLSTATE reader `sqlstate`, the name, limit and lock timeout validation (`validate_name`, `validate_limit`, `validate_lock_timeout`), the pinned search path and settings (`pin_search_path`, `pin_output_settings`, `pin_definition_settings`), the one-statement check runner and the collection-of-names guard |
+| `_connection.py` | Shared private plumbing, not a component: the `Connection` and `Cursor` protocols, the connection guard and the writable check (`check_connection`, `check_writable`), the transaction helpers, the advisory lock every Caverns write takes (`ADVISORY_LOCK_KEY`, `lock`; `session_lock` for a REPEATABLE READ `transaction` or an `autocommit` statement, whose failed release is a `CavernsError`), `autocommit` (a cursor with autocommit on and a session `lock_timeout`, both restored, for a step that runs outside a transaction) and its lock timeout (`DEFAULT_LOCK_TIMEOUT`, `set_lock_timeout`), the SQLSTATE reader `sqlstate`, the name, limit and lock timeout validation (`validate_name`, `validate_limit`, `validate_lock_timeout`), the pinned search path and settings (`pin_search_path`, `pin_output_settings`, `pin_definition_settings`), the one-statement check runner and the collection-of-names guard |
 | `_fingerprint.py` | Shared private fingerprint machinery, not a component: `Fingerprint`, the catalog queries, the document and its hash, the default, watched and missing schemas, `Difference`, `restrict` and `compare`, and the storage of fingerprints in `caverns.fingerprint` (`record`, `latest`) |
 | `_sql.py` | Shared private SQL reading, not a component: the lexer and the splitter of SQL text into statements of tokens (`split`, `Statement`, `Token`, `Kind`); no database access |
 | `console.py` | The console helpers: status lines with their icons, tables and JSON, the confirmation prompt (`confirm`, `interactive`); the only module that prints or reads |
@@ -35,6 +35,13 @@ from a directory (`Changeset.from_directory`): every `*.sql` file of that direct
 sub-directories, is a step in file-name order, labelled with the file name minus `.sql`;
 `<label>.check.sql` is the check of the step `<label>.sql`. Other files are ignored. A step is also
 readable from one file (`Step.from_file`).
+
+A step whose SQL starts with the line `-- caverns:no-transaction` runs outside a transaction (for `CREATE INDEX
+CONCURRENTLY`, `REINDEX CONCURRENTLY`, `VACUUM`, `ALTER TYPE ... ADD VALUE` on a server that refuses it in a
+transaction). The marker is the first line after any leading ASCII whitespace, exactly that text (case-sensitive;
+trailing whitespace on the line is ignored), for a Python list and a file alike; `Step.transactional` is `False`
+for it. Such a step must hold exactly one statement (`ChangesetError` otherwise, counted by Caverns' SQL lexer;
+comments are not statements). The marker is part of the SQL, so the checksum covers it and the ledger is unchanged.
 
 **Nozdormu, the ledger.** Every recorded change is a row of `caverns.ledger`. Caverns creates it itself:
 `install(connection)` applies Caverns' own changeset (named `caverns`, six steps: `ledger`, then `fingerprint`,
@@ -108,6 +115,19 @@ step's own error. That happens when the failed step was Caverns' own `ledger` st
 that cannot create the schema), so there is no ledger to record into, or when the `failed` row cannot be
 written (a read-only session). A connection lost during a step raises the driver's error and records
 nothing. The rows written are returned and logged.
+
+*A step outside a transaction.* A step marked `-- caverns:no-transaction` runs differently: Caverns takes its
+advisory lock for the session (not the transaction), so the connection must be direct or behind a session-mode pooler
+(a transaction-mode pooler is refused when the release fails, as for a snapshot); reads the ledger again in a short
+transaction (a step applied meanwhile is skipped); runs the statement with autocommit on, under `lock_timeout` as the
+session's setting, which is put back afterwards, with autocommit switched off again whatever happens; then writes the
+row (with its fingerprint when it is the run's last, and its acknowledgement) in a transaction, and releases the
+lock, a release that fails raising a `CavernsError` that says the step was recorded. Nothing can be rolled back: a step
+that fails leaves its partial effect (a failed `CREATE INDEX CONCURRENTLY` leaves an invalid index), records a
+`failed` row and raises `StepFailed`, and Caverns logs a warning naming every invalid index in the database; drop each
+with `DROP INDEX CONCURRENTLY` before applying the step again. Give such a step a check: a crash between the statement
+and its row leaves the effect without a row, which preflight then reads as `unknown` with a check and as `pending`
+without one. The guard and the acknowledgement apply as for any step.
 
 *Lock timeout.* `lock_timeout` is the seconds one step's transaction waits for a lock its SQL needs, and the
 run bounds its wait for Caverns' lock until it has written a row: the transaction sets `lock_timeout` to it (transaction-local, so the
@@ -547,6 +567,8 @@ With nothing found: `✅ No drift — the live schema matches the fingerprint at
 - `Step(label, sql, check=None)`: the label is a non-empty single line without surrounding whitespace;
   the SQL is not blank. A check is SQL returning exactly one row with one boolean column, true when the
   step's effect is already present. `Step.from_file(path, *, label=None, check=None)` reads UTF-8 text.
+- `Step.transactional`: a read-only property, `False` when the SQL's first line is `-- caverns:no-transaction` (see
+  the model); such a step holds exactly one statement, else `ChangesetError`.
 - `Step.checksum`: the SHA-256 hex of the SQL as UTF-8 after line endings are normalised to `\n` and the
   whole text's leading and trailing ASCII whitespace (space, tab, LF, CR, FF, VT) is trimmed; any other
   character, a non-breaking space included, is kept. It covers the SQL only, not the label, the
@@ -704,6 +726,9 @@ With nothing found: `✅ No drift — the live schema matches the fingerprint at
 ## Known limitations
 
 - Caverns writes only to a primary: a standby (in recovery) and a read-only session are refused.
+- A step that runs outside a transaction (`-- caverns:no-transaction`) cannot be rolled back, and a crash between its
+  statement and its ledger row leaves the effect without a row: give it a check, so that preflight reads it as
+  `unknown`.
 - Steps and checks run under the session's `search_path`, not a pinned one: schema-qualify them.
 - A snapshot copies in one REPEATABLE READ transaction, so a very large table needs a quiet period and a
   `max_bytes` to match; copying in batches is not supported yet.

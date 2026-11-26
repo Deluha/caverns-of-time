@@ -2004,3 +2004,163 @@ def test_a_runner_role_with_the_documented_grants_records_an_acknowledgement(
     assert [e.label for e in apply(ledger_conn, Changeset("app", [PURGE]), acknowledge=["purge"])] == ["purge"]
     _run(ledger_conn, "RESET ROLE")
     assert [row[1] for row in _query(ledger_conn, ACKNOWLEDGEMENTS)] == ["destructive"]
+
+
+# --- steps that run outside a transaction --------------------------------------------------
+
+CONCURRENT_INDEX = Step(
+    "cindex", "-- caverns:no-transaction\nCREATE INDEX CONCURRENTLY t_id_c ON nozdormu_test.t (id)", check=None
+)
+CONCURRENT_APP = Changeset("app", [SCHEMA, TABLE, CONCURRENT_INDEX])
+UNIQUE_APP = Changeset(
+    "app",
+    [
+        SCHEMA,
+        TABLE,
+        Step("dups", "INSERT INTO nozdormu_test.t VALUES (1), (1)"),
+        Step("uniq", "-- caverns:no-transaction\nCREATE UNIQUE INDEX CONCURRENTLY t_uniq ON nozdormu_test.t (id)"),
+    ],
+)
+LOCK_TIMEOUT = "SELECT current_setting('lock_timeout')"
+HELD_ADVISORY_LOCKS = "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND pid = pg_backend_pid()"
+INDEX_VALID = "SELECT indisvalid FROM pg_index WHERE indexrelid = to_regclass(%s)"
+
+
+def _assert_outside_state_restored(conn: Any, lock_timeout: str = "0") -> None:
+    """The connection is as before a non-transactional step: autocommit off, lock_timeout back, no lock held."""
+    assert conn.autocommit is False
+    _assert_idle(conn)
+    assert _query(conn, LOCK_TIMEOUT) == [(lock_timeout,)]
+    assert _query(conn, HELD_ADVISORY_LOCKS) == [(0,)]
+
+
+def test_a_non_transactional_step_applies_and_leaves_the_connection_as_it_was(ledger_conn: Any) -> None:
+    install(ledger_conn)
+    _execute(ledger_conn, "SET lock_timeout = '7s'")
+    entries = apply(ledger_conn, CONCURRENT_APP)
+    assert [(e.label, e.outcome) for e in entries] == [
+        ("schema", "applied"),
+        ("table", "applied"),
+        ("cindex", "applied"),
+    ]
+    assert entries[2].duration_ms is not None
+    assert _query(ledger_conn, INDEX_VALID, ("nozdormu_test.t_id_c",)) == [(True,)]
+    assert [s.step.label for s in preflight(ledger_conn, CONCURRENT_APP) if s.status is Status.APPLIED] == [
+        "schema",
+        "table",
+        "cindex",
+    ]
+    _assert_outside_state_restored(ledger_conn, "7s")
+
+
+def test_a_non_transactional_step_runs_under_the_lock_timeout_of_the_call(ledger_conn: Any) -> None:
+    install(ledger_conn)
+    seen = Step(
+        "seen",
+        "-- caverns:no-transaction\nCREATE TABLE nozdormu_test.seen AS SELECT current_setting('lock_timeout') AS v",
+    )
+    apply(ledger_conn, Changeset("app", [SCHEMA, seen]), lock_timeout=2.5)
+    assert _query(ledger_conn, "SELECT v FROM nozdormu_test.seen") == [("2500ms",)]
+    _assert_outside_state_restored(ledger_conn)
+
+
+def test_a_non_transactional_step_that_is_last_records_the_fingerprint_at_its_row(ledger_conn: Any) -> None:
+    install(ledger_conn)
+    entries = apply(ledger_conn, CONCURRENT_APP)
+    stored = _query(ledger_conn, FINGERPRINT_ROWS)
+    assert [row[0] for row in stored] == [entries[-1].version]
+
+
+def test_the_marker_is_what_lets_a_concurrent_index_run(ledger_conn: Any) -> None:
+    install(ledger_conn)
+    plain = Step("cindex", CONCURRENT_INDEX.sql.split("\n", 1)[1])
+    with pytest.raises(StepFailed) as failed:
+        apply(ledger_conn, Changeset("app", [SCHEMA, TABLE, plain]))
+    row = _query(ledger_conn, "SELECT error FROM caverns.ledger WHERE version = %s", (failed.value.version,))
+    assert "cannot run inside a transaction block" in row[0][0]
+    entries = apply(ledger_conn, CONCURRENT_APP)  # the same statement behind the marker
+    assert [(e.label, e.outcome) for e in entries] == [("cindex", "applied")]
+    assert _query(ledger_conn, INDEX_VALID, ("nozdormu_test.t_id_c",)) == [(True,)]
+
+
+def test_a_failing_non_transactional_step_is_recorded_and_warns_of_the_invalid_index(
+    ledger_conn: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    install(ledger_conn)
+    _execute(ledger_conn, "SET lock_timeout = '7s'")
+    with caplog.at_level(logging.WARNING, logger="caverns_of_time.nozdormu"), pytest.raises(StepFailed) as failed:
+        apply(ledger_conn, UNIQUE_APP)
+    assert failed.value.label == "uniq"
+    rows = _query(ledger_conn, "SELECT outcome, error FROM caverns.ledger WHERE version = %s", (failed.value.version,))
+    assert rows[0][0] == "failed"
+    assert rows[0][1].startswith("23505: ")
+    assert _query(ledger_conn, INDEX_VALID, ("nozdormu_test.t_uniq",)) == [(False,)]  # no rollback: it stays
+    warnings = [r.getMessage() for r in caplog.records if "outside a transaction" in r.getMessage()]
+    assert len(warnings) == 1
+    assert warnings[0].startswith("step uniq of changeset app failed outside a transaction; invalid indexes")
+    assert "nozdormu_test.t_uniq" in warnings[0]
+    assert warnings[0].endswith("drop each with DROP INDEX CONCURRENTLY before reapplying")
+    stored = _query(ledger_conn, FINGERPRINT_ROWS)
+    assert [row[0] for row in stored] == [failed.value.version]
+    _assert_outside_state_restored(ledger_conn, "7s")
+
+
+def test_a_failed_non_transactional_step_can_be_fixed_and_applied(ledger_conn: Any) -> None:
+    install(ledger_conn)
+    with pytest.raises(StepFailed):
+        apply(ledger_conn, UNIQUE_APP)
+    _execute(ledger_conn, "DROP INDEX nozdormu_test.t_uniq")
+    _execute(ledger_conn, "DELETE FROM nozdormu_test.t WHERE id = 1")
+    entries = apply(ledger_conn, UNIQUE_APP)
+    assert [(e.label, e.outcome) for e in entries] == [("uniq", "applied")]
+    assert _query(ledger_conn, INDEX_VALID, ("nozdormu_test.t_uniq",)) == [(True,)]
+
+
+def test_a_risky_non_transactional_step_needs_an_acknowledgement_and_records_it(ledger_conn: Any) -> None:
+    install(ledger_conn)
+    vacuum = Step("vacuum", "-- caverns:no-transaction\nVACUUM FULL nozdormu_test.t")
+    changeset = Changeset("app", [SCHEMA, TABLE, vacuum])
+    with pytest.raises(GuardRefused, match=r"vacuum \(lock_hazard: VACUUM FULL\)"):
+        apply(ledger_conn, changeset)
+    entries = apply(ledger_conn, changeset, acknowledge=["vacuum"])
+    assert [(e.label, e.outcome) for e in entries] == [
+        ("schema", "applied"),
+        ("table", "applied"),
+        ("vacuum", "applied"),
+    ]
+    assert [row[:2] for row in _query(ledger_conn, ACKNOWLEDGEMENTS)] == [(entries[2].version, "lock_hazard")]
+    _assert_outside_state_restored(ledger_conn)
+
+
+def test_a_non_transactional_step_another_runner_applied_first_writes_nothing(
+    ledger_conn: Any, second_conn: Any
+) -> None:
+    _applied_prefix(ledger_conn)
+    fingerprints = _query(ledger_conn, FINGERPRINT_ROWS)
+    stale = preflight(ledger_conn, CONCURRENT_APP)
+    _record(second_conn, CONCURRENT_INDEX)  # the other runner's row
+    entries = nozdormu._apply_statuses(
+        ledger_conn, CONCURRENT_APP, stale, frozenset(), frozenset(), record_fingerprint=True
+    )
+    assert entries == []
+    assert _query(ledger_conn, APP_ROWS) == [("schema", "applied"), ("table", "applied"), ("cindex", "applied")]
+    assert _query(ledger_conn, "SELECT to_regclass('nozdormu_test.t_id_c') IS NULL") == [(True,)]
+    assert _query(ledger_conn, FINGERPRINT_ROWS) == fingerprints
+    _assert_outside_state_restored(ledger_conn)
+
+
+def test_a_changeset_mixes_transactional_and_non_transactional_steps_in_order(ledger_conn: Any) -> None:
+    install(ledger_conn)
+    after = Step("after", "CREATE TABLE nozdormu_test.after (id int)")
+    changeset = Changeset("app", [SCHEMA, TABLE, CONCURRENT_INDEX, after])
+    entries = apply(ledger_conn, changeset)
+    assert [(e.label, e.outcome) for e in entries] == [
+        ("schema", "applied"),
+        ("table", "applied"),
+        ("cindex", "applied"),
+        ("after", "applied"),
+    ]
+    assert [e.version for e in entries] == sorted(e.version for e in entries)
+    assert [row[0] for row in _query(ledger_conn, FINGERPRINT_ROWS)] == [entries[-1].version]
+    assert _exists(ledger_conn, "nozdormu_test.after")
+    _assert_outside_state_restored(ledger_conn)

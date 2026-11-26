@@ -88,6 +88,72 @@ def test_checksum_encodes_as_utf8() -> None:
     assert Step("x", "SELECT 'é'").checksum == hashlib.sha256("SELECT 'é'".encode()).hexdigest()
 
 
+# --- non-transactional steps -------------------------------------------------------------
+
+NO_TX = "-- caverns:no-transaction\nCREATE INDEX CONCURRENTLY i ON t (id)"
+
+
+def test_a_step_is_transactional_without_the_marker() -> None:
+    assert Step("x", SQL).transactional
+    assert not Step("x", NO_TX).transactional
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "\n\n  \t-- caverns:no-transaction\nVACUUM",
+        "-- caverns:no-transaction   \t\nVACUUM",
+        "-- caverns:no-transaction\r\nVACUUM",
+        "-- caverns:no-transaction\nVACUUM -- one statement and a comment\n",
+        "-- caverns:no-transaction\n/* a comment */ VACUUM;",
+    ],
+)
+def test_the_marker_makes_a_step_non_transactional(sql: str) -> None:
+    assert not Step("x", sql).transactional
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT 1;\n-- caverns:no-transaction\nVACUUM",
+        "-- a comment\n-- caverns:no-transaction\nVACUUM",
+        "-- Caverns:No-Transaction\nVACUUM",
+        "-- caverns:no-transaction please\nVACUUM",
+        "--caverns:no-transaction\nVACUUM",
+        "-- caverns:no-transaction-x\nVACUUM",
+        "\u00a0-- caverns:no-transaction\nVACUUM",
+        "/* caverns:no-transaction */ VACUUM",
+    ],
+)
+def test_a_marker_that_is_not_the_first_line_exactly_does_not_count(sql: str) -> None:
+    assert Step("x", sql).transactional
+
+
+def test_a_non_transactional_step_holds_exactly_one_statement() -> None:
+    with pytest.raises(ChangesetError) as refused:
+        Step("two", "-- caverns:no-transaction\nVACUUM a; VACUUM b")
+    assert str(refused.value) == "step 'two' runs outside a transaction and must hold exactly one statement, not 2"
+    with pytest.raises(ChangesetError, match="not 0"):
+        Step("none", "-- caverns:no-transaction")
+    assert Step("ok", "-- caverns:no-transaction\nVACUUM a; -- done\n").label == "ok"
+    assert Step("many", "VACUUM a; VACUUM b").transactional  # a transactional step may hold several
+
+
+def test_the_checksum_covers_the_marker() -> None:
+    assert Step("x", NO_TX).checksum != Step("x", NO_TX.split("\n", 1)[1]).checksum
+
+
+def test_from_directory_reads_the_marker(tmp_path: Path) -> None:
+    _write(tmp_path, {"a.sql": "SELECT 1;", "b.sql": NO_TX})
+    steps = Changeset.from_directory("app", tmp_path).steps
+    assert [(s.label, s.transactional) for s in steps] == [("a", True), ("b", False)]
+
+
+def test_from_file_reads_the_marker(tmp_path: Path) -> None:
+    _write(tmp_path, {"b.sql": NO_TX})
+    assert not Step.from_file(tmp_path / "b.sql").transactional
+
+
 # --- Step.from_file ----------------------------------------------------------------------
 
 
