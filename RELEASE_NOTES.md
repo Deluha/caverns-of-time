@@ -14,11 +14,12 @@ What a second review found in Phases 1–3, fixed before new components:
 - A `failed` row's `error` is the SQLSTATE and the primary message (`<SQLSTATE>: <message>`), no longer the whole
   error: step SQL must not carry secrets.
 - `apply(..., lock_timeout=5.0)` and `epochs.snapshot(..., lock_timeout=5.0)`: a wait for a lock gives up after
-  5 seconds (`None` keeps the session's own setting); a timeout waiting for Caverns' lock before the run wrote a row is a
-  `CavernsError`, nothing written. Once the run has written a row its later waits for Caverns' lock (the failure
-  record's included) have no timeout, so a run is never stopped between its rows and its fingerprint.
-- Privileges: `install` refuses a `caverns` schema or relation owned by a role the current role is not a member of
-  that inherits its privileges, and the new own step `privileges` revokes every privilege of `PUBLIC` on the schema, its tables, sequences and
+  5 seconds; the run bounds its wait for Caverns' lock until it has written a row (a timeout is a `CavernsError`,
+  nothing written), then its later waits for it have no timeout, so a run is never stopped between its rows and its
+  fingerprint. The failure record's wait is never bounded, even before any row; every step's own lock waits are
+  bounded. With `None`, every wait is left to the session's own `lock_timeout`.
+- Privileges: `install` refuses a `caverns` schema or relation owned by a role whose privileges the current role does not
+  inherit, and the new own step `privileges` revokes every privilege of `PUBLIC` on the schema, its tables, sequences and
   functions. The grants a runner role needs are documented; the append-only triggers guard against mistakes, not
   against the schema's owner or a superuser.
 - Every write is refused with a `CavernsError` on a standby and in a read-only session. A failed release of the

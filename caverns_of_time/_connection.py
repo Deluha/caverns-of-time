@@ -204,7 +204,7 @@ def sqlstate(error: BaseException) -> str | None:
 
 
 def _milliseconds(seconds: float) -> int:
-    return max(1, round(seconds * MILLISECONDS))
+    return round(seconds * MILLISECONDS)
 
 
 def _set_lock_timeout_setting(cursor: Cursor, value: str) -> None:

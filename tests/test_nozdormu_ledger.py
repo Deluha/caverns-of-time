@@ -289,8 +289,8 @@ def test_install_refuses_a_schema_owned_by_a_role_the_caller_is_not_a_member_of(
     with pytest.raises(CavernsError) as refused:
         install(ledger_conn)
     assert str(refused.value) == (
-        f"schema caverns is owned by role {owner}, of which role {stranger} is not a member: "
-        f"run install as {owner} or a member of it"
+        f"schema caverns is owned by role {owner}, whose privileges role {stranger} does not inherit: "
+        f"run install as {owner} or a member that inherits its privileges"
     )
     _assert_idle(ledger_conn)
     _run(ledger_conn, "RESET ROLE")
@@ -304,7 +304,7 @@ def test_install_refuses_a_relation_owned_by_a_role_the_caller_is_not_a_member_o
     _run(ledger_conn, f"CREATE SCHEMA caverns AUTHORIZATION {member}", "CREATE TABLE caverns.stray (id int)")
     _run(ledger_conn, f"SET ROLE {member}")
     with pytest.raises(
-        CavernsError, match="relation caverns.stray is owned by role .*, of which role .* is not a member"
+        CavernsError, match="relation caverns.stray is owned by role .*, whose privileges role .* does not inherit"
     ):
         install(ledger_conn)
     _run(ledger_conn, "RESET ROLE")
@@ -325,8 +325,8 @@ def test_install_refuses_an_owner_whose_privileges_the_caller_does_not_inherit(
     with pytest.raises(CavernsError) as refused:
         install(ledger_conn)
     assert str(refused.value) == (
-        f"schema caverns is owned by role {owner}, of which role {stranger} is not a member: "
-        f"run install as {owner} or a member of it"
+        f"schema caverns is owned by role {owner}, whose privileges role {stranger} does not inherit: "
+        f"run install as {owner} or a member that inherits its privileges"
     )
     _assert_idle(ledger_conn)
     _run(ledger_conn, "RESET ROLE")
@@ -1236,14 +1236,58 @@ def test_a_later_steps_own_lock_wait_is_still_bounded(ledger_conn: Any, second_c
     )
     with second_conn.cursor() as cursor:
         cursor.execute("LOCK TABLE nozdormu_test.t IN ACCESS EXCLUSIVE MODE")
-    try:
-        with pytest.raises(StepFailed) as failed:
+    outcome: dict[str, Any] = {}
+
+    def run() -> None:
+        try:
             apply(ledger_conn, reading, lock_timeout=0.2)
+        except BaseException as error:  # reported below
+            outcome["error"] = error
+
+    runner = threading.Thread(target=run, daemon=True)
+    runner.start()
+    try:
+        runner.join(WAIT_SECONDS)
+        hung = runner.is_alive()
     finally:
-        second_conn.rollback()
-    assert _connection.sqlstate(failed.value.__cause__) == "55P03"  # type: ignore[arg-type]
+        second_conn.rollback()  # releases the table, so a hung run ends
+        runner.join(WAIT_SECONDS)
+    assert not hung, "the step's own lock wait was not bounded"
+    failed = outcome.get("error")
+    assert isinstance(failed, StepFailed)
+    assert _connection.sqlstate(failed.__cause__) == "55P03"  # type: ignore[arg-type]
     rows = _query(ledger_conn, "SELECT label, outcome FROM caverns.ledger WHERE changeset = 'app' ORDER BY version")
     assert rows[-2:] == [("noop", "applied"), ("read", "failed")]  # `read` is the run's second step
+
+
+def test_the_wait_after_a_skipped_first_step_is_still_bounded(
+    ledger_conn: Any, second_conn: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A first planned step already applied by the time it is written writes no row: the next wait is bounded."""
+    install(ledger_conn)
+    statuses = preflight(ledger_conn, APP)
+    apply(ledger_conn, Changeset("app", [SCHEMA]))  # another runner got there first
+    real = nozdormu._write_step
+    calls: list[str] = []
+
+    def write(*args: Any, **kwargs: Any) -> Any:
+        entry = real(*args, **kwargs)
+        calls.append(args[2].step.label)
+        if len(calls) == 1:
+            assert entry is None  # skipped: nothing written
+            _hold_caverns_lock(second_conn)
+        return entry
+
+    monkeypatch.setattr(nozdormu, "_write_step", write)
+    try:
+        with pytest.raises(CavernsError, match=r"advisory lock: gave up waiting after 0\.2 seconds"):
+            nozdormu._apply_statuses(
+                ledger_conn, APP, statuses, frozenset(), frozenset(), record_fingerprint=True, lock_timeout=0.2
+            )
+    finally:
+        _release_caverns_lock(second_conn)
+    assert calls == ["schema"]  # the second call raised while waiting
+    assert _query(ledger_conn, APP_ROWS) == [("schema", "applied")]
 
 
 def test_a_lock_timeout_that_is_not_valid_is_refused_before_anything_runs(ledger_conn: Any) -> None:

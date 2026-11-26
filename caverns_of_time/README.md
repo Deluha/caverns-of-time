@@ -53,7 +53,7 @@ itself (a test asserts that `PUBLIC` can execute no function of `caverns` after 
 privileges. Only the schema's owner and the roles it grants to can use the ledger afterwards. Before applying
 anything `install` also refuses, with a `CavernsError` and nothing written, a `caverns` schema, or a relation in it,
 owned by a role the current role is not a member of that inherits its privileges (`schema caverns is owned by role
-alice, of which role bob is not a member: run install as alice or a member of it`; a member granted `WITH INHERIT
+alice, whose privileges role bob does not inherit: run install as alice or a member that inherits its privileges`; a member granted `WITH INHERIT
 FALSE` is refused too, as it cannot `REVOKE` or `ALTER`); a schema owned by a role the current role is a member of
 that inherits its privileges is accepted. The grants a role needs to run `apply`, `baseline`, `register`, `unregister`, `snapshot` and
 `delete` (it need not own anything, and an identity sequence needs no grant of its own):
@@ -108,15 +108,15 @@ written (a read-only session). A connection lost during a step raises the driver
 nothing. The rows written are returned and logged.
 
 *Lock timeout.* `lock_timeout` is the seconds one step's transaction waits for a lock its SQL needs, and the
-run waits for Caverns' lock until it has written a row: the transaction sets `lock_timeout` to it (transaction-local, so the
+run bounds its wait for Caverns' lock until it has written a row: the transaction sets `lock_timeout` to it (transaction-local, so the
 session's own setting is untouched afterwards) before it takes Caverns' advisory lock, and the step's SQL runs under
 it. It is `5.0` by default; a number from 0.001 s to 2147483.647 s (rounded to milliseconds; a smaller or larger
 one, NaN, infinity or an int too large for a float is refused), else `ChangesetError`; `None` leaves the session's own `lock_timeout` in force. A timeout on such a wait for
 Caverns' lock (another Caverns run holds it) raises `CavernsError` naming the lock, with the transaction rolled back
-and nothing written. Once the run has committed a step, its later waits for Caverns' lock, and the one that
-records a failure, have no timeout (`lock_timeout` is set after the lock is held), so a run is never stopped between
-its rows and its fingerprint, and a `failed` row is never lost to a busy lock; the waits of every step's own SQL
-stay bounded. A timeout inside a step fails the step like any other error: rolled back, a `failed` row whose error
+and nothing written. Once the run has written a row, its later waits for Caverns' lock have no timeout
+(`lock_timeout` is set after the lock is held), so a run is never stopped between its rows and its fingerprint; the
+failure record's wait is never bounded, even before any row, so a `failed` row is never lost to a busy lock. The waits
+of every step's own SQL stay bounded. With `None`, every wait is left to the session's own `lock_timeout`. A timeout inside a step fails the step like any other error: rolled back, a `failed` row whose error
 is `55P03: <message>` and `StepFailed`, the step `pending` again. `install` follows the same rule, with the fixed
 default; `baseline`, `register`, `unregister` and `delete` always use the default too, and take no parameter.
 
@@ -540,7 +540,7 @@ With nothing found: `✅ No drift — the live schema matches the fingerprint at
   `chromie log --limit` takes 0 to the same maximum.
 - `apply(connection, changeset, *, reapply=(), accept=(), lock_timeout=5.0) -> list[LedgerEntry]`: the rows written, in order
   (`[]` when nothing is to do). A bare string for `reapply` or `accept`, a label in both, or a `lock_timeout` that is not
-  `None` or a positive number (a `bool` is not one) is a `ChangesetError`; a wait for Caverns' lock that times out before the run wrote a row is a `CavernsError`, nothing written.
+  `None` or a number from 0.001 to 2147483.647 (a `bool` is not one) is a `ChangesetError`; a wait for Caverns' lock that times out before the run wrote a row is a `CavernsError`, nothing written.
   Raises `PreflightRefused` (attribute `statuses`, the offending steps), `StepFailed` (attributes `label`
   and `version`, the failed row's ledger version; its `__cause__` is the driver's error), a plain
   `CavernsError` (its `__cause__` is the step's error) when a failed step cannot be recorded, and the

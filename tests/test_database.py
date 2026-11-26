@@ -12,6 +12,7 @@ import psycopg
 import pytest
 
 from dev_tools.database import DEFAULT_DSN, IMAGE, POSTGRES_MAJOR
+from tests import conftest
 from tests.conftest import (
     DSN_VARIABLE,
     REQUIRE_DB_VARIABLE,
@@ -84,24 +85,29 @@ def test_local_hosts_are_accepted(host: str) -> None:
     assert non_local_target(f"postgresql://u:p@{host}/x") is None
 
 
-ROLES_LEFT = "SELECT count(*) FROM pg_roles WHERE rolname LIKE 'caverns_test_%'"
+ROLES_LEFT = "SELECT count(*) FROM pg_roles WHERE rolname = ANY(%s)"
 
 
-def _roles_left(conn: Any) -> int:
+def _roles_left(conn: Any, names: tuple[str, ...]) -> int:
+    """How many of the roles *names* (the ones the test made) exist; another run's roles are not counted."""
     with conn.cursor() as cursor:
-        cursor.execute(ROLES_LEFT)
+        cursor.execute(ROLES_LEFT, (list(names),))
         (count,) = cursor.fetchone()
     conn.commit()
     return int(count)
 
 
-def test_throwaway_roles_are_dropped_and_a_failed_create_leaks_none(ledger_conn: Any) -> None:
+def test_throwaway_roles_are_dropped_and_a_failed_create_leaks_none(
+    ledger_conn: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
     with throwaway_roles(ledger_conn, ("a", "NOLOGIN"), ("b", "NOLOGIN")) as made:
-        assert len(made) == 2 and _roles_left(ledger_conn) == 2
-    assert _roles_left(ledger_conn) == 0
+        assert len(made) == 2 and _roles_left(ledger_conn, made) == 2
+    assert _roles_left(ledger_conn, made) == 0
+    monkeypatch.setattr(conftest.secrets, "token_hex", lambda _: "feedface")  # known names, to look for them
+    names = ("caverns_test_a_feedface", "caverns_test_b_feedface")
     with pytest.raises(Exception, match="NOTAN"), throwaway_roles(ledger_conn, ("a", "NOLOGIN"), ("b", "NOTAN")):
         pytest.fail("the second role cannot be created")
-    assert _roles_left(ledger_conn) == 0  # the first was dropped, and the original error was not masked
+    assert _roles_left(ledger_conn, names) == 0  # the first was dropped, and the original error was not masked
 
 
 @pytest.mark.parametrize("variable", ["PGHOSTADDR", "PGSERVICE", "PGSERVICEFILE"])

@@ -785,16 +785,16 @@ def _apply_statuses(
 def _require_owned(cursor: Cursor) -> None:
     """Refuse (`CavernsError`) the own schema or a relation in it that the current role neither owns nor inherits.
 
-    The message says "not a member" for brevity: a role that is a member without inheriting the owner's privileges
-    is refused too, as it cannot change what the owner owns.
+    A role that is a member without inheriting the owner's privileges is refused too, as it cannot change what the
+    owner owns.
     """
     cursor.execute(_FOREIGN_OWNER_SQL)
     row = cursor.fetchone()
     if row is not None:
         description, owner, current = row
         raise CavernsError(
-            f"{description} is owned by role {owner}, of which role {current} is not a member: "
-            f"run install as {owner} or a member of it"
+            f"{description} is owned by role {owner}, whose privileges role {current} does not inherit: "
+            f"run install as {owner} or a member that inherits its privileges"
         )
 
 
@@ -836,12 +836,12 @@ def apply(
     last row (a failed step's `failed` row included); before its first step it logs a warning per difference
     between the live watched schemas and the latest recorded fingerprint.
 
-    *lock_timeout* is the seconds each step's transaction waits for a lock its SQL needs, and the first step's
-    for Caverns' advisory lock (None keeps the session's own `lock_timeout`; a number must be positive, 1 ms or
-    more). The first wait for Caverns' lock that times out raises `CavernsError`, nothing written; one inside a
-    step fails the step like any other error (`failed` row `55P03: ...`, `StepFailed`). Once the run has
-    written a row, its later waits for Caverns' lock, the failure record's included, have no timeout, so that a
-    run is never stopped between its rows and its fingerprint.
+    *lock_timeout* is the seconds each step's transaction waits for a lock its SQL needs, and the run's for
+    Caverns' advisory lock until the run has written a row (None keeps the session's own `lock_timeout`; a number
+    must be positive, 1 ms or more). The first wait for Caverns' lock that times out raises `CavernsError`, nothing
+    written; one inside a step fails the step like any other error (`failed` row `55P03: ...`, `StepFailed`). Once
+    the run has written a row, its later waits for Caverns' lock have no timeout, so that a run is never stopped
+    between its rows and its fingerprint; the failure record's wait is never bounded, even before any row.
 
     A standby or a read-only session is refused with `CavernsError`, nothing written.
     """
