@@ -126,10 +126,11 @@ session's setting, which is put back afterwards, with autocommit switched off ag
 row (with its fingerprint when it is the run's last, and its acknowledgement) in a transaction, and releases the
 lock, a release that fails raising a `CavernsError` that says the step was recorded. Nothing can be rolled back: a step
 that fails leaves its partial effect (a failed `CREATE INDEX CONCURRENTLY` leaves an invalid index), records a
-`failed` row and raises `StepFailed`, and Caverns logs a warning naming every invalid index in the database; drop each
-with `DROP INDEX CONCURRENTLY` before applying the step again. Give such a step a check: a crash between the statement
-and its row leaves the effect without a row, which preflight then reads as `unknown` with a check and as `pending`
-without one. The guard and the acknowledgement apply as for any step.
+`failed` row and raises `StepFailed`, and Caverns logs a warning naming every invalid index in the database (the
+failed row's fingerprint is read after the partial effect, so it holds them). Drop each with `DROP INDEX
+CONCURRENTLY`, which is then drift from that fingerprint, and apply the step again with `on_drift="warn"`. Give such
+a step a check: a crash between the statement and its row leaves the effect without a row, which preflight then reads
+as `unknown` with a check and as `pending` without one. The guard and the acknowledgement apply as for any step.
 
 *Lock timeout.* `lock_timeout` is the seconds one step's transaction waits for a lock its SQL needs, and the
 run bounds its wait for Caverns' lock until it has written a row: the transaction sets `lock_timeout` to it (transaction-local, so the
@@ -348,7 +349,8 @@ splits `ALTER TABLE` actions on the commas outside parentheses. A string is read
 | `unknown` | `DO`, `CALL`, `EXECUTE`, `SELECT`, `WITH`, `MERGE` without a `DELETE`, other `VACUUM`, transaction control, a statement that does not start with a word or starts with any other keyword, and a statement the lexer cannot read to its end |
 | `safe` | `INSERT`, `UPDATE`, `COPY`, `GRANT`, `REVOKE`, `COMMENT`, `SET`, `RESET`, `ANALYZE`; every other `CREATE`, including `CREATE [OR REPLACE] FUNCTION` and `PROCEDURE`; every other `ALTER`, such as a rename, an owner change, `VALIDATE CONSTRAINT`, `SET (...)` and `SET ACCESS METHOD` |
 
-A table created earlier in the same SQL (`CREATE [TEMP|UNLOGGED|FOREIGN] TABLE`) is new and empty, so a later
+A table created earlier in the same SQL (`CREATE [TEMP|UNLOGGED|FOREIGN] TABLE`; `IF NOT EXISTS` does not count, as
+it may find an old table with data) is new and empty, so a later
 `CREATE INDEX` on it and any later `ALTER TABLE` of it are `safe`. Names are compared as written, an unquoted name
 folded to lower case: `t` and `public.t` are different tables, so `public.t` after `CREATE TABLE t` is flagged.
 
@@ -778,6 +780,11 @@ With nothing found: `✅ No drift — the live schema matches the fingerprint at
   `SET ACCESS METHOD` rewrite a table and are not flagged.
 - The drift check runs in its own transaction before the first step: drift made between it and the first step is not
   seen, and the run's fingerprint absorbs it unrecorded.
+- Murozond reads strings as with `standard_conforming_strings = on` (PostgreSQL's default); `apply` does not check the
+  setting, and with it off a backslash in a plain string can hide a statement from the classifier.
+- A run stopped between its rows and its last row (killed, connection lost) leaves the latest fingerprint older than
+  the ledger; the next `apply` then reads the run's own effect as drift and refuses by default: check `chromie
+  drift`, then apply once with `on_drift="warn"`.
 - Logical replication of the `caverns` schema is unsupported: the ledger, fingerprint and epoch tables are not
   designed to be replicated, and a subscriber's copy is not a ledger Caverns can write.
 

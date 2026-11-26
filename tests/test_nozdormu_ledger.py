@@ -2109,10 +2109,49 @@ def test_a_failing_non_transactional_step_is_recorded_and_warns_of_the_invalid_i
     assert len(warnings) == 1
     assert warnings[0].startswith("step uniq of changeset app failed outside a transaction; invalid indexes")
     assert "nozdormu_test.t_uniq" in warnings[0]
-    assert warnings[0].endswith("drop each with DROP INDEX CONCURRENTLY before reapplying")
+    assert warnings[0].endswith(
+        "drop each with DROP INDEX CONCURRENTLY, then reapply with on_drift='warn' "
+        "(the failed row's fingerprint holds them)"
+    )
     stored = _query(ledger_conn, FINGERPRINT_ROWS)
     assert [row[0] for row in stored] == [failed.value.version]
     _assert_outside_state_restored(ledger_conn, "7s")
+
+
+FREE_STEP = Step(
+    "free",
+    "-- caverns:no-transaction\nCREATE SCHEMA nozdormu_test",
+    check="SELECT to_regnamespace('nozdormu_test') IS NOT NULL",
+)
+
+
+def test_a_non_transactional_first_step_gives_up_waiting_for_caverns_lock(ledger_conn: Any, second_conn: Any) -> None:
+    install(ledger_conn)
+    _hold_caverns_lock(second_conn)
+    try:
+        started = time.monotonic()
+        with pytest.raises(CavernsError, match=r"advisory lock: gave up waiting after 0\.2 seconds"):
+            apply(ledger_conn, Changeset("app", [FREE_STEP]), lock_timeout=0.2)
+        assert time.monotonic() - started < WAIT_SECONDS
+    finally:
+        _release_caverns_lock(second_conn)
+    _assert_idle(ledger_conn)
+    assert _query(ledger_conn, APP_ROWS) == []
+    assert not _exists(ledger_conn, "nozdormu_test")
+
+
+def test_a_non_transactional_step_whose_lock_release_returns_false_raises_a_caverns_error(ledger_conn: Any) -> None:
+    """What a transaction-mode pooler does: the unlock reaches a session that never held the lock."""
+    install(ledger_conn)
+    unlock = Step("unlock", f"-- caverns:no-transaction\nSELECT pg_advisory_unlock({_connection.ADVISORY_LOCK_KEY})")
+    with pytest.raises(CavernsError, match="the lock was not held") as failed:
+        apply(ledger_conn, Changeset("app", [unlock]), acknowledge=["unlock"])
+    assert str(failed.value) == (
+        "step 'unlock' of changeset 'app' was recorded, but releasing Caverns' advisory lock failed "
+        "(the lock was not held): Caverns needs a direct connection or a session-mode pooler, "
+        "not a transaction-mode one"
+    )
+    assert _query(ledger_conn, APP_ROWS) == [("unlock", "applied")]  # the step stands, as the message says
 
 
 def test_a_failed_non_transactional_step_can_be_fixed_and_applied(ledger_conn: Any) -> None:

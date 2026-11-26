@@ -73,6 +73,7 @@ _OBJECT_TYPES = tuple(
 _HARMLESS_DROPS = frozenset({"DEFAULT", "NOT", "EXPRESSION", "IDENTITY"})
 _CONSTRAINT_STARTS = frozenset({"CONSTRAINT", "CHECK", "FOREIGN", "PRIMARY", "UNIQUE", "EXCLUDE"})
 _CREATE_MODIFIERS = frozenset({"GLOBAL", "LOCAL", "TEMP", "TEMPORARY", "UNLOGGED", "UNIQUE", "FOREIGN"})
+_OFF_VALUES = frozenset({"FALSE", "OFF", "0"})  # values that turn a boolean option off
 _SET_HAZARDS = frozenset({"TABLESPACE", "LOGGED", "UNLOGGED"})
 # `ADD COLUMN` definitions that build an index or rewrite the table: the phrase and its reason.
 _COLUMN_HAZARDS = (
@@ -101,8 +102,9 @@ def classify(sql: str) -> Classification:
     """Classify the SQL: the worst risk of its statements and one finding per risky statement or ALTER action.
 
     A statement that cannot be read to its end, and SQL with no statement, are unknown. A table created earlier in
-    the SQL is new, so indexing or altering it later in the same SQL is safe (names compared as written, so `t` and
-    `public.t` differ). Strings are read as in `standard_conforming_strings = on`.
+    the SQL (not by `IF NOT EXISTS`, which may find an old one) is new, so indexing or altering it later in the same
+    SQL is safe (names compared as written, so `t` and `public.t` differ). Strings are read as in
+    `standard_conforming_strings = on`.
     """
     statements = split(sql)
     created: set[Name] = set()
@@ -143,7 +145,12 @@ def _merge(tokens: Sequence[Token], _created: set[Name]) -> list[Verdict]:
 
 
 def _reindex(tokens: Sequence[Token], _created: set[Name]) -> list[Verdict]:
-    return [] if _has(tokens, "CONCURRENTLY") else [(Risk.LOCK_HAZARD, "REINDEX without CONCURRENTLY")]
+    for i, token in enumerate(tokens):
+        if token.keyword == "CONCURRENTLY":
+            value = tokens[i + 1].text.strip("'").upper() if i + 1 < len(tokens) else ""
+            if token.depth == 0 or value not in _OFF_VALUES:  # `(CONCURRENTLY off)` turns it off
+                return []
+    return [(Risk.LOCK_HAZARD, "REINDEX without CONCURRENTLY")]
 
 
 def _refresh(tokens: Sequence[Token], _created: set[Name]) -> list[Verdict]:
@@ -166,8 +173,8 @@ def _create(tokens: Sequence[Token], created: set[Name]) -> list[Verdict]:
     kind = tokens[i].keyword if i < len(tokens) else ""
     if kind == "INDEX":
         return _create_index(tokens[i + 1 :], created)
-    if kind == "TABLE":
-        name, _ = _name(tokens, i + (4 if _at(tokens, i + 1, "IF", "NOT", "EXISTS") else 1))
+    if kind == "TABLE" and not _at(tokens, i + 1, "IF", "NOT", "EXISTS"):  # IF NOT EXISTS may find an old table
+        name, _ = _name(tokens, i + 1)
         if name:
             created.add(name)
     return []
@@ -239,7 +246,7 @@ def _alter_column(words: list[str]) -> Verdict | None:
 
 def _add(action: Sequence[Token], words: list[str]) -> Verdict | None:
     """`ADD ...`: a table constraint needs NOT VALID (or an existing index), a column must not build one."""
-    if words[1] in _CONSTRAINT_STARTS:
+    if words[1] in _CONSTRAINT_STARTS or words[1:3] == ["NOT", "NULL"]:  # `ADD NOT NULL a` (PostgreSQL 18)
         # USING INDEX TABLESPACE is a storage option of a new index, not an existing one
         existing_index = _has(action, "USING", "INDEX", top=True) and not _has(action, "USING", "INDEX", "TABLESPACE")
         keyed = bool({"PRIMARY", "UNIQUE"} & set(words))

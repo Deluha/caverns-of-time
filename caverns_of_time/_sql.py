@@ -3,7 +3,7 @@
 Input: SQL text. Output: its statements, each a tuple of tokens (words, quoted identifiers, string literals,
 punctuation and other characters, with comments and whitespace dropped) and, for a statement the lexer cannot
 read to its end, the reason. Nothing is run and no database is touched. Not public: Murozond classifies the
-statements, and Nozdormu will count them. Contract: `caverns_of_time/README.md`.
+statements, and it counts them (a step is one statement). Contract: `caverns_of_time/README.md`.
 """
 
 from __future__ import annotations
@@ -19,8 +19,9 @@ __all__ = ["Kind", "Statement", "Token", "split"]
 UNTERMINATED = "unterminated quote or comment"
 META_COMMAND = "psql meta-command"
 
-_WORD = re.compile(r"[A-Za-z_\x80-￿][A-Za-z0-9_$\x80-￿]*")
-_DOLLAR_TAG = re.compile(r"\$(?:[A-Za-z_\x80-￿][A-Za-z0-9_\x80-￿]*)?\$")  # `$1` is a parameter, not a tag
+# PostgreSQL accepts every high-bit byte in a name, so every non-ASCII code point is a letter; `$` continues a word
+_WORD = re.compile(r"[A-Za-z_\x80-\U0010ffff][A-Za-z0-9_$\x80-\U0010ffff]*")
+_DOLLAR_TAG = re.compile(r"\$(?:[A-Za-z_\x80-\U0010ffff][A-Za-z0-9_\x80-\U0010ffff]*)?\$")  # `$1` is no tag
 # String prefixes written directly before the quote: only E turns backslash escapes on (B, X, N and U& do not).
 _STRING_PREFIXES = "BbEeNnXx"
 _PUNCTUATION = "(),;"
@@ -93,12 +94,17 @@ def split(sql: str) -> list[Statement]:
             parens += 1
         if atomic:
             atomic += (token.keyword == "CASE") - (token.keyword == "END")
-        elif token.keyword == "ATOMIC" and tokens and tokens[-1].keyword == "BEGIN":
-            atomic = 1
+        elif token.keyword == "ATOMIC" and parens == 0 and tokens and tokens[-1].keyword == "BEGIN":
+            atomic = _defines_routine(tokens)
         tokens.append(token)
     if tokens or broken:
         statements.append(Statement(tuple(tokens), broken))
     return statements
+
+
+def _defines_routine(tokens: list[Token]) -> int:
+    """1 when the statement so far is a `CREATE ... FUNCTION` or `PROCEDURE` (only that has a `BEGIN ATOMIC` body)."""
+    return int(tokens[0].keyword == "CREATE" and any(t.keyword in ("FUNCTION", "PROCEDURE") for t in tokens))
 
 
 def _lex(sql: str) -> Iterator[tuple[Kind, str]]:

@@ -492,7 +492,7 @@ _INSERT_ENTRY_SQL = (
 )
 # Every invalid index of the database: what a failed `CREATE INDEX CONCURRENTLY` leaves behind.
 _INVALID_INDEXES_SQL = (
-    "SELECT n.nspname::text || '.' || c.relname::text FROM pg_index x JOIN pg_class c ON c.oid = x.indexrelid"
+    "SELECT format('%I.%I', n.nspname, c.relname) FROM pg_index x JOIN pg_class c ON c.oid = x.indexrelid"
     " JOIN pg_namespace n ON n.oid = c.relnamespace WHERE NOT x.indisvalid ORDER BY 1"
 )
 _INSERT_ACKNOWLEDGEMENT_SQL = "INSERT INTO caverns.acknowledgement (version, risk, findings) VALUES (%s, %s, %s::jsonb)"
@@ -755,11 +755,12 @@ def _record_failure(
     The wait for Caverns' lock has no timeout: the run has a failure to record, and losing the row would leave
     the ledger silent about it. *lock_timeout* bounds the waits after it.
 
-    With *consumer* the transaction also stores the fingerprint of the database as the steps before the failed one
-    left it, with an *acknowledgement* (the step ran acknowledged) the acknowledgement row and with a *drift* (the
-    run's first row) the drift record. Raises `CavernsError` from *error* when the failure cannot be recorded:
-    the ledger does not exist (the failed step was its own) or writing the row fails (a read-only
-    session). The transaction is rolled back either way, so no fingerprint is recorded then.
+    With *consumer* the transaction also stores the fingerprint of the database as the failure left it (for a step
+    outside a transaction that includes its partial effect, an invalid index), with an *acknowledgement* (the step
+    ran acknowledged) the acknowledgement row and with a *drift* (the run's first row) the drift record. Raises
+    `CavernsError` from *error* when the failure cannot be recorded: the ledger does not exist (the failed step was
+    its own) or writing the row fails (a read-only session). The transaction is rolled back either way, so no
+    fingerprint is recorded then.
     """
     try:
         with transaction(connection) as cursor:
@@ -916,7 +917,8 @@ def _warn_of_invalid_indexes(connection: Connection, changeset: Changeset, step:
     if invalid:
         _log.warning(
             "step %s of changeset %s failed outside a transaction; invalid indexes in the database: %s; "
-            "drop each with DROP INDEX CONCURRENTLY before reapplying",
+            "drop each with DROP INDEX CONCURRENTLY, then reapply with on_drift='warn' "
+            "(the failed row's fingerprint holds them)",
             step.label,
             changeset.name,
             ", ".join(invalid),
@@ -1228,7 +1230,8 @@ def apply(
     pooler is required) and *lock_timeout* as the session's lock timeout for its statement; its row, acknowledgement
     and fingerprint follow in a transaction. A failure cannot be rolled back: it leaves the statement's partial
     effect (an invalid index), records a `failed` row, raises `StepFailed` and logs a warning naming every invalid
-    index of the database, to drop with `DROP INDEX CONCURRENTLY` before reapplying. A crash between the statement
+    index of the database, to drop with `DROP INDEX CONCURRENTLY` before reapplying with `on_drift="warn"` (the
+    failed row's fingerprint holds them, so dropping them is drift from it). A crash between the statement
     and its row leaves the effect without a row: give such a step a check.
 
     A standby or a read-only session is refused with `CavernsError`, nothing written.

@@ -148,6 +148,10 @@ def test_merge_without_delete_is_unknown() -> None:
         ("ALTER TABLE t DETACH PARTITION p", "DETACH PARTITION without CONCURRENTLY"),
         ("REINDEX TABLE t", "REINDEX without CONCURRENTLY"),
         ("REINDEX (VERBOSE) INDEX i", "REINDEX without CONCURRENTLY"),
+        ("REINDEX (CONCURRENTLY false) TABLE t", "REINDEX without CONCURRENTLY"),
+        ("REINDEX (VERBOSE, CONCURRENTLY off) TABLE t", "REINDEX without CONCURRENTLY"),
+        ("REINDEX (CONCURRENTLY 0) TABLE t", "REINDEX without CONCURRENTLY"),
+        ("ALTER TABLE t ADD NOT NULL a", "ADD CONSTRAINT without NOT VALID"),
         ("REFRESH MATERIALIZED VIEW v", "REFRESH MATERIALIZED VIEW without CONCURRENTLY"),
         ("VACUUM FULL t", "VACUUM FULL"),
         ("VACUUM (FULL, ANALYZE) t", "VACUUM FULL"),
@@ -186,6 +190,11 @@ def test_lock_hazards(sql: str, reason: str) -> None:
         "ALTER TABLE t DETACH PARTITION p FINALIZE",
         "REINDEX TABLE CONCURRENTLY t",
         "REINDEX (CONCURRENTLY) TABLE t",
+        "REINDEX (CONCURRENTLY true) TABLE t",
+        "REINDEX (CONCURRENTLY on) TABLE t",
+        "REINDEX TABLE CONCURRENTLY off",
+        "ALTER TABLE t ADD NOT NULL a NOT VALID",
+        "ALTER TABLE t ADD COLUMN c int NOT NULL DEFAULT 0",
         "REFRESH MATERIALIZED VIEW CONCURRENTLY v",
     ],
 )
@@ -197,8 +206,19 @@ def test_a_table_created_earlier_in_the_sql_is_new() -> None:
     sql = "CREATE TABLE s.t (a int); CREATE INDEX i ON s.t (a); ALTER TABLE s.t ADD b int PRIMARY KEY, DROP COLUMN a"
     assert found(sql) == []
     assert found("CREATE TABLE t (a int); CREATE INDEX i ON ONLY t (a); ALTER TABLE ONLY t ADD CHECK (a > 0)") == []
-    assert found('CREATE TEMP TABLE IF NOT EXISTS "T" (a int); ALTER TABLE "T" ALTER a SET NOT NULL') == []
+    assert found('CREATE TEMP TABLE "T" (a int); ALTER TABLE "T" ALTER a SET NOT NULL') == []
     assert found("CREATE FOREIGN TABLE f (a int) SERVER s; ALTER FOREIGN TABLE f DROP COLUMN a") == []
+
+
+def test_create_table_if_not_exists_does_not_make_a_table_new() -> None:
+    # the table may already exist with data
+    assert found('CREATE TEMP TABLE IF NOT EXISTS "T" (a int); ALTER TABLE "T" ALTER a SET NOT NULL') == [
+        (L, 2, "SET NOT NULL")
+    ]
+    drop = "CREATE TABLE IF NOT EXISTS public.orders (id int); ALTER TABLE public.orders DROP COLUMN legacy"
+    assert found(drop) == [(D, 2, "ALTER TABLE DROP COLUMN")]
+    index = "CREATE TABLE IF NOT EXISTS public.orders (id int); CREATE INDEX ON public.orders (id)"
+    assert found(index) == [(L, 2, "CREATE INDEX without CONCURRENTLY")]
 
 
 def test_a_table_created_later_does_not_exempt_an_earlier_statement() -> None:
@@ -386,6 +406,20 @@ def test_a_word_containing_a_dollar_is_one_word() -> None:
     assert found("CREATE TABLE a$b (a int); CREATE INDEX i ON a$b (a)") == []
 
 
+def test_a_non_ascii_character_is_part_of_a_dollar_tag() -> None:
+    assert found("CREATE FUNCTION f() RETURNS void LANGUAGE sql AS $😀$'$😀$; DROP TABLE x; -- '") == [
+        (D, 2, "DROP TABLE")
+    ]
+
+
+def test_a_dollar_after_a_non_ascii_identifier_character_is_part_of_the_identifier() -> None:
+    # PostgreSQL reads `x😀$a$` as one identifier, so no dollar quote opens
+    assert found("INSERT INTO t SELECT 1 AS x😀$a$; DROP TABLE y; SELECT $a$") == [
+        (D, 2, "DROP TABLE"),
+        (U, 3, "unterminated quote or comment"),  # the last `$a$` opens a dollar quote of its own
+    ]
+
+
 def test_semicolons_inside_parentheses_do_not_split() -> None:
     assert found("INSERT INTO t VALUES (1; DROP TABLE t)") == []
 
@@ -405,6 +439,12 @@ def test_a_begin_atomic_body_is_one_statement() -> None:
 def test_statements_after_a_begin_atomic_body_are_read() -> None:
     sql = "CREATE PROCEDURE p() BEGIN ATOMIC SELECT 1; END; DROP TABLE t"
     assert found(sql) == [(D, 2, "DROP TABLE")]
+
+
+def test_begin_atomic_outside_a_routine_definition_does_not_open_a_body() -> None:
+    assert found("INSERT INTO t SELECT begin atomic FROM s; DROP TABLE x") == [(D, 2, "DROP TABLE")]
+    assert len(_sql.split("INSERT INTO t SELECT begin atomic FROM s; DROP TABLE x")) == 2
+    assert found("CREATE FUNCTION f() RETURNS int AS (begin atomic); DROP TABLE x") == [(D, 2, "DROP TABLE")]
 
 
 def test_a_plain_begin_does_not_open_a_body() -> None:
