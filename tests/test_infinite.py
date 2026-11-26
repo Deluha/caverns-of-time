@@ -542,7 +542,7 @@ def test_without_a_baseline_a_schema_created_later_is_watched(conn: Any, caplog:
     assert EXT_SCHEMA in result.schemas  # read live: the new schema is watched at once
     assert [(d.change, d.kind, d.name) for d in result.differences] == [("added", "table", f"{EXT_SCHEMA}.u")]
     with caplog.at_level("WARNING"):
-        apply(conn, Changeset("app", [*STEPS, Step("later", NOOP)]))
+        apply(conn, Changeset("app", [*STEPS, Step("later", NOOP)]), on_drift="warn")
     assert f"added table {EXT_SCHEMA}.u" in caplog.text  # the warning compares the watched schemas too
     assert EXT_SCHEMA in _latest_schemas(conn)
     assert drift(conn).differences == ()
@@ -565,7 +565,7 @@ def test_without_a_baseline_a_dropped_schema_is_drift_and_is_warned_of(
     assert narrowed.schemas == (SCHEMA,)
     assert [(d.change, d.kind, d.name) for d in narrowed.differences] == expected
     with caplog.at_level("WARNING"):
-        apply(conn, Changeset("app", [*STEPS, Step("later", NOOP)]))
+        apply(conn, Changeset("app", [*STEPS, Step("later", NOOP)]), on_drift="warn")
     assert f"removed table {SCHEMA}.t" in caplog.text  # the pre-apply warning compares the same schemas
     assert SCHEMA not in _latest_schemas(conn)  # the recorded fingerprint describes the database as it now is
     assert drift(conn).differences == ()
@@ -803,7 +803,7 @@ def test_drift_compares_with_the_latest_fingerprint_only(conn: Any) -> None:
     _applied(conn)
     _run(conn, f"ALTER TABLE {SCHEMA}.t ADD COLUMN extra text")
     assert drift(conn).differences
-    apply(conn, Changeset("app", [*STEPS, Step("later", f"CREATE TABLE {SCHEMA}.later ()")]))
+    apply(conn, Changeset("app", [*STEPS, Step("later", f"CREATE TABLE {SCHEMA}.later ()")]), on_drift="warn")
     result = drift(conn)  # the new run's fingerprint holds the column
     assert not result.differences and result.fingerprint_version == history(conn, limit=1)[0].version
 

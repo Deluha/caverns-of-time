@@ -38,7 +38,7 @@ LEDGER_TEST_DROPS = (
 RUNNER_GRANTS = (
     "GRANT USAGE ON SCHEMA caverns TO {role}",
     "GRANT SELECT, INSERT ON caverns.ledger, caverns.fingerprint, caverns.epoch, caverns.epoch_source,"
-    " caverns.epoch_row, caverns.epoch_deletion, caverns.acknowledgement TO {role}",
+    " caverns.epoch_row, caverns.epoch_deletion, caverns.acknowledgement, caverns.drift TO {role}",
     "GRANT SELECT, INSERT, UPDATE, DELETE ON caverns.epoch_table TO {role}",
     "GRANT DELETE ON caverns.epoch_row TO {role}",
 )

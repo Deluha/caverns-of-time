@@ -3,7 +3,8 @@
 Input: a DB-API 2.0 connection (autocommit off) and `Step` / `Changeset` values built from SQL text,
 a list or a directory of `.sql` files. Output: validated, immutable values, and ledger rows in the
 `caverns.ledger` table of the connected database, written by Caverns itself, plus the
-`caverns.acknowledgement` rows of the risky steps `apply` was told to run (Murozond guards `apply`).
+`caverns.acknowledgement` rows of the risky steps `apply` was told to run (Murozond guards `apply`) and the
+`caverns.drift` row of a run that proceeded past drift.
 The module imports no database driver. Contract and behaviour: `caverns_of_time/README.md`.
 """
 
@@ -14,6 +15,7 @@ import hashlib
 import json
 import logging
 import os
+import reprlib
 import time
 from collections.abc import Callable, Collection, Sequence
 from dataclasses import dataclass
@@ -44,6 +46,7 @@ from caverns_of_time._connection import (
 from caverns_of_time._fingerprint import (
     FINGERPRINT_EXISTS_SQL,
     FINGERPRINT_SERVER_SQL,
+    Difference,
     capture,
     compare,
     compared_schemas,
@@ -61,6 +64,7 @@ from caverns_of_time.errors import (
     BaselineRefused,
     CavernsError,
     ChangesetError,
+    DriftRefused,
     GuardRefused,
     LedgerNotInstalled,
     PreflightRefused,
@@ -438,6 +442,24 @@ CREATE OR REPLACE TRIGGER acknowledgement_no_truncate BEFORE TRUNCATE ON caverns
     FOR EACH STATEMENT EXECUTE FUNCTION caverns.append_only();
 """
 _ACKNOWLEDGEMENT_EXISTS_SQL = "SELECT to_regclass('caverns.acknowledgement') IS NOT NULL"
+# WARNING: this statement ships with the release: never edit it once released; its checksum is recorded
+# in every consumer's ledger. A change to the drift records is a new step of the own changeset (hard rule 6).
+_DRIFT_DDL_SQL = """
+CREATE TABLE IF NOT EXISTS caverns.drift (
+    version             bigint      PRIMARY KEY REFERENCES caverns.ledger (version),
+    fingerprint_version bigint      NOT NULL REFERENCES caverns.fingerprint (version),
+    schemas             text[]      NOT NULL,
+    differences         jsonb       NOT NULL
+        CHECK (jsonb_typeof(differences) = 'array' AND jsonb_array_length(differences) > 0),
+    recorded_at         timestamptz NOT NULL DEFAULT clock_timestamp()
+);
+REVOKE ALL ON caverns.drift FROM PUBLIC;
+CREATE OR REPLACE TRIGGER drift_no_update_delete BEFORE UPDATE OR DELETE ON caverns.drift
+    FOR EACH ROW EXECUTE FUNCTION caverns.append_only();
+CREATE OR REPLACE TRIGGER drift_no_truncate BEFORE TRUNCATE ON caverns.drift
+    FOR EACH STATEMENT EXECUTE FUNCTION caverns.append_only();
+"""
+_DRIFT_EXISTS_SQL = "SELECT to_regclass('caverns.drift') IS NOT NULL"
 _OWN_CHANGESET = Changeset(
     _OWN_CHANGESET_NAME,
     [
@@ -447,6 +469,7 @@ _OWN_CHANGESET = Changeset(
         Step("privileges", _PRIVILEGES_DDL_SQL, check=_PRIVILEGES_REVOKED_SQL),
         Step("fingerprint_server", _FINGERPRINT_SERVER_DDL_SQL, check=FINGERPRINT_SERVER_SQL),
         Step("acknowledgement", _ACKNOWLEDGEMENT_DDL_SQL, check=_ACKNOWLEDGEMENT_EXISTS_SQL),
+        Step("drift", _DRIFT_DDL_SQL, check=_DRIFT_EXISTS_SQL),
     ],
 )
 
@@ -473,6 +496,20 @@ _INVALID_INDEXES_SQL = (
     " JOIN pg_namespace n ON n.oid = c.relnamespace WHERE NOT x.indisvalid ORDER BY 1"
 )
 _INSERT_ACKNOWLEDGEMENT_SQL = "INSERT INTO caverns.acknowledgement (version, risk, findings) VALUES (%s, %s, %s::jsonb)"
+_INSERT_DRIFT_SQL = (
+    "INSERT INTO caverns.drift (version, fingerprint_version, schemas, differences) VALUES (%s, %s, %s, %s::jsonb)"
+)
+
+_ON_DRIFT_REFUSE = "refuse"
+_ON_DRIFT_WARN = "warn"
+_ON_DRIFT = (_ON_DRIFT_REFUSE, _ON_DRIFT_WARN)
+
+
+def _validate_on_drift(value: object) -> None:
+    """*value* must be one of `_ON_DRIFT`; a `ChangesetError` names it otherwise."""
+    if value not in _ON_DRIFT:
+        choices = " or ".join(repr(choice) for choice in _ON_DRIFT)
+        raise ChangesetError(f"on_drift must be {choices}, not {reprlib.repr(value)}")
 
 
 def _reject_reserved(changeset: Changeset) -> None:
@@ -691,6 +728,16 @@ def _recorded_error(error: Exception) -> str:
     return lines[0].strip() if lines and lines[0].strip() else type(error).__name__
 
 
+@dataclass(frozen=True)
+class _Drift:
+    """What differs between the latest recorded fingerprint (at ledger version *fingerprint_version*) and the live
+    database, compared over *schemas*; never empty."""
+
+    fingerprint_version: int
+    schemas: list[str]
+    differences: tuple[Difference, ...]
+
+
 def _record_failure(
     connection: Connection,
     changeset: Changeset,
@@ -698,18 +745,19 @@ def _record_failure(
     error: Exception,
     duration_ms: int,
     *,
-    record_fingerprint: bool,
+    consumer: bool,
     lock_timeout: float | None,
     acknowledgement: Classification | None = None,
+    drift: _Drift | None = None,
 ) -> StepFailed:
     """Record a failed step in a transaction of its own; the error to raise.
 
     The wait for Caverns' lock has no timeout: the run has a failure to record, and losing the row would leave
     the ledger silent about it. *lock_timeout* bounds the waits after it.
 
-    With *record_fingerprint* the transaction also stores the fingerprint of the database as the steps
-    before the failed one left it, and with an *acknowledgement* (the step ran acknowledged) the acknowledgement
-    row. Raises `CavernsError` from *error* when the failure cannot be recorded:
+    With *consumer* the transaction also stores the fingerprint of the database as the steps before the failed one
+    left it, with an *acknowledgement* (the step ran acknowledged) the acknowledgement row and with a *drift* (the
+    run's first row) the drift record. Raises `CavernsError` from *error* when the failure cannot be recorded:
     the ledger does not exist (the failed step was its own) or writing the row fails (a read-only
     session). The transaction is rolled back either way, so no fingerprint is recorded then.
     """
@@ -726,7 +774,8 @@ def _record_failure(
                 error=_recorded_error(error),
                 duration_ms=duration_ms,
                 acknowledgement=acknowledgement,
-                with_fingerprint=record_fingerprint,
+                with_fingerprint=consumer,
+                drift=drift,
             )
     except Exception as record_error:
         raise CavernsError(
@@ -744,13 +793,17 @@ def _record_row(
     *,
     acknowledgement: Classification | None,
     with_fingerprint: bool,
+    drift: _Drift | None = None,
     error: str | None = None,
     duration_ms: int | None = None,
 ) -> LedgerEntry:
-    """The one place a step's ledger row is written, with its acknowledgement and, when asked, the fingerprint."""
+    """The one place a step's ledger row is written, with its acknowledgement, the drift of the run's first row
+    and, when asked, the fingerprint."""
     entry = _insert(cursor, changeset.name, step, outcome, error=error, duration_ms=duration_ms)
     if acknowledgement is not None:
         _record_acknowledgement(cursor, entry, acknowledgement)
+    if drift is not None:
+        _record_drift(cursor, entry, drift)
     if with_fingerprint:
         _record_fingerprint(cursor, entry)
     return entry
@@ -770,18 +823,38 @@ def _record_acknowledgement(cursor: Cursor, entry: LedgerEntry, classification: 
     cursor.execute(_INSERT_ACKNOWLEDGEMENT_SQL, (entry.version, classification.risk.value, json.dumps(findings)))
 
 
-def _warn_of_drift(connection: Connection, changeset: Changeset) -> None:
-    """Log one warning per difference between the latest recorded fingerprint and the live database; no refusal.
+def _record_drift(cursor: Cursor, entry: LedgerEntry, drift: _Drift) -> None:
+    """Store *drift*, the differences a run proceeded past, at *entry*'s version (the run's first row)."""
+    differences = [{"kind": d.kind, "name": d.name, "change": d.change} for d in drift.differences]
+    cursor.execute(
+        _INSERT_DRIFT_SQL, (entry.version, drift.fingerprint_version, drift.schemas, json.dumps(differences))
+    )
+
+
+def _find_drift(connection: Connection) -> _Drift | None:
+    """The differences between the latest recorded fingerprint and the live database; None when there is no
+    fingerprint or no difference. Read-only.
 
     Compares the watched schemas plus those the fingerprint covers, so a schema dropped since reads as removed.
     """
     with read_only(connection) as cursor:
         found = latest_fingerprint(cursor)
         if found is None:
-            return
-        compared = compared_schemas(cursor, found[1])
-        differences = compare(restrict(found[1].document, compared), read_document(cursor, compared))
-    for difference in differences:
+            return None
+        version, recorded = found
+        compared = compared_schemas(cursor, recorded)
+        differences = compare(restrict(recorded.document, compared), read_document(cursor, compared))
+    return _Drift(version, compared, tuple(differences)) if differences else None
+
+
+def _check_drift(connection: Connection, changeset: Changeset, on_drift: str) -> _Drift | None:
+    """The drift a run proceeds past, each difference logged as a warning; `DriftRefused` unless *on_drift* is warn."""
+    drift = _find_drift(connection)
+    if drift is None:
+        return None
+    if on_drift == _ON_DRIFT_REFUSE:
+        raise DriftRefused(drift.fingerprint_version, drift.differences)
+    for difference in drift.differences:
         _log.warning(
             "drift before applying changeset %s: %s %s %s",
             changeset.name,
@@ -789,6 +862,7 @@ def _warn_of_drift(connection: Connection, changeset: Changeset) -> None:
             difference.kind,
             difference.name,
         )
+    return drift
 
 
 def _execute_step(
@@ -797,9 +871,10 @@ def _execute_step(
     cursor: Cursor,
     step: Step,
     *,
-    record_fingerprint: bool,
+    consumer: bool,
     lock_timeout: float | None,
     acknowledgement: Classification | None,
+    drift: _Drift | None,
 ) -> int:
     """Run the step's SQL as written; its duration in milliseconds.
 
@@ -817,9 +892,10 @@ def _execute_step(
             step,
             error,
             _elapsed_ms(started),
-            record_fingerprint=record_fingerprint,
+            consumer=consumer,
             lock_timeout=lock_timeout,
             acknowledgement=acknowledgement,
+            drift=drift,
         ) from error
     return _elapsed_ms(started)
 
@@ -852,9 +928,10 @@ def _execute_step_outside_transaction(
     changeset: Changeset,
     step: Step,
     *,
-    record_fingerprint: bool,
+    consumer: bool,
     lock_timeout: float | None,
     acknowledgement: Classification | None,
+    drift: _Drift | None,
 ) -> int:
     """Run the step's one statement with autocommit on; its duration in milliseconds.
 
@@ -873,9 +950,10 @@ def _execute_step_outside_transaction(
             step,
             error,
             _elapsed_ms(started),
-            record_fingerprint=record_fingerprint,
+            consumer=consumer,
             lock_timeout=lock_timeout,
             acknowledgement=acknowledgement,
+            drift=drift,
         )
         _warn_of_invalid_indexes(connection, changeset, step)
         raise failure from error
@@ -907,11 +985,12 @@ def _write_step_outside_transaction(
     changeset: Changeset,
     status: StepStatus,
     *,
-    record_fingerprint: bool,
+    consumer: bool,
     first: bool,
     last: bool,
     lock_timeout: float | None,
     acknowledgement: Classification | None,
+    drift: _Drift | None,
 ) -> LedgerEntry | None:
     """Run a non-transactional step under Caverns' session lock, then record it; None when applied elsewhere.
 
@@ -931,9 +1010,10 @@ def _write_step_outside_transaction(
             connection,
             changeset,
             step,
-            record_fingerprint=record_fingerprint,
+            consumer=consumer,
             lock_timeout=lock_timeout,
             acknowledgement=acknowledgement,
+            drift=drift,
         )
         with transaction(connection) as cursor:
             lock(cursor, lock_timeout=lock_timeout, unbounded_wait=True)
@@ -944,7 +1024,8 @@ def _write_step_outside_transaction(
                 _OUTCOME_APPLIED,
                 duration_ms=duration,
                 acknowledgement=acknowledgement,
-                with_fingerprint=record_fingerprint and last,
+                with_fingerprint=consumer and last,
+                drift=drift,
             )
 
 
@@ -954,11 +1035,12 @@ def _write_step(
     status: StepStatus,
     outcome: str,
     *,
-    record_fingerprint: bool,
+    consumer: bool,
     first: bool,
     last: bool,
     lock_timeout: float | None,
     acknowledgement: Classification | None = None,
+    drift: _Drift | None = None,
 ) -> LedgerEntry | None:
     """Run or accept one step in one transaction; None when another runner applied it first.
 
@@ -967,10 +1049,12 @@ def _write_step(
     not stopped between its rows and its fingerprint. The step's own lock waits are bounded in every case.
 
     The ledger is read again under the lock: a status that changed since preflight (an `applied`
-    one means the work is done) must not be acted on. With *record_fingerprint* a failure of the step
+    one means the work is done) must not be acted on. With *consumer* a failure of the step
     records a fingerprint with its `failed` row, and, when the step is the *last* of the run, so does
     its own row. A step run with an *acknowledgement* (its Murozond classification) writes the acknowledgement
     row in the same transaction as its `applied` or `failed` row; a step another runner applied first writes none.
+    The *drift* the run proceeded past is recorded in the same transaction as the row of the run's first written
+    step, whatever that row is (`applied`, `accepted` or `failed`); a step another runner applied first writes none.
 
     A non-transactional step that runs (not an accepted one) takes `_write_step_outside_transaction`: its
     statement runs outside any transaction and its row follows in a transaction of its own.
@@ -981,11 +1065,12 @@ def _write_step(
             connection,
             changeset,
             status,
-            record_fingerprint=record_fingerprint,
+            consumer=consumer,
             first=first,
             last=last,
             lock_timeout=lock_timeout,
             acknowledgement=acknowledgement,
+            drift=drift,
         )
     with transaction(connection) as cursor:
         lock(cursor, lock_timeout=lock_timeout, unbounded_wait=not first)
@@ -999,9 +1084,10 @@ def _write_step(
                 changeset,
                 cursor,
                 step,
-                record_fingerprint=record_fingerprint,
+                consumer=consumer,
                 lock_timeout=lock_timeout,
                 acknowledgement=acknowledgement,
+                drift=drift,
             )
         return _record_row(
             cursor,
@@ -1010,7 +1096,8 @@ def _write_step(
             outcome,
             duration_ms=duration,
             acknowledgement=acknowledgement,
-            with_fingerprint=record_fingerprint and last,
+            with_fingerprint=consumer and last,
+            drift=drift,
         )
 
 
@@ -1021,21 +1108,22 @@ def _apply_statuses(
     reapply: frozenset[str],
     accept: frozenset[str],
     *,
-    record_fingerprint: bool,
+    consumer: bool,
     acknowledge: frozenset[str] = frozenset(),
+    on_drift: str = _ON_DRIFT_REFUSE,
     lock_timeout: float | None = DEFAULT_LOCK_TIMEOUT,
 ) -> list[LedgerEntry]:
     """Walk the planned steps in order, each in its own transaction; the rows written.
 
-    With *record_fingerprint* (a consumer's changeset, never Caverns' own) the run is also guarded (`_guard`, after
-    the status refusal and before anything is written; *acknowledge* names the risky steps it may run), and a run
-    that has steps to write first warns of drift, then stores one fingerprint, in the transaction of its last
-    ledger row.
+    *consumer* says the changeset is a consumer's, never Caverns' own: it governs the guard, the drift check and
+    the fingerprint. Such a run is guarded (`_guard`, after the status refusal and before anything is written;
+    *acknowledge* names the risky steps it may run); one that has steps to write then checks drift (`_check_drift`:
+    refused, or per *on_drift* recorded with the first row it writes) and stores one fingerprint, in the
+    transaction of its last ledger row.
     """
     plan = _plan(changeset, statuses, reapply, accept)
-    acknowledgements = _guard(changeset, plan, acknowledge) if record_fingerprint else {}
-    if record_fingerprint and plan:
-        _warn_of_drift(connection, changeset)
+    acknowledgements = _guard(changeset, plan, acknowledge) if consumer else {}
+    drift = _check_drift(connection, changeset, on_drift) if consumer and plan else None
     written: list[LedgerEntry] = []
     for position, (status, outcome) in enumerate(plan, start=1):
         entry = _write_step(
@@ -1043,13 +1131,15 @@ def _apply_statuses(
             changeset,
             status,
             outcome,
-            record_fingerprint=record_fingerprint,
+            consumer=consumer,
             first=not written,
             last=position == len(plan),
             lock_timeout=lock_timeout,
             acknowledgement=acknowledgements.get(status.step.label),
+            drift=drift,
         )
         if entry is not None:
+            drift = None  # recorded with the run's first row
             _log.info(
                 "%s step %s of changeset %s: ledger version %d", outcome, entry.label, entry.changeset, entry.version
             )
@@ -1088,7 +1178,7 @@ def install(connection: Connection) -> list[LedgerEntry]:
     unknown = frozenset(s.step.label for s in statuses if s.status is Status.UNKNOWN)
     for label in sorted(unknown):
         _log.warning("own step %s is present without a ledger row: recording it as accepted", label)
-    return _apply_statuses(connection, _OWN_CHANGESET, statuses, frozenset(), unknown, record_fingerprint=False)
+    return _apply_statuses(connection, _OWN_CHANGESET, statuses, frozenset(), unknown, consumer=False)
 
 
 def apply(
@@ -1098,6 +1188,7 @@ def apply(
     reapply: Collection[str] = (),
     accept: Collection[str] = (),
     acknowledge: Collection[str] = (),
+    on_drift: str = _ON_DRIFT_REFUSE,
     lock_timeout: float | None = DEFAULT_LOCK_TIMEOUT,
 ) -> list[LedgerEntry]:
     """Apply the steps of *changeset* that are pending, one transaction and one ledger row each.
@@ -1113,11 +1204,17 @@ def apply(
     written) unless its label is in *acknowledge*; an acknowledged step is logged as a warning and recorded in
     `caverns.acknowledgement`, in the transaction of its `applied` or `failed` row. Caverns' own changeset is not
     guarded. The refusals, all before anything is written, come in this order: the status refusal, an *acknowledge*
-    label the changeset lacks, whose step does not run in this apply or is safe (`ChangesetError`), the guard.
+    label the changeset lacks, whose step does not run in this apply or is safe (`ChangesetError`), the guard, drift.
 
     A run that writes ledger rows stores one fingerprint of the watched schemas, in the transaction of its
-    last row (a failed step's `failed` row included); before its first step it logs a warning per difference
-    between the live watched schemas and the latest recorded fingerprint.
+    last row (a failed step's `failed` row included). Before its first step a run with steps to write compares the
+    live watched schemas (and those the fingerprint covers) with the latest recorded fingerprint, in a read-only
+    transaction; no fingerprint, no check. With *on_drift* `"refuse"` (the default) a difference refuses the run
+    (`DriftRefused`, nothing written); with `"warn"` it logs a warning per difference and the run proceeds, and
+    the drift is recorded in `caverns.drift`, in the transaction of the run's first written row (`applied`,
+    `accepted` or `failed`; a step another runner applied first writes none, so the next row carries it). Drift
+    made between the check and the first step is absorbed by that step's fingerprint, unrecorded. Any other
+    *on_drift* is a `ChangesetError`.
 
     *lock_timeout* is the seconds each step's transaction waits for a lock its SQL needs, and the run's for
     Caverns' advisory lock until the run has written a row (None keeps the session's own `lock_timeout`; a number
@@ -1137,6 +1234,7 @@ def apply(
     A standby or a read-only session is refused with `CavernsError`, nothing written.
     """
     validate_lock_timeout(lock_timeout)
+    _validate_on_drift(on_drift)
     reapply_names, accept_names = names("reapply", reapply), names("accept", accept)
     acknowledge_names = names("acknowledge", acknowledge)
     statuses = preflight(connection, changeset)
@@ -1147,8 +1245,9 @@ def apply(
         statuses,
         reapply_names,
         accept_names,
-        record_fingerprint=True,
+        consumer=True,
         acknowledge=acknowledge_names,
+        on_drift=on_drift,
         lock_timeout=lock_timeout,
     )
 
