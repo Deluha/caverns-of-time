@@ -9,6 +9,8 @@ fails a whole run in which no database test passed.
 from __future__ import annotations
 
 import os
+import secrets
+import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from typing import Any
@@ -17,6 +19,8 @@ import psycopg
 import psycopg2
 import pytest
 from psycopg.conninfo import conninfo_to_dict
+
+from caverns_of_time import _connection
 
 DSN_VARIABLE = "CAVERNS_TEST_DSN"
 REQUIRE_DB_VARIABLE = "CAVERNS_REQUIRE_DB"
@@ -30,6 +34,22 @@ LEDGER_TEST_DROPS = (
     "DROP SCHEMA IF EXISTS caverns CASCADE",
     "DROP SCHEMA IF EXISTS nozdormu_test CASCADE",
 )
+# What a role that runs Caverns (not its owner) needs on the own schema after `install`: the README's grants.
+RUNNER_GRANTS = (
+    "GRANT USAGE ON SCHEMA caverns TO {role}",
+    "GRANT SELECT, INSERT ON caverns.ledger, caverns.fingerprint, caverns.epoch, caverns.epoch_source,"
+    " caverns.epoch_row, caverns.epoch_deletion TO {role}",
+    "GRANT SELECT, INSERT, UPDATE, DELETE ON caverns.epoch_table TO {role}",
+    "GRANT DELETE ON caverns.epoch_row TO {role}",
+)
+# pg_locks shows a bigint advisory key as its high (classid) and low (objid) 32 bits.
+LOCK_KEY_HIGH = _connection.ADVISORY_LOCK_KEY >> 32
+LOCK_KEY_LOW = _connection.ADVISORY_LOCK_KEY & 0xFFFFFFFF
+WAITING_LOCKS_SQL = (
+    "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND NOT granted AND classid = %s AND objid = %s"
+)
+WAIT_SECONDS = 10.0
+POLL_SECONDS = 0.02
 # libpq reads these when the connection string leaves them out, or (PGHOSTADDR) even when
 # it names a host, so any of them can redirect a local-looking connection string.
 REDIRECTING_VARIABLES = ("PGHOSTADDR", "PGSERVICE", "PGSERVICEFILE")
@@ -176,3 +196,58 @@ def second_conn(request: pytest.FixtureRequest, ledger_conn: Any, db_dsn: str) -
         yield conn
     finally:
         conn.close()
+
+
+def wait_for_a_waiting_lock(conn: Any) -> None:
+    """Block until one session waits for Caverns' advisory lock (seen from *conn*), or fail after WAIT_SECONDS."""
+    deadline = time.monotonic() + WAIT_SECONDS
+    with conn.cursor() as cursor:
+        while time.monotonic() < deadline:
+            cursor.execute(WAITING_LOCKS_SQL, (LOCK_KEY_HIGH, LOCK_KEY_LOW))
+            row = cursor.fetchone()
+            if row is not None and row[0] == 1:
+                return
+            time.sleep(POLL_SECONDS)
+    pytest.fail(f"no runner waited for the advisory lock within {WAIT_SECONDS} s")
+
+
+def _execute_each(conn: Any, statements: tuple[str, ...]) -> list[Exception]:
+    """Run each statement in a transaction of its own; the errors, none of which stops the rest."""
+    failures: list[Exception] = []
+    for statement in statements:
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute(statement)
+            conn.commit()
+        except Exception as error:
+            conn.rollback()
+            failures.append(error)
+    return failures
+
+
+@contextmanager
+def throwaway_roles(conn: Any, *kinds: tuple[str, str]) -> Iterator[tuple[str, ...]]:
+    """Create one cluster-wide role per `(kind, attributes)`, named `caverns_test_<kind>_<suffix>`, and drop them after.
+
+    Roles are cluster-wide, so a leaked one outlives the test database: only the roles actually created are
+    dropped, each drop (and the schema drops before them) independent, so one failing step neither stops the rest
+    nor masks the error the test body raised. A failed cleanup with no body error raises its first error.
+    """
+    suffix = secrets.token_hex(4)
+    created: list[str] = []
+    try:
+        for kind, attributes in kinds:
+            role = f"caverns_test_{kind}_{suffix}"
+            create = f"CREATE ROLE {role} {attributes}"
+            with conn.cursor() as cursor:
+                cursor.execute(create)
+            conn.commit()
+            created.append(role)
+        yield tuple(created)
+    finally:
+        conn.rollback()
+        failures = _execute_each(conn, ("RESET ROLE", *LEDGER_TEST_DROPS))
+        for role in created:
+            failures += _execute_each(conn, (f"DROP OWNED BY {role}", f"DROP ROLE IF EXISTS {role}"))
+    if failures:
+        raise failures[0]

@@ -52,9 +52,10 @@ of them. A function is executable by `PUBLIC` unless revoked, so a later own ste
 itself (a test asserts that `PUBLIC` can execute no function of `caverns` after `install`); Caverns sets no default
 privileges. Only the schema's owner and the roles it grants to can use the ledger afterwards. Before applying
 anything `install` also refuses, with a `CavernsError` and nothing written, a `caverns` schema, or a relation in it,
-owned by a role the current role is not a member of (`schema caverns is owned by role alice, of which role bob is
-not a member: run install as alice or a member of it`); a schema owned by a role the current role is a member of
-is accepted. The grants a role needs to run `apply`, `baseline`, `register`, `unregister`, `snapshot` and
+owned by a role the current role is not a member of that inherits its privileges (`schema caverns is owned by role
+alice, of which role bob is not a member: run install as alice or a member of it`; a member granted `WITH INHERIT
+FALSE` is refused too, as it cannot `REVOKE` or `ALTER`); a schema owned by a role the current role is a member of
+that inherits its privileges is accepted. The grants a role needs to run `apply`, `baseline`, `register`, `unregister`, `snapshot` and
 `delete` (it need not own anything, and an identity sequence needs no grant of its own):
 
 ```sql
@@ -66,7 +67,7 @@ GRANT DELETE ON caverns.epoch_row TO runner;                           -- `delet
 ```
 
 Reading (`preflight`, `history`, `drift`, `catalog`, `as_of`, `diff`) needs `USAGE` and `SELECT` only. `install`
-runs as the schema's owner or a member of the owner's role. The append-only triggers guard against mistakes, not
+runs as the schema's owner or a member of the owner's role that inherits its privileges. The append-only triggers guard against mistakes, not
 against the schema's owner or a superuser, who can drop or disable them. **Upgrade:** run `install()` once after
 upgrading, as the owner; it applies `privileges`, after which a role that used the schema only through `PUBLIC` needs
 the grants above.
@@ -109,9 +110,8 @@ nothing. The rows written are returned and logged.
 *Lock timeout.* `lock_timeout` is the seconds one step's transaction waits for a lock its SQL needs, and the
 run's first step waits for Caverns' lock: the transaction sets `lock_timeout` to it (transaction-local, so the
 session's own setting is untouched afterwards) before it takes Caverns' advisory lock, and the step's SQL runs under
-it. It is `5.0` by default; a number from 0.001 s to 2147483.647 s (rounded to milliseconds; a smaller or larger one, NaN, infinity or an
-int too large for a float is refused),
-else `ChangesetError`; `None` leaves the session's own `lock_timeout` in force. A timeout on that first wait for
+it. It is `5.0` by default; a number from 0.001 s to 2147483.647 s (rounded to milliseconds; a smaller or larger
+one, NaN, infinity or an int too large for a float is refused), else `ChangesetError`; `None` leaves the session's own `lock_timeout` in force. A timeout on that first wait for
 Caverns' lock (another Caverns run holds it) raises `CavernsError` naming the lock, with the transaction rolled back
 and nothing written. Once the run has committed a step, its later waits for Caverns' lock, and the one that
 records a failure, have no timeout (`lock_timeout` is set after the lock is held), so a run is never stopped between
@@ -503,7 +503,8 @@ With nothing found: `✅ No drift — the live schema matches the fingerprint at
   and `delete` with `dry_run`) are not checked.
 - `install(connection) -> list[LedgerEntry]`: the rows written, one per own step not yet applied, `[]` when
   Caverns is already installed; an `accepted` row for an own step whose table exists without its row. Raises
-  `CavernsError` for a `caverns` schema or relation owned by a role the current role is not a member of.
+  `CavernsError` for a `caverns` schema or relation owned by a role the current role is not a member of that
+  inherits its privileges.
 - The ledger, `caverns.ledger`, one row per recorded event:
 
   | Column | Holds |

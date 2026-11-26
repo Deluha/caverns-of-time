@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import logging
 import re
-import secrets
 import threading
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
@@ -42,7 +41,7 @@ from caverns_of_time.epochs import (
 )
 from caverns_of_time.errors import CavernsError, ChangesetError, EpochNotFound, EpochRefused, LedgerNotInstalled
 from caverns_of_time.nozdormu import Changeset, install, preflight
-from tests.test_nozdormu_ledger import RUNNER_GRANTS, WAIT_SECONDS, _wait_for_a_waiting_lock
+from tests.conftest import RUNNER_GRANTS, WAIT_SECONDS, throwaway_roles, wait_for_a_waiting_lock
 
 DRIVER_ERRORS = (psycopg.Error, psycopg2.Error)
 SCHEMA = "nozdormu_test"
@@ -824,19 +823,12 @@ RLS_TABLE = (
 
 @pytest.fixture
 def rls_roles(ledger_conn: Any) -> Iterator[tuple[str, str, str]]:
-    """Three roles, cluster-wide so uniquely named: a reader, the table's owner and one with BYPASSRLS."""
-    suffix = secrets.token_hex(4)
-    reader, owner, bypass = (f"caverns_test_rls_{kind}_{suffix}" for kind in ("reader", "owner", "bypass"))
-    try:
-        for role, attribute in ((reader, "NOLOGIN"), (owner, "NOLOGIN"), (bypass, "NOLOGIN BYPASSRLS")):
-            _execute(ledger_conn, f"CREATE ROLE {role} {attribute}")
+    """Three roles, dropped after: a reader, the table's owner and one with BYPASSRLS."""
+    with throwaway_roles(
+        ledger_conn, ("rls_reader", "NOLOGIN"), ("rls_owner", "NOLOGIN"), ("rls_bypass", "NOLOGIN BYPASSRLS")
+    ) as made:
+        reader, owner, bypass = made
         yield reader, owner, bypass
-    finally:
-        ledger_conn.rollback()
-        _execute(ledger_conn, "RESET ROLE", "DROP SCHEMA IF EXISTS caverns CASCADE")
-        _execute(ledger_conn, f"DROP SCHEMA IF EXISTS {SCHEMA} CASCADE")
-        for role in (reader, owner, bypass):
-            _execute(ledger_conn, f"DROP OWNED BY {role}", f"DROP ROLE IF EXISTS {role}")
 
 
 def _rls_setup(conn: Any, roles: tuple[str, str, str], *extra: str) -> None:
@@ -1054,7 +1046,7 @@ def test_snapshot_waits_for_the_lock_and_sees_what_the_holder_committed(ledger_c
     runner = threading.Thread(target=run, daemon=True)
     runner.start()
     try:
-        _wait_for_a_waiting_lock(second_conn)
+        wait_for_a_waiting_lock(second_conn)
         with second_conn.cursor() as cursor:  # the other runner's work, under the lock it holds
             cursor.execute(f"INSERT INTO {SCHEMA}.one VALUES (2, 'y')")
         second_conn.commit()
@@ -2014,7 +2006,7 @@ def test_delete_waits_for_the_lock_and_deletes_after_the_holder_commits(ledger_c
     runner = threading.Thread(target=run, daemon=True)
     runner.start()
     try:
-        _wait_for_a_waiting_lock(second_conn)
+        wait_for_a_waiting_lock(second_conn)
         with second_conn.cursor() as cursor:  # nothing is deleted while the other runner holds the lock
             cursor.execute("SELECT count(*) FROM caverns.epoch_deletion")
             assert cursor.fetchone() == (0,)

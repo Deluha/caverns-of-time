@@ -17,8 +17,8 @@ What a second review found in Phases 1–3, fixed before new components:
   5 seconds (`None` keeps the session's own setting); a timeout on a run's first wait for Caverns' lock is a
   `CavernsError`, nothing written. Once the run has written a row its later waits for Caverns' lock (the failure
   record's included) have no timeout, so a run is never stopped between its rows and its fingerprint.
-- Privileges: `install` refuses a `caverns` schema or relation owned by a role the current role is not a member of,
-  and the new own step `privileges` revokes every privilege of `PUBLIC` on the schema, its tables, sequences and
+- Privileges: `install` refuses a `caverns` schema or relation owned by a role the current role is not a member of
+  that inherits its privileges, and the new own step `privileges` revokes every privilege of `PUBLIC` on the schema, its tables, sequences and
   functions. The grants a runner role needs are documented; the append-only triggers guard against mistakes, not
   against the schema's owner or a superuser.
 - Every write is refused with a `CavernsError` on a standby and in a read-only session. A failed release of the

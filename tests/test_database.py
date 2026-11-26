@@ -6,6 +6,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any
 
 import psycopg
 import pytest
@@ -18,6 +19,7 @@ from tests.conftest import (
     non_local_target,
     resolve_dsn,
     rolled_back_connection,
+    throwaway_roles,
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -80,6 +82,26 @@ def test_every_way_to_reach_another_machine_is_refused(suffix: str, target: str)
 @pytest.mark.parametrize("host", ["localhost", "127.0.0.1", "[::1]", "localhost,127.0.0.1"])
 def test_local_hosts_are_accepted(host: str) -> None:
     assert non_local_target(f"postgresql://u:p@{host}/x") is None
+
+
+ROLES_LEFT = "SELECT count(*) FROM pg_roles WHERE rolname LIKE 'caverns_test_%'"
+
+
+def _roles_left(conn: Any) -> int:
+    with conn.cursor() as cursor:
+        cursor.execute(ROLES_LEFT)
+        (count,) = cursor.fetchone()
+    conn.commit()
+    return int(count)
+
+
+def test_throwaway_roles_are_dropped_and_a_failed_create_leaks_none(ledger_conn: Any) -> None:
+    with throwaway_roles(ledger_conn, ("a", "NOLOGIN"), ("b", "NOLOGIN")) as made:
+        assert len(made) == 2 and _roles_left(ledger_conn) == 2
+    assert _roles_left(ledger_conn) == 0
+    with pytest.raises(Exception, match="NOTAN"), throwaway_roles(ledger_conn, ("a", "NOLOGIN"), ("b", "NOTAN")):
+        pytest.fail("the second role cannot be created")
+    assert _roles_left(ledger_conn) == 0  # the first was dropped, and the original error was not masked
 
 
 @pytest.mark.parametrize("variable", ["PGHOSTADDR", "PGSERVICE", "PGSERVICEFILE"])

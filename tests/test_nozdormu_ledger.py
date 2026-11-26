@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import logging
 import re
-import secrets
 import threading
 import time
 from collections.abc import Iterator
@@ -26,6 +25,7 @@ from caverns_of_time.errors import (
 )
 from caverns_of_time.infinite import fingerprint as take_fingerprint
 from caverns_of_time.nozdormu import Changeset, Status, Step, apply, baseline, history, install, preflight
+from tests.conftest import RUNNER_GRANTS, WAIT_SECONDS, throwaway_roles, wait_for_a_waiting_lock
 
 DRIVER_ERRORS = (psycopg.Error, psycopg2.Error)
 SCHEMA = Step("schema", "CREATE SCHEMA nozdormu_test", check="SELECT to_regnamespace('nozdormu_test') IS NOT NULL")
@@ -231,6 +231,32 @@ def test_install_accepts_the_privileges_step_when_the_revocations_are_already_th
     assert [(e.label, e.outcome) for e in entries] == [("privileges", "accepted"), ("fingerprint_server", "applied")]
 
 
+# What PUBLIC can do, spelled out: USAGE and CREATE on the schema, SELECT on a table, USAGE on a sequence.
+PUBLIC_GRANTS_SQL = (
+    "SELECT has_schema_privilege('public', 'caverns', 'USAGE'), has_schema_privilege('public', 'caverns', 'CREATE'),"
+    " has_table_privilege('public', 'caverns.ledger', 'SELECT'),"
+    " has_sequence_privilege('public', pg_get_serial_sequence('caverns.ledger', 'version'), 'USAGE')"
+)
+
+
+def test_install_revokes_what_public_was_granted_before_the_privileges_step(
+    ledger_conn: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _install_first_three_steps(ledger_conn, monkeypatch)
+    _run(
+        ledger_conn,
+        "GRANT USAGE, CREATE ON SCHEMA caverns TO PUBLIC",
+        "GRANT SELECT ON caverns.ledger TO PUBLIC",
+        "DO $$ BEGIN EXECUTE format('GRANT USAGE ON SEQUENCE %s TO PUBLIC',"
+        " pg_get_serial_sequence('caverns.ledger', 'version')); END $$",
+    )
+    assert _query(ledger_conn, PUBLIC_GRANTS_SQL) == [(True, True, True, True)]
+    assert _query(ledger_conn, nozdormu._PRIVILEGES_REVOKED_SQL) == [(False,)]
+    install(ledger_conn)
+    assert _query(ledger_conn, PUBLIC_GRANTS_SQL) == [(False, False, False, False)]
+    assert _query(ledger_conn, PUBLIC_ACL_ROWS) == [(0, 0)]
+
+
 def _run(conn: Any, *statements: str) -> None:
     """Several statements, then one commit."""
     with conn.cursor() as cursor:
@@ -241,12 +267,9 @@ def _run(conn: Any, *statements: str) -> None:
 
 @pytest.fixture
 def roles(ledger_conn: Any) -> Iterator[tuple[str, str, str]]:
-    """Three roles, cluster-wide so uniquely named and dropped after: an owner, a stranger and a member of the owner."""
-    suffix = secrets.token_hex(4)
-    owner, stranger, member = (f"caverns_test_{kind}_{suffix}" for kind in ("owner", "stranger", "member"))
-    try:
-        for role in (owner, stranger, member):
-            _run(ledger_conn, f"CREATE ROLE {role} NOLOGIN")
+    """Three roles, dropped after: an owner, a stranger and a member of the owner (inheriting its privileges)."""
+    with throwaway_roles(ledger_conn, ("owner", "NOLOGIN"), ("stranger", "NOLOGIN"), ("member", "NOLOGIN")) as made:
+        owner, stranger, member = made
         _run(ledger_conn, f"GRANT {owner} TO {member}")
         # Schema creation checks the database privilege even when the schema exists.
         _run(
@@ -256,11 +279,6 @@ def roles(ledger_conn: Any) -> Iterator[tuple[str, str, str]]:
             + "', current_database()); END $$",
         )
         yield owner, stranger, member
-    finally:
-        ledger_conn.rollback()
-        _run(ledger_conn, "RESET ROLE", "DROP SCHEMA IF EXISTS caverns CASCADE")
-        for role in (owner, stranger, member):
-            _run(ledger_conn, f"DROP OWNED BY {role}", f"DROP ROLE IF EXISTS {role}")
 
 
 def test_install_refuses_a_schema_owned_by_a_role_the_caller_is_not_a_member_of(
@@ -293,6 +311,28 @@ def test_install_refuses_a_relation_owned_by_a_role_the_caller_is_not_a_member_o
     assert not _exists(ledger_conn, "caverns.ledger")
 
 
+def test_install_refuses_an_owner_whose_privileges_the_caller_does_not_inherit(
+    ledger_conn: Any, roles: tuple[str, str, str]
+) -> None:
+    """A member that does not inherit the owner's privileges cannot REVOKE or ALTER: refused like a stranger."""
+    owner, stranger, _ = roles
+    _run(
+        ledger_conn,
+        f"CREATE SCHEMA caverns AUTHORIZATION {owner}",
+        f"GRANT {owner} TO {stranger} WITH INHERIT FALSE",
+        f"SET ROLE {stranger}",
+    )
+    with pytest.raises(CavernsError) as refused:
+        install(ledger_conn)
+    assert str(refused.value) == (
+        f"schema caverns is owned by role {owner}, of which role {stranger} is not a member: "
+        f"run install as {owner} or a member of it"
+    )
+    _assert_idle(ledger_conn)
+    _run(ledger_conn, "RESET ROLE")
+    assert not _exists(ledger_conn, "caverns.ledger")  # nothing was written
+
+
 def test_install_accepts_a_schema_owned_by_a_role_the_caller_is_a_member_of(
     ledger_conn: Any, roles: tuple[str, str, str]
 ) -> None:
@@ -305,15 +345,6 @@ def test_install_accepts_a_schema_owned_by_a_role_the_caller_is_a_member_of(
     assert _query(ledger_conn, LEDGER_ROWS) == OWN_ROWS
     assert _query(ledger_conn, PUBLIC_ACL_ROWS) == [(0, 0)]
     assert _query(ledger_conn, "SELECT DISTINCT recorded_by FROM caverns.ledger") == [(member,)]
-
-
-RUNNER_GRANTS = (
-    "GRANT USAGE ON SCHEMA caverns TO {role}",
-    "GRANT SELECT, INSERT ON caverns.ledger, caverns.fingerprint, caverns.epoch, caverns.epoch_source,"
-    " caverns.epoch_row, caverns.epoch_deletion TO {role}",
-    "GRANT SELECT, INSERT, UPDATE, DELETE ON caverns.epoch_table TO {role}",
-    "GRANT DELETE ON caverns.epoch_row TO {role}",
-)
 
 
 def test_a_runner_role_with_the_documented_grants_applies_and_snapshots(
@@ -987,25 +1018,6 @@ RACE_STEP = Step("race", "CREATE TABLE nozdormu_test.race_t ()")
 RACE = Changeset("race", [RACE_STEP])
 RACE_ROWS = "SELECT label, outcome FROM caverns.ledger WHERE changeset = 'race' ORDER BY version"
 REPEATABLE_READ_SQL = "SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL REPEATABLE READ"
-# pg_locks shows a bigint advisory key as its high (classid) and low (objid) 32 bits.
-LOCK_KEY_HIGH = _connection.ADVISORY_LOCK_KEY >> 32
-LOCK_KEY_LOW = _connection.ADVISORY_LOCK_KEY & 0xFFFFFFFF
-WAITING_LOCKS_SQL = (
-    "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND NOT granted AND classid = %s AND objid = %s"
-)
-WAIT_SECONDS = 10.0
-POLL_SECONDS = 0.02
-
-
-def _wait_for_a_waiting_lock(conn: Any) -> None:
-    deadline = time.monotonic() + WAIT_SECONDS
-    with conn.cursor() as cursor:
-        while time.monotonic() < deadline:
-            cursor.execute(WAITING_LOCKS_SQL, (LOCK_KEY_HIGH, LOCK_KEY_LOW))
-            if cursor.fetchone()[0] == 1:
-                return
-            time.sleep(POLL_SECONDS)
-    pytest.fail(f"no runner waited for the advisory lock within {WAIT_SECONDS} s")
 
 
 def test_a_runner_waits_for_the_lock_and_reads_the_ledger_after_it(ledger_conn: Any, second_conn: Any) -> None:
@@ -1025,7 +1037,7 @@ def test_a_runner_waits_for_the_lock_and_reads_the_ledger_after_it(ledger_conn: 
     runner = threading.Thread(target=run, daemon=True)
     runner.start()
     try:
-        _wait_for_a_waiting_lock(second_conn)
+        wait_for_a_waiting_lock(second_conn)
         with second_conn.cursor() as cursor:  # the other runner's work, under the lock it holds
             cursor.execute(RACE_STEP.sql)
             nozdormu._insert(cursor, RACE.name, RACE_STEP, "applied")
@@ -1141,7 +1153,7 @@ def _release_caverns_lock_when_a_runner_has_waited(holder: Any, outcome: dict[st
 
     def release() -> None:
         try:
-            _wait_for_a_waiting_lock(holder)
+            wait_for_a_waiting_lock(holder)
             time.sleep(HELD_SECONDS)
             _release_caverns_lock(holder)
         except BaseException as error:  # reported by the test

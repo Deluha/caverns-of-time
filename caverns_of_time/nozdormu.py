@@ -368,7 +368,8 @@ SELECT to_regnamespace('caverns') IS NOT NULL AND to_regclass('caverns.epoch_del
        WHERE p.pronamespace = to_regnamespace('caverns') AND has_function_privilege('public', p.oid, 'EXECUTE'))
 """
 # The first object of the own schema (the schema, then its relations by name) whose owner the current role is not a
-# member of: what it is called, its owner and the current role. No row when every owner is the role or one of its roles.
+# member of that inherits its privileges (`USAGE`: a member without inherit cannot REVOKE or ALTER): what it is called,
+# its owner and the current role. No row when every owner is the role or a role whose privileges it inherits.
 _FOREIGN_OWNER_SQL = """
 SELECT description, owner, current_user::text FROM (
     SELECT 0 AS rank, 'schema caverns' AS description, n.nspowner AS owner_oid,
@@ -378,7 +379,7 @@ SELECT description, owner, current_user::text FROM (
     SELECT 1, 'relation caverns.' || c.relname, c.relowner, pg_get_userbyid(c.relowner)::text
     FROM pg_class c WHERE c.relnamespace = to_regnamespace('caverns')
 ) objects
-WHERE NOT pg_has_role(current_user, owner_oid, 'MEMBER')
+WHERE NOT pg_has_role(current_user, owner_oid, 'USAGE')
 ORDER BY rank, description
 LIMIT 1
 """
@@ -783,7 +784,11 @@ def _apply_statuses(
 
 
 def _require_owned(cursor: Cursor) -> None:
-    """Refuse (`CavernsError`) the own schema or a relation in it that the current role neither owns nor inherits."""
+    """Refuse (`CavernsError`) the own schema or a relation in it that the current role neither owns nor inherits.
+
+    The message says "not a member" for brevity: a role that is a member without inheriting the owner's privileges
+    is refused too, as it cannot change what the owner owns.
+    """
     cursor.execute(_FOREIGN_OWNER_SQL)
     row = cursor.fetchone()
     if row is not None:
@@ -798,7 +803,7 @@ def install(connection: Connection) -> list[LedgerEntry]:
     """Create the ledger by applying Caverns' own changeset; the rows written ([] when installed).
 
     Refuses (`CavernsError`, nothing written) a standby or a read-only session, and a `caverns` schema or a
-    relation in it owned by a role the current role is not a member of.
+    relation in it owned by a role the current role is not a member of that inherits its privileges.
     """
     check_connection(connection)
     check_writable(connection)
