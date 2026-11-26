@@ -246,10 +246,17 @@ def test_the_own_changeset_is_the_ledger_fingerprint_and_epochs_steps() -> None:
     assert all(step.check for step in nozdormu._OWN_CHANGESET.steps)
 
 
-def test_the_released_ledger_step_is_byte_identical() -> None:
-    """Its checksum is in every consumer's ledger: an edit of the statement would read as a conflict."""
-    released = "6ccdacf3430bfa341afd4f7f0d7fdba8a76c5ce344b58109387a38ca7ab1251b"
-    assert nozdormu._OWN_CHANGESET.steps[0].checksum == released
+# Each own step's checksum, pinned: it is in every consumer's ledger, so an edit of a statement would read
+# as a conflict and `install` would refuse after a release. A new own step adds its line here.
+_OWN_STEP_CHECKSUMS = {
+    "ledger": "6ccdacf3430bfa341afd4f7f0d7fdba8a76c5ce344b58109387a38ca7ab1251b",
+    "fingerprint": "69a4b5b9fe688d80e5089127f8f2c022dcdeb5d1aee13279a7ab0bd62bc8ba31",
+    "epochs": "d35779e89163f27f628f153510a5030bac36a37e58ad9bdf59dcb4cb5ecb8b2f",
+}
+
+
+def test_every_own_step_is_byte_identical_to_its_pinned_checksum() -> None:
+    assert {step.label: step.checksum for step in nozdormu._OWN_CHANGESET.steps} == _OWN_STEP_CHECKSUMS
 
 
 def test_the_default_schemas_query_leaves_out_the_own_schema_by_its_name() -> None:

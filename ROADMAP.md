@@ -87,7 +87,7 @@ changed outside the timeline. The first consumer is not the design target.
 | 1 — Nozdormu | Merged | [#2](https://github.com/Deluha/caverns-of-time/pull/2) |
 | 2 — Chromie and Infinite | Merged | [#3](https://github.com/Deluha/caverns-of-time/pull/3) |
 | 3 — Epochs | Merged | [#4](https://github.com/Deluha/caverns-of-time/pull/4) |
-| 4 — Hardening | Not started | |
+| 4 — Hardening | In progress | |
 | 5 — Murozond | Not started | |
 | 6 — Timewalking | Not started | |
 | 7 — Chromie write commands | Not started | |
@@ -251,6 +251,21 @@ value (5 seconds — *proposed*) and the parameter on `apply` and `snapshot`; th
 what `install` does with a schema of another owner, and whether these arrive as a new own step; whether the
 fingerprint change alters recorded hashes; refusal or record for row-level security; the snapshot size
 limits; whether `apply` pins a declared schema (R28).
+
+Sign-off decisions (owner, 2026-11-26: H1–H10 confirmed as proposed):
+
+| # | Item | Decision |
+|---|---|---|
+| H1 | Step before the baseline (R14) | `baseline` writes one `baseline` row per step from the first through `through`, in one transaction, each with its step's checksum and the same fingerprint hash; the `caverns.fingerprint` row is keyed at the last (amends N7). New status `before_baseline` (`Status.BEFORE_BASELINE`): a step at or before the latest baseline row's step without a row of its own; its check is not run. Acknowledged by `reapply` (run, record `applied`) or `accept` (record `accepted`); `chromie status` shows it and exits 1. An edited pre-baseline step now reads as `conflict`. |
+| H2 | Recorded error (R15) | A `failed` row's `error` is `<SQLSTATE>: <primary message>`, read without a driver import (psycopg 3 `sqlstate`, psycopg2 `pgcode`, both `diag.message_primary`); an error without them keeps the first line of its text. `StepFailed` is still raised from the whole error. The README states that step SQL must not carry secrets. |
+| H3 | Lock timeout (R20) | `apply(..., lock_timeout=5.0)` and `epochs.snapshot(..., lock_timeout=5.0)`: seconds, a positive number; `None` keeps the session's setting. Set by `set_config('lock_timeout', %s, true)` in each transaction before Caverns' lock, so it bounds the lock and each step. A timeout on Caverns' lock raises `CavernsError`; one in a step is a `failed` row and `StepFailed`. `install`, `baseline`, `register`, `unregister` and `delete` take the fixed 5 seconds, without a parameter. |
+| H4 | Privilege model (R21) | `install` refuses (`CavernsError`) an existing `caverns` schema or own table whose owner the current role is not a member of. New own step `privileges` (fourth of `caverns`): `REVOKE ALL` from `PUBLIC` on the schema, its tables and functions, and the default privilege on its functions; its check is that `PUBLIC` has no `USAGE` on the schema. The README documents the grants a runner role needs and that the append-only triggers guard against mistakes, not the schema's owner or a superuser. |
+| H5 | Standby and lock release (R22, R17) | Every write (`install`, `apply`, `baseline`, `register`, `unregister`, `snapshot`, `delete` without `dry_run`) first reads `pg_is_in_recovery()` and `transaction_read_only`: a standby or a read-only session is refused with `CavernsError`. The read-only case is tested on the real database; the standby case shares its code path (no replica in tests). A `false` from `pg_advisory_unlock` or an error releasing the session lock raises `CavernsError` saying the epoch was committed and that a session-mode pooler or a direct connection is required (replaces the warning). Logical replication of `caverns` joins the known limitations. |
+| H6 | Fingerprint settings (R18) | The fingerprint is read under E8's settings plus `quote_all_identifiers` `off` and `standard_conforming_strings` `on`. New own step `fingerprint_server`: `caverns.fingerprint` gains `server_version integer` (`server_version_num`, nullable, outside the hash); `Fingerprint` gains `server_version`. The document format is unchanged, so a hash recorded under default settings stays equal; nothing is released. Drift output unchanged. |
+| H7 | Row-level security (R16) | Refused, not recorded: before copying, a table with row-level security is refused (`EpochRefused`, naming table and role) unless the role is a superuser, has `BYPASSRLS` or owns the table without `FORCE`; `row_security` is pinned `off` in the snapshot transaction as a backstop. |
+| H8 | Snapshot size (R27) | The total `pg_table_size` of the registered tables is logged before copying; `snapshot(..., max_bytes=1 GiB)` refuses (`EpochRefused`) above it, `None` lifts the limit. A table whose largest key plus its schema and table names exceeds the btree entry limit (from `block_size`; 2,704 bytes on 8 kB pages) is refused before copying. The README documents the cost of the long REPEATABLE READ transaction. |
+| H9 | Search path of steps (R28) | Not pinned in v0.1: steps and checks run under the caller's `search_path`; the README requires schema-qualified steps (the adoption guide repeats it in Phase 8). |
+| H10 | Commits | As the table above; commit 1 pins every own step's checksum, and the steps of commits 5 and 7 add their pins. No new exception class. |
 
 ### Phase 5 — Murozond
 
