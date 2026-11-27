@@ -3,8 +3,8 @@
 The components (Nozdormu, Chromie, Epochs, Infinite, Murozond, Timewalking) arrive
 phase by phase; see ROADMAP.md. Present so far: Nozdormu (`caverns_of_time.nozdormu`, the
 migration ledger), Chromie, Infinite (`caverns_of_time.infinite`, the schema fingerprint), Epochs
-(`caverns_of_time.epochs`, the snapshots of tracked tables) and the shared exceptions
-(`caverns_of_time.errors`).
+(`caverns_of_time.epochs`, the snapshots of tracked tables), Murozond (`caverns_of_time.murozond`, the
+destructive-change classifier) and the shared exceptions (`caverns_of_time.errors`).
 """
 
 from importlib.metadata import PackageNotFoundError, version

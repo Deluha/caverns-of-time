@@ -88,6 +88,77 @@ def test_checksum_encodes_as_utf8() -> None:
     assert Step("x", "SELECT 'é'").checksum == hashlib.sha256("SELECT 'é'".encode()).hexdigest()
 
 
+# --- non-transactional steps -------------------------------------------------------------
+
+NO_TX = "-- caverns:no-transaction\nCREATE INDEX CONCURRENTLY i ON t (id)"
+
+
+def test_a_step_is_transactional_without_the_marker() -> None:
+    assert Step("x", SQL).transactional
+    assert not Step("x", NO_TX).transactional
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "\n\n  \t-- caverns:no-transaction\nVACUUM",
+        "-- caverns:no-transaction   \t\nVACUUM",
+        "-- caverns:no-transaction\r\nVACUUM",
+        "-- caverns:no-transaction\nVACUUM -- one statement and a comment\n",
+        "-- caverns:no-transaction\n/* a comment */ VACUUM;",
+    ],
+)
+def test_the_marker_makes_a_step_non_transactional(sql: str) -> None:
+    assert not Step("x", sql).transactional
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT 1;\n-- caverns:no-transaction\nVACUUM",
+        "-- a comment\n-- caverns:no-transaction\nVACUUM",
+        "-- Caverns:No-Transaction\nVACUUM",
+        "-- caverns:no-transaction please\nVACUUM",
+        "--caverns:no-transaction\nVACUUM",
+        "-- caverns:no-transaction-x\nVACUUM",
+        "\u00a0-- caverns:no-transaction\nVACUUM",
+        "/* caverns:no-transaction */ VACUUM",
+    ],
+)
+def test_a_marker_that_is_not_the_first_line_exactly_does_not_count(sql: str) -> None:
+    assert Step("x", sql).transactional
+
+
+def test_a_non_transactional_step_holds_exactly_one_statement() -> None:
+    with pytest.raises(ChangesetError) as refused:
+        Step("two", "-- caverns:no-transaction\nVACUUM a; VACUUM b")
+    assert str(refused.value) == "step 'two' runs outside a transaction and must hold exactly one statement, not 2"
+    with pytest.raises(ChangesetError, match="not 0"):
+        Step("none", "-- caverns:no-transaction")
+    assert Step("ok", "-- caverns:no-transaction\nVACUUM a; -- done\n").label == "ok"
+    assert Step("many", "VACUUM a; VACUUM b").transactional  # a transactional step may hold several
+
+
+def test_a_line_comment_ending_in_a_carriage_return_does_not_hide_a_second_statement() -> None:
+    with pytest.raises(ChangesetError, match="not 2"):
+        Step("two", "-- caverns:no-transaction\nCREATE INDEX CONCURRENTLY i ON t (a); -- x\rDROP TABLE v")
+
+
+def test_the_checksum_covers_the_marker() -> None:
+    assert Step("x", NO_TX).checksum != Step("x", NO_TX.split("\n", 1)[1]).checksum
+
+
+def test_from_directory_reads_the_marker(tmp_path: Path) -> None:
+    _write(tmp_path, {"a.sql": "SELECT 1;", "b.sql": NO_TX})
+    steps = Changeset.from_directory("app", tmp_path).steps
+    assert [(s.label, s.transactional) for s in steps] == [("a", True), ("b", False)]
+
+
+def test_from_file_reads_the_marker(tmp_path: Path) -> None:
+    _write(tmp_path, {"b.sql": NO_TX})
+    assert not Step.from_file(tmp_path / "b.sql").transactional
+
+
 # --- Step.from_file ----------------------------------------------------------------------
 
 
@@ -235,7 +306,8 @@ def test_the_fingerprint_column_lists_are_the_version_and_the_fingerprint_fields
 
 
 @pytest.mark.parametrize(
-    "table", ["ledger", "fingerprint", "epoch_table", "epoch_source", "epoch_row", "epoch_deletion"]
+    "table",
+    ["ledger", "fingerprint", "epoch_table", "epoch_source", "epoch_row", "epoch_deletion", "acknowledgement", "drift"],
 )
 def test_every_sql_constant_names_the_own_tables_in_the_own_schema(table: str) -> None:
     constants = {
@@ -251,9 +323,9 @@ def test_every_sql_constant_names_the_own_tables_in_the_own_schema(table: str) -
             assert qualifier == nozdormu._OWN_CHANGESET_NAME, name
 
 
-def test_the_own_changeset_is_the_ledger_fingerprint_epochs_privileges_and_fingerprint_server_steps() -> None:
+def test_the_own_changeset_is_the_seven_own_steps_in_order() -> None:
     labels = [step.label for step in nozdormu._OWN_CHANGESET.steps]
-    assert labels == ["ledger", "fingerprint", "epochs", "privileges", "fingerprint_server"]
+    assert labels == ["ledger", "fingerprint", "epochs", "privileges", "fingerprint_server", "acknowledgement", "drift"]
     assert all(step.check for step in nozdormu._OWN_CHANGESET.steps)
 
 
@@ -265,6 +337,8 @@ _OWN_STEP_CHECKSUMS = {
     "epochs": "d35779e89163f27f628f153510a5030bac36a37e58ad9bdf59dcb4cb5ecb8b2f",
     "privileges": "e5c174e922f0240159a9531d986e7c6257df73bfa3d53ba61e94dcd149eaab76",
     "fingerprint_server": "83988cb43b79b838e7d58659a1cee8003bcf20e3670b5025bd6f2bc0d8bde5fb",
+    "acknowledgement": "2495a898d4ec7122fef1051425ccc8f8567a34a7142a95c80453298b3bc8a0ba",
+    "drift": "895b428a77209920b05ab8412c17060a90e8cc574e2c6183a86596cd8719f1f8",
 }
 
 

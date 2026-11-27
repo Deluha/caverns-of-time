@@ -17,7 +17,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Protocol
 
-from caverns_of_time import console, epochs, infinite, nozdormu
+from caverns_of_time import console, epochs, infinite, murozond, nozdormu
 from caverns_of_time.errors import CavernsError
 from caverns_of_time.nozdormu import Connection
 
@@ -179,23 +179,49 @@ def _status(args: argparse.Namespace, connection: Connection) -> int:
     versions = [s.entry.version if s.entry else None for s in statuses]
     open_steps = [s for s in statuses if s.status is not nozdormu.Status.APPLIED]
     code = EXIT_FINDING if open_steps else EXIT_OK
+    risks = [murozond.classify(s.step.sql) for s in statuses]
     if args.format == "json":
         steps = [
-            {"label": s.step.label, "status": s.status.value, "version": version}
-            for s, version in zip(statuses, versions, strict=True)
+            {
+                "label": s.step.label,
+                "status": s.status.value,
+                "version": version,
+                "risk": risk.risk.value,
+                "findings": [asdict(f) for f in risk.findings],
+            }
+            for s, version, risk in zip(statuses, versions, risks, strict=True)
         ]
         console.emit_json({"changeset": name, "steps": steps})
         return code
     console.table(
-        ["LABEL", "STATUS", "VERSION"],
-        [(s.step.label, s.status.value, version) for s, version in zip(statuses, versions, strict=True)],
+        ["LABEL", "STATUS", "VERSION", "RISK"],
+        [
+            (s.step.label, s.status.value, version, _risk_cell(risk))
+            for s, version, risk in zip(statuses, versions, risks, strict=True)
+        ],
     )
     if open_steps:
         listed = ", ".join(f"{s.step.label} ({s.status.value})" for s in open_steps)
         console.error(f"{len(open_steps)} of {len(statuses)} steps of changeset {name} not applied: {listed}.")
     else:
         console.success(f"All {len(statuses)} steps of changeset {name} applied.")
+    needing = [
+        f"{s.step.label} ({risk.risk.value})"
+        for s, risk in zip(statuses, risks, strict=True)
+        if s.status not in (nozdormu.Status.APPLIED, nozdormu.Status.UNKNOWN) and risk.risk is not murozond.Risk.SAFE
+    ]
+    if needing:
+        verb = "needs" if len(needing) == 1 else "need"
+        console.warning(f"{_plural(len(needing), 'step')} {verb} an acknowledgement to apply: {', '.join(needing)}.")
     return code
+
+
+def _risk_cell(classification: murozond.Classification) -> str:
+    """A step's risk for the status table: the risk, then the distinct reasons of its findings when not safe."""
+    if classification.risk is murozond.Risk.SAFE:
+        return classification.risk.value
+    reasons = ", ".join(dict.fromkeys(f.reason for f in classification.findings))
+    return f"{classification.risk.value} ({reasons})"
 
 
 _CHANGE_SYMBOLS = {"added": "+", "removed": "-", "changed": "~"}

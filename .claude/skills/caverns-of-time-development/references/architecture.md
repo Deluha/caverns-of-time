@@ -6,7 +6,7 @@ Module map, components, the consumer boundary, packaging and the tech stack.
 
 | Path | Holds |
 |---|---|
-| `caverns_of_time/` | The package: one module per component, behind an explicit public surface (`caverns_of_time/README.md`); exceptions live in one shared module, `caverns_of_time/errors.py`; `chromie.py` is the CLI entry, `console.py` the console helpers, and `_connection.py` and `_fingerprint.py` the shared private modules beside `errors` |
+| `caverns_of_time/` | The package: one module per component, behind an explicit public surface (`caverns_of_time/README.md`); exceptions live in one shared module, `caverns_of_time/errors.py`; `chromie.py` is the CLI entry, `console.py` the console helpers, `murozond.py` the SQL risk classifier (pure, no database), and `_connection.py`, `_fingerprint.py` and `_sql.py` (the SQL lexer and statement splitter) the shared private modules beside `errors` |
 | `dev_tools/` | Verify command, checkers, the test-database command; stdlib only, never shipped (`dev_tools/README.md`) |
 | `tests/` | The only test location; database fixtures in `tests/conftest.py` (`tests/README.md`) |
 | `.claude/` | Guidance machinery: settings, agents, hooks, path rules, the development skill and the command skills |
@@ -23,8 +23,8 @@ The component names are the codenames; code, docs and messages use them consiste
 | Chromie | The guide who takes travellers to past timelines | The CLI and query API | 2 |
 | Infinite | The Infinite Dragonflight, who alter the timeline | Drift detector: live schema versus what the ledger says | 2 |
 | Epochs | The sands of the hourglass | Run-level snapshots of opted-in tables, tagged with the ledger version | 3 |
-| Murozond | Nozdormu's corrupted future | Destructive-change guard on a changeset before apply | 4 |
-| Timewalking | Replaying the past | Rebuild the schema at a past ledger version in a scratch database | 4 |
+| Murozond | Nozdormu's corrupted future | Destructive-change guard on a changeset before apply | 5 |
+| Timewalking | Replaying the past | Rebuild the schema at a past ledger version in a scratch database | 6 |
 
 A component exists in the package only from its phase on (`ROADMAP.md`); until then nothing imports it
 and no doc describes behaviour that is not built.

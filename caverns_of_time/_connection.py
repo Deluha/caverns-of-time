@@ -1,8 +1,9 @@
 """Shared connection plumbing for the components: the connection contract, its guards and transactions.
 
 Not public: the components import it, a consumer imports `Connection` from `nozdormu`. Input: a DB-API 2.0
-connection (autocommit off). Output: cursors in transactions Caverns commits or rolls back itself, the advisory
-lock every Caverns write takes (per transaction, or per session ahead of a REPEATABLE READ transaction), and the
+connection (autocommit off). Output: cursors in transactions Caverns commits or rolls back itself (or, for a step
+that cannot run in one, in autocommit), the advisory lock every Caverns write takes (per transaction, or per session
+ahead of a REPEATABLE READ transaction or an autocommit statement), and the
 validation and catalog helpers the components share (names, limits, the pinned search path and settings).
 """
 
@@ -10,7 +11,7 @@ from __future__ import annotations
 
 import reprlib
 from collections.abc import Collection, Iterator, Sequence
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from typing import Any, Protocol
 
 from caverns_of_time.errors import CavernsError, ChangesetError
@@ -22,6 +23,7 @@ __all__ = [
     "MILLISECONDS",
     "Connection",
     "Cursor",
+    "autocommit",
     "check_connection",
     "check_writable",
     "lock",
@@ -57,11 +59,11 @@ class Connection(Protocol):
     """The part of a DB-API 2.0 connection Caverns uses; psycopg 3 and psycopg2 both fit.
 
     Parameters are `%s` placeholders. Autocommit must be off: Caverns commits and rolls back itself,
-    and a connection with uncommitted work is refused.
+    and a connection with uncommitted work is refused. Caverns switches it on itself, on an idle connection
+    and for one statement only, to run a step outside a transaction (`autocommit`), so it must be settable.
     """
 
-    @property
-    def autocommit(self) -> bool: ...
+    autocommit: bool
 
     def cursor(self) -> Cursor: ...
 
@@ -87,6 +89,9 @@ _SESSION_UNLOCK_SQL = "SELECT pg_advisory_unlock(%s::bigint)"
 DEFAULT_LOCK_TIMEOUT = 5.0
 # Transaction-local: it ends with the transaction, so the session's own setting is never changed.
 _LOCK_TIMEOUT_SQL = "SELECT set_config('lock_timeout', %s, true)"
+# Session-wide, for a statement run in autocommit (a transaction-local setting would end with the statement).
+_SESSION_LOCK_TIMEOUT_SQL = "SELECT set_config('lock_timeout', %s, false)"
+_CURRENT_LOCK_TIMEOUT_SQL = "SELECT current_setting('lock_timeout')"
 _NO_LOCK_TIMEOUT = "0"  # lock_timeout 0 waits for ever
 _LOCK_NOT_AVAILABLE = "55P03"  # SQLSTATE lock_not_available, what a lock_timeout raises
 _LOCK_TIMEOUT_MAX_MS = 2**31 - 1  # an integer of milliseconds, what `lock_timeout` takes
@@ -259,13 +264,18 @@ def lock(cursor: Cursor, *, lock_timeout: float | None = DEFAULT_LOCK_TIMEOUT, u
 
 @contextmanager
 def session_lock(
-    connection: Connection, *, committed: str, lock_timeout: float | None = DEFAULT_LOCK_TIMEOUT
+    connection: Connection,
+    *,
+    committed: str,
+    lock_timeout: float | None = DEFAULT_LOCK_TIMEOUT,
+    unbounded_wait: bool = False,
 ) -> Iterator[None]:
     """Hold Caverns' advisory lock for the session, taken and committed before the block begins.
 
     For a block that runs a REPEATABLE READ `transaction`: the transaction-level `lock` statement would take
     that transaction's snapshot before it waits (see `_READ_COMMITTED_SQL`), while this one commits first, so
-    the snapshot comes after the lock is held. *lock_timeout* bounds the wait as for `lock`. The lock is
+    the snapshot comes after the lock is held. Also for a block that runs a statement outside a transaction
+    (`autocommit`). *lock_timeout* and *unbounded_wait* bound the wait as for `lock`. The lock is
     released when the block ends. A session lock survives a rollback, so a failure while taking it (the server
     may have granted it) and a block that raised release it best-effort and let the error propagate (a lost
     connection frees the lock). A release that fails after the block succeeded (an error, or `false` from
@@ -274,7 +284,7 @@ def session_lock(
     """
     try:
         with cursor(connection) as cur:
-            _take_advisory_lock(cur, _SESSION_LOCK_SQL, lock_timeout)
+            _take_advisory_lock(cur, _SESSION_LOCK_SQL, lock_timeout, unbounded_wait=unbounded_wait)
         connection.commit()
     except BaseException:
         _release_session_lock_quietly(connection)
@@ -290,6 +300,38 @@ def session_lock(
         raise CavernsError(_release_failure(committed, str(error).strip())) from error
     if not held:
         raise CavernsError(_release_failure(committed, "the lock was not held"))
+
+
+@contextmanager
+def autocommit(connection: Connection, *, lock_timeout: float | None) -> Iterator[Cursor]:
+    """A cursor on the connection with autocommit on, for a statement that cannot run in a transaction.
+
+    The connection is rolled back first (autocommit can only change while it is idle; the caller has committed
+    its own work). *lock_timeout* seconds (None: the session's own setting) bound the statement's lock waits as
+    the session setting, put back when the block ends; autocommit is switched off again whatever happens. The
+    statement cannot be rolled back: a failure leaves its partial effect.
+    """
+    connection.rollback()
+    connection.autocommit = True
+    try:
+        with cursor(connection) as cur:
+            saved = None
+            if lock_timeout is not None:
+                cur.execute(_CURRENT_LOCK_TIMEOUT_SQL)
+                row = cur.fetchone()
+                saved = row[0] if row else None
+                cur.execute(_SESSION_LOCK_TIMEOUT_SQL, (f"{_milliseconds(lock_timeout)}ms",))
+            try:
+                yield cur
+            except BaseException:
+                if saved is not None:
+                    with suppress(Exception):  # the error already propagating matters more
+                        cur.execute(_SESSION_LOCK_TIMEOUT_SQL, (saved,))
+                raise
+            if saved is not None:
+                cur.execute(_SESSION_LOCK_TIMEOUT_SQL, (saved,))
+    finally:
+        connection.autocommit = False
 
 
 def _release_failure(committed: str, reason: str) -> str:

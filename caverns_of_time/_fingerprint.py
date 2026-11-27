@@ -38,7 +38,8 @@ __all__ = [
 ]
 
 # The kinds of object a document holds, in the order they are read.
-_KINDS = ("table", "column", "index", "constraint", "view", "function")
+# The last four were added after the first release; `compare` skips a kind the recorded document lacks.
+_KINDS = ("table", "column", "index", "constraint", "view", "function", "trigger", "row_security", "policy", "enum")
 
 # The schemas a fingerprint covers when the caller names none: every one but the system's and Caverns' own.
 _DEFAULT_SCHEMAS_SQL = (
@@ -140,6 +141,60 @@ WHERE p.prokind IN ('f', 'p') AND n.nspname = ANY(%s::text[])
   AND NOT EXISTS (SELECT 1 FROM pg_depend d WHERE d.classid = 'pg_proc'::regclass
        AND d.objid = p.oid AND d.deptype = 'e')
 ORDER BY n.nspname, p.proname, pg_get_function_identity_arguments(p.oid)
+"""
+# User triggers on any relation (a constraint trigger included). `tgisinternal` leaves out the triggers PostgreSQL
+# makes for a foreign key; a trigger an extension owns, or one on an extension's relation, goes too.
+_TRIGGERS_SQL = """
+SELECT n.nspname::text, c.relname::text, t.tgname::text, pg_get_triggerdef(t.oid),
+       CASE t.tgenabled WHEN 'O' THEN 'origin' WHEN 'D' THEN 'disabled' WHEN 'R' THEN 'replica'
+            WHEN 'A' THEN 'always' END
+FROM pg_trigger t
+JOIN pg_class c ON c.oid = t.tgrelid
+JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE NOT t.tgisinternal AND n.nspname = ANY(%s::text[])
+  AND NOT EXISTS (SELECT 1 FROM pg_depend d WHERE d.classid = 'pg_class'::regclass
+       AND d.objid = c.oid AND d.deptype = 'e')
+  AND NOT EXISTS (SELECT 1 FROM pg_depend d WHERE d.classid = 'pg_trigger'::regclass
+       AND d.objid = t.oid AND d.deptype = 'e')
+ORDER BY n.nspname, c.relname, t.tgname
+"""
+# Only a table with row-level security enabled or forced has an entry.
+_ROW_SECURITY_SQL = """
+SELECT n.nspname::text, c.relname::text, c.relrowsecurity, c.relforcerowsecurity
+FROM pg_class c
+JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE c.relkind IN ('r', 'p') AND (c.relrowsecurity OR c.relforcerowsecurity) AND n.nspname = ANY(%s::text[])
+  AND NOT EXISTS (SELECT 1 FROM pg_depend d WHERE d.classid = 'pg_class'::regclass
+       AND d.objid = c.oid AND d.deptype = 'e')
+ORDER BY n.nspname, c.relname
+"""
+# A role oid of 0 is PUBLIC; the names are sorted in Python, so the order does not depend on the collation.
+_POLICIES_SQL = """
+SELECT n.nspname::text, c.relname::text, p.polname::text,
+       CASE p.polcmd WHEN '*' THEN 'all' WHEN 'r' THEN 'select' WHEN 'a' THEN 'insert' WHEN 'w' THEN 'update'
+            WHEN 'd' THEN 'delete' END,
+       p.polpermissive,
+       ARRAY(SELECT CASE WHEN r.oid = 0 THEN 'public'
+                         ELSE (SELECT o.rolname::text FROM pg_roles o WHERE o.oid = r.oid) END
+             FROM unnest(p.polroles) AS r(oid)),
+       pg_get_expr(p.polqual, p.polrelid), pg_get_expr(p.polwithcheck, p.polrelid)
+FROM pg_policy p
+JOIN pg_class c ON c.oid = p.polrelid
+JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE n.nspname = ANY(%s::text[])
+  AND NOT EXISTS (SELECT 1 FROM pg_depend d WHERE d.classid = 'pg_class'::regclass
+       AND d.objid = c.oid AND d.deptype = 'e')
+ORDER BY n.nspname, c.relname, p.polname
+"""
+_ENUMS_SQL = """
+SELECT n.nspname::text, t.typname::text,
+       ARRAY(SELECT e.enumlabel::text FROM pg_enum e WHERE e.enumtypid = t.oid ORDER BY e.enumsortorder)
+FROM pg_type t
+JOIN pg_namespace n ON n.oid = t.typnamespace
+WHERE t.typtype = 'e' AND n.nspname = ANY(%s::text[])
+  AND NOT EXISTS (SELECT 1 FROM pg_depend d WHERE d.classid = 'pg_type'::regclass
+       AND d.objid = t.oid AND d.deptype = 'e')
+ORDER BY n.nspname, t.typname
 """
 
 
@@ -307,6 +362,20 @@ def read_document(cursor: Cursor, schemas: Sequence[str]) -> dict[str, Any]:
         document[schema]["view"][view] = {"kind": kind, "definition": definition}
     for schema, function, arguments, definition in rows(_FUNCTIONS_SQL):
         document[schema]["function"][f"{function}({arguments})"] = definition
+    for schema, table, trigger, definition, enabled in rows(_TRIGGERS_SQL):
+        document[schema]["trigger"][f"{table}.{trigger}"] = {"definition": definition, "enabled": enabled}
+    for schema, table, enabled, forced in rows(_ROW_SECURITY_SQL):
+        document[schema]["row_security"][table] = {"enabled": enabled, "forced": forced}
+    for schema, table, policy, command, permissive, roles, using, with_check in rows(_POLICIES_SQL):
+        document[schema]["policy"][f"{table}.{policy}"] = {
+            "command": command,
+            "permissive": permissive,
+            "roles": sorted(roles),
+            "using": using,
+            "with_check": with_check,
+        }
+    for schema, enum, labels in rows(_ENUMS_SQL):
+        document[schema]["enum"][enum] = list(labels)
     return document
 
 
@@ -325,11 +394,15 @@ def compare(recorded: dict[str, Any], live: dict[str, Any]) -> list[Difference]:
     """The differences between two documents, sorted by schema, kind (in `_KINDS` order) and key.
 
     An object only in *live* is `added`, only in *recorded* `removed`, in both with another value `changed`.
+    For a schema *recorded* holds, only the kinds its entry holds are compared, so a fingerprint recorded by a
+    release that knew fewer kinds reports no difference for the others; for a schema it lacks, every kind is
+    compared (its objects read as added).
     """
     differences = []
     for schema in sorted(set(recorded) | set(live)):
         before, after = recorded.get(schema, {}), live.get(schema, {})
-        for kind in _KINDS:
+        kinds = [kind for kind in _KINDS if kind in before] if schema in recorded else _KINDS
+        for kind in kinds:
             old, new = before.get(kind, {}), after.get(kind, {})
             for key in sorted(set(old) | set(new)):
                 if key not in old:

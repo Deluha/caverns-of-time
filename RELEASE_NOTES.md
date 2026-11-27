@@ -4,6 +4,39 @@ What shipped, newest first. What is planned: `ROADMAP.md`.
 
 ## v0.1.0 — in development
 
+### Phase 5 — Murozond
+
+The destructive-change guard, and what a run does about drift:
+
+- `murozond.classify(sql)` returns a `Classification`: the worst `Risk` (`destructive`, `lock_hazard`, `unknown` or
+  `safe`) and a `Finding(risk, statement, reason)` per risky statement or `ALTER TABLE` action. Rules in brief:
+  every `DROP`, `TRUNCATE`, `DELETE` and `ALTER TABLE ... DROP` is destructive; `CREATE INDEX` without
+  `CONCURRENTLY`, `ADD CONSTRAINT` without `NOT VALID`, `ALTER COLUMN TYPE` and `SET NOT NULL` are lock hazards;
+  a `COPY` of a `DELETE` or `MERGE` query is destructive and `COPY ... PROGRAM` is unknown; `DO`, `CALL`, `SELECT`
+  and any statement it does not know are unknown. There is no SQL parser: a lexer reads keywords, and a finding's reason is fixed text, never quoted SQL.
+- The guard on `apply`: `apply(..., acknowledge=())` refuses with `GuardRefused` (a `PreflightRefused`) every step that
+  would run and is not safe unless its label is named. The refusals come in order, all before anything is written:
+  status, an invalid `acknowledge`, the guard, drift. Caverns' own changeset is exempt; `preflight` is unchanged.
+- `caverns.acknowledgement` (own step `acknowledgement`, append-only) records each acknowledged step that ran, with its
+  risk and findings, never its SQL.
+- `chromie status` gains a `RISK` column (`destructive (DROP TABLE)`), a warning listing the steps that would need an
+  acknowledgement, and `risk` and `findings` keys in its JSON. Exit codes are unchanged.
+- Non-transactional steps: a step whose SQL starts with `-- caverns:no-transaction` (`Step.transactional` is
+  `False`) runs outside a transaction, for `CREATE INDEX CONCURRENTLY` and the like. It holds exactly one statement and
+  takes Caverns' lock for the session, so it needs a direct or session-mode connection. A failure leaves its partial
+  effect, and Caverns logs a warning naming the invalid indexes it may have left.
+- The fingerprint reads four more kinds: triggers, row-level-security flags, policies and enum labels. A fingerprint
+  recorded earlier is compared only on the kinds it holds, so it reports no drift for the new ones.
+- `apply(..., on_drift="refuse")`: a difference between the live schema and the last fingerprint now refuses the run
+  with `DriftRefused`, nothing written (a behaviour change: `apply` used to only warn). `on_drift="warn"` logs it,
+  records it in the new append-only `caverns.drift` (own step `drift`) and proceeds.
+- **Upgrade:** run `install()` once, as the schema's owner: it adds the own steps `acknowledgement` and `drift`; until
+  then `preflight`, `apply` and `baseline` raise `LedgerNotInstalled`. Grant `SELECT, INSERT` on
+  `caverns.acknowledgement` and `caverns.drift` to runner roles; a runner without the `caverns.drift` grant cannot
+  record a failure in a warn run. A run that used to pass with logged drift now refuses until it is run once with
+  `on_drift="warn"`. Step SQL using `SELECT` or `CREATE INDEX` without `CONCURRENTLY` now needs `acknowledge`, and so
+  does any other step that is not safe.
+
 ### Phase 4 — Hardening
 
 What a second review found in Phases 1–3, fixed before new components:

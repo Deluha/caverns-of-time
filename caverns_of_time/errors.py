@@ -10,7 +10,12 @@ from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:  # nozdormu imports this module
+    from caverns_of_time._fingerprint import Difference
+    from caverns_of_time.murozond import Classification
     from caverns_of_time.nozdormu import StepStatus
+
+# The differences a `DriftRefused` message lists before it counts the rest.
+_SHOWN_DIFFERENCES = 5
 
 
 class CavernsError(Exception):
@@ -32,6 +37,37 @@ class PreflightRefused(CavernsError):
         self.statuses = tuple(statuses)
         listing = ", ".join(f"{s.step.label} ({s.status})" for s in self.statuses)
         super().__init__(f"the run is refused for: {listing}")
+
+
+class GuardRefused(PreflightRefused):
+    """Murozond refused a run: a step that is not safe is not named in `acknowledge`; `statuses` and
+    `classifications` hold those steps, in parallel."""
+
+    def __init__(self, statuses: Sequence[StepStatus], classifications: Sequence[Classification]) -> None:
+        self.statuses = tuple(statuses)
+        self.classifications = tuple(classifications)
+        listing = ", ".join(
+            f"{s.step.label} ({c.risk}: {', '.join(dict.fromkeys(f.reason for f in c.findings))})"
+            for s, c in zip(self.statuses, self.classifications, strict=True)
+        )
+        CavernsError.__init__(self, f"Murozond refuses the run for: {listing}: name each in acknowledge to run it")
+
+
+class DriftRefused(CavernsError):
+    """A run was refused because the live schema differs from the latest recorded fingerprint: `fingerprint_version`
+    is the ledger version the fingerprint was recorded at, `differences` holds what differs."""
+
+    def __init__(self, fingerprint_version: int, differences: Sequence[Difference]) -> None:
+        self.fingerprint_version = fingerprint_version
+        self.differences = tuple(differences)
+        shown = [f"{d.change} {d.kind} {d.name}" for d in self.differences[:_SHOWN_DIFFERENCES]]
+        listing = ", ".join(shown)
+        if len(self.differences) > _SHOWN_DIFFERENCES:
+            listing += f", and {len(self.differences) - _SHOWN_DIFFERENCES} more"
+        super().__init__(
+            f"the live schema differs from the fingerprint at ledger version {fingerprint_version}: {listing}: "
+            "apply with on_drift='warn' to proceed and record the drift"
+        )
 
 
 class StepFailed(CavernsError):

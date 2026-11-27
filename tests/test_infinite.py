@@ -16,7 +16,9 @@ from caverns_of_time.nozdormu import Changeset, Status, Step, apply, baseline, h
 
 SCHEMA = "infinite_test"
 EXT_SCHEMA = "infinite_ext"
-KINDS = {"table", "column", "index", "constraint", "view", "function"}
+OLD_KINDS = {"table", "column", "index", "constraint", "view", "function"}
+NEW_KINDS = {"trigger", "row_security", "policy", "enum"}  # added after the first release
+KINDS = OLD_KINDS | NEW_KINDS
 # Everything these tests create, dropped before and after each: two schemas (the extension goes with its
 # schema) and the foreign data wrapper with its server, which no schema holds.
 TEST_DROPS = (
@@ -26,6 +28,7 @@ TEST_DROPS = (
     "DROP FOREIGN DATA WRAPPER IF EXISTS infinite_fdw CASCADE",
 )
 TABLE = f"CREATE TABLE {SCHEMA}.t (id integer NOT NULL, note text DEFAULT 'a')"
+NOOP = "SET LOCAL application_name = 'noop'"  # a step Murozond calls safe that changes nothing
 
 
 def _run(conn: Any, *statements: str) -> None:
@@ -104,7 +107,7 @@ def test_infinite_re_exports_the_fingerprint_type() -> None:
 # --- the document's shape ------------------------------------------------------------------
 
 
-def test_an_empty_schema_has_all_six_kinds_empty(conn: Any) -> None:
+def test_an_empty_schema_has_all_ten_kinds_empty(conn: Any) -> None:
     _created(conn)
     result = _fp(conn)
     assert result.schemas == (SCHEMA,)
@@ -132,7 +135,7 @@ def test_the_baseline_records_the_hash_of_the_fingerprint(conn: Any) -> None:
     assert entry.fingerprint == _fp(conn).hash
 
 
-# --- the six kinds -------------------------------------------------------------------------
+# --- the kinds -------------------------------------------------------------------------
 
 
 def test_tables_have_their_kind_and_a_new_table_changes_the_hash(conn: Any) -> None:
@@ -268,6 +271,104 @@ def test_functions_and_procedures_are_keyed_by_identity_arguments(conn: Any) -> 
         conn, f"CREATE OR REPLACE FUNCTION {SCHEMA}.f(a integer) RETURNS integer LANGUAGE sql AS 'SELECT 3'"
     )
     assert "SELECT 3" in after.document[SCHEMA]["function"]["f(a integer)"]
+
+
+TRIGGER_FUNCTION = f"CREATE FUNCTION {SCHEMA}.trg() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RETURN NEW; END'"
+TRIGGER = f"CREATE TRIGGER t_ins BEFORE INSERT ON {SCHEMA}.t FOR EACH ROW EXECUTE FUNCTION {SCHEMA}.trg()"
+POLICY = f"CREATE POLICY p_all ON {SCHEMA}.t USING (id > 0)"
+ENUM = f"CREATE TYPE {SCHEMA}.mood AS ENUM ('sad', 'happy')"
+PK = f"ALTER TABLE {SCHEMA}.t ADD CONSTRAINT t_pk PRIMARY KEY (id)"
+
+
+def test_triggers_have_their_definition_and_enabled_state(conn: Any) -> None:
+    _created(
+        conn,
+        TABLE,
+        PK,
+        f"CREATE TABLE {SCHEMA}.u (t_id integer REFERENCES {SCHEMA}.t (id))",  # a foreign key's internal triggers
+        f"CREATE VIEW {SCHEMA}.v AS SELECT id FROM {SCHEMA}.t",
+        TRIGGER_FUNCTION,
+        TRIGGER,
+        f"CREATE TRIGGER t_off AFTER UPDATE ON {SCHEMA}.t FOR EACH ROW EXECUTE FUNCTION {SCHEMA}.trg()",
+        f"ALTER TABLE {SCHEMA}.t DISABLE TRIGGER t_off",
+        f"CREATE CONSTRAINT TRIGGER t_ct AFTER INSERT ON {SCHEMA}.t DEFERRABLE INITIALLY DEFERRED"
+        f" FOR EACH ROW EXECUTE FUNCTION {SCHEMA}.trg()",
+        f"CREATE TRIGGER v_ins INSTEAD OF INSERT ON {SCHEMA}.v FOR EACH ROW EXECUTE FUNCTION {SCHEMA}.trg()",
+        f"ALTER TABLE {SCHEMA}.t ENABLE REPLICA TRIGGER t_ins",
+    )
+    triggers = _doc(conn)["trigger"]
+    assert set(triggers) == {"t.t_ins", "t.t_off", "t.t_ct", "v.v_ins"}  # no key for the internal ones
+    assert triggers["t.t_ins"] == {
+        "definition": f"CREATE TRIGGER t_ins BEFORE INSERT ON {SCHEMA}.t FOR EACH ROW EXECUTE FUNCTION {SCHEMA}.trg()",
+        "enabled": "replica",
+    }
+    assert [triggers[key]["enabled"] for key in ("t.t_off", "t.t_ct", "v.v_ins")] == ["disabled", "origin", "origin"]
+    assert "CONSTRAINT TRIGGER" in triggers["t.t_ct"]["definition"]
+    after = _changed(conn, f"ALTER TABLE {SCHEMA}.t ENABLE ALWAYS TRIGGER t_off")
+    assert after.document[SCHEMA]["trigger"]["t.t_off"]["enabled"] == "always"
+
+
+def test_row_security_is_recorded_only_for_a_table_with_a_flag(conn: Any) -> None:
+    _created(
+        conn, TABLE, f"CREATE TABLE {SCHEMA}.plain ()", f"CREATE TABLE {SCHEMA}.pt (id integer) PARTITION BY LIST (id)"
+    )
+    assert _doc(conn)["row_security"] == {}
+    after = _changed(conn, f"ALTER TABLE {SCHEMA}.t ENABLE ROW LEVEL SECURITY")
+    assert after.document[SCHEMA]["row_security"] == {"t": {"enabled": True, "forced": False}}
+    after = _changed(conn, f"ALTER TABLE {SCHEMA}.t FORCE ROW LEVEL SECURITY")
+    assert after.document[SCHEMA]["row_security"] == {"t": {"enabled": True, "forced": True}}
+    after = _changed(conn, f"ALTER TABLE {SCHEMA}.pt ENABLE ROW LEVEL SECURITY")
+    assert set(after.document[SCHEMA]["row_security"]) == {"t", "pt"}  # a partitioned table counts
+    after = _changed(conn, f"ALTER TABLE {SCHEMA}.t DISABLE ROW LEVEL SECURITY")
+    assert after.document[SCHEMA]["row_security"]["t"] == {"enabled": False, "forced": True}  # forced alone counts
+    after = _changed(conn, f"ALTER TABLE {SCHEMA}.t NO FORCE ROW LEVEL SECURITY")
+    assert set(after.document[SCHEMA]["row_security"]) == {"pt"}
+
+
+def test_policies_have_command_permissiveness_roles_and_expressions(conn: Any) -> None:
+    me = _query(conn, "SELECT current_user::text")[0][0]
+    _created(
+        conn,
+        TABLE,
+        f"CREATE POLICY p_all ON {SCHEMA}.t USING (id > 0)",
+        f'CREATE POLICY p_ins ON {SCHEMA}.t AS RESTRICTIVE FOR INSERT TO pg_monitor, "{me}"'
+        " WITH CHECK (note IS NOT NULL)",
+        f"CREATE POLICY p_upd ON {SCHEMA}.t FOR UPDATE USING (id < 9) WITH CHECK (id < 10)",
+        f"CREATE POLICY p_sel ON {SCHEMA}.t FOR SELECT TO CURRENT_USER USING (true)",
+        f"CREATE POLICY p_del ON {SCHEMA}.t FOR DELETE USING (false)",
+    )
+    policies = _doc(conn)["policy"]
+    assert set(policies) == {"t.p_all", "t.p_ins", "t.p_upd", "t.p_sel", "t.p_del"}
+    assert policies["t.p_all"] == {
+        "command": "all",
+        "permissive": True,
+        "roles": ["public"],
+        "using": "(id > 0)",
+        "with_check": None,
+    }
+    assert policies["t.p_ins"] == {
+        "command": "insert",
+        "permissive": False,
+        "roles": sorted(["pg_monitor", me]),
+        "using": None,
+        "with_check": "(note IS NOT NULL)",
+    }
+    assert (policies["t.p_upd"]["using"], policies["t.p_upd"]["with_check"]) == ("(id < 9)", "(id < 10)")
+    assert [policies[key]["command"] for key in ("t.p_sel", "t.p_upd", "t.p_del")] == ["select", "update", "delete"]
+    assert policies["t.p_sel"]["roles"] == [me]
+    after = _changed(conn, f"ALTER POLICY p_all ON {SCHEMA}.t USING (id > 1)")
+    assert after.document[SCHEMA]["policy"]["t.p_all"]["using"] == "(id > 1)"
+    assert _doc(conn)["row_security"] == {}  # a policy is not the table's flag
+
+
+def test_an_enum_is_its_labels_in_sort_order(conn: Any) -> None:
+    _created(conn, ENUM, f"CREATE DOMAIN {SCHEMA}.d AS integer", f"CREATE TYPE {SCHEMA}.pair AS (a integer)")
+    assert _doc(conn)["enum"] == {"mood": ["sad", "happy"]}  # a domain and a composite type are not covered
+    after = _changed(conn, f"ALTER TYPE {SCHEMA}.mood ADD VALUE 'ecstatic' BEFORE 'sad'")
+    assert after.document[SCHEMA]["enum"]["mood"] == ["ecstatic", "sad", "happy"]
+    after = _changed(conn, f"ALTER TYPE {SCHEMA}.mood ADD VALUE 'meh' AFTER 'sad'")
+    assert after.document[SCHEMA]["enum"]["mood"] == ["ecstatic", "sad", "meh", "happy"]
+    _changed(conn, f"ALTER TYPE {SCHEMA}.mood RENAME VALUE 'meh' TO 'ok'")
 
 
 def test_what_an_extension_owns_is_excluded(conn: Any) -> None:
@@ -441,7 +542,7 @@ def test_without_a_baseline_a_schema_created_later_is_watched(conn: Any, caplog:
     assert EXT_SCHEMA in result.schemas  # read live: the new schema is watched at once
     assert [(d.change, d.kind, d.name) for d in result.differences] == [("added", "table", f"{EXT_SCHEMA}.u")]
     with caplog.at_level("WARNING"):
-        apply(conn, Changeset("app", [*STEPS, Step("later", "SELECT 1")]))
+        apply(conn, Changeset("app", [*STEPS, Step("later", NOOP)]), on_drift="warn")
     assert f"added table {EXT_SCHEMA}.u" in caplog.text  # the warning compares the watched schemas too
     assert EXT_SCHEMA in _latest_schemas(conn)
     assert drift(conn).differences == ()
@@ -464,7 +565,7 @@ def test_without_a_baseline_a_dropped_schema_is_drift_and_is_warned_of(
     assert narrowed.schemas == (SCHEMA,)
     assert [(d.change, d.kind, d.name) for d in narrowed.differences] == expected
     with caplog.at_level("WARNING"):
-        apply(conn, Changeset("app", [*STEPS, Step("later", "SELECT 1")]))
+        apply(conn, Changeset("app", [*STEPS, Step("later", NOOP)]), on_drift="warn")
     assert f"removed table {SCHEMA}.t" in caplog.text  # the pre-apply warning compares the same schemas
     assert SCHEMA not in _latest_schemas(conn)  # the recorded fingerprint describes the database as it now is
     assert drift(conn).differences == ()
@@ -541,12 +642,48 @@ def test_compare_reads_a_schema_in_one_document_only_as_all_added_or_all_removed
     assert _fingerprint.compare(both, kept) == [Difference("table", "b.u", "removed")]
 
 
+def _old(document: dict[str, Any]) -> dict[str, Any]:
+    """*document* as an earlier release recorded it: without the kinds added since."""
+    return {
+        name: {kind: value for kind, value in kinds.items() if kind in OLD_KINDS} for name, kinds in document.items()
+    }
+
+
+def test_compare_skips_the_kinds_a_recorded_schema_lacks_and_reads_a_lacking_schema_in_full() -> None:
+    live = _document(
+        a={
+            "table": {"t": {"kind": "r"}},
+            "trigger": {"t.g": {"definition": "d", "enabled": "origin"}},
+            "enum": {"e": ["x"]},
+        },
+        b={"row_security": {"t": {"enabled": True, "forced": False}}},
+    )
+    recorded = _old(_document(a={"table": {"t": {"kind": "r"}}}))
+    assert _fingerprint.compare(recorded, live) == [Difference("row_security", "b.t", "added")]
+    assert _fingerprint.compare(_old(live), live) == []
+    assert _fingerprint.compare({"a": {"table": {}, "trigger": {}}}, live) == [
+        Difference("table", "a.t", "added"),
+        Difference("trigger", "a.t.g", "added"),  # the kinds the recorded entry holds are compared
+        Difference("row_security", "b.t", "added"),  # a schema it lacks is compared on every kind
+    ]
+
+
+def test_a_fingerprint_recorded_before_the_new_kinds_reports_no_drift_for_them(conn: Any) -> None:
+    _created(conn, TABLE, TRIGGER_FUNCTION, TRIGGER, f"ALTER TABLE {SCHEMA}.t ENABLE ROW LEVEL SECURITY", POLICY, ENUM)
+    live = fingerprint(conn, schemas=[SCHEMA]).document
+    assert all(live[SCHEMA][kind] for kind in NEW_KINDS)
+    assert _fingerprint.compare(_old(live), live) == []
+    assert _fingerprint.compare({}, live) == [
+        *(Difference(kind, f"{SCHEMA}.{key}", "added") for kind in _fingerprint._KINDS for key in live[SCHEMA][kind])
+    ]
+
+
 # --- drift -----------------------------------------------------------------------------------
 
 STEPS = [
     Step("schema", f"CREATE SCHEMA {SCHEMA}", check=f"SELECT to_regnamespace('{SCHEMA}') IS NOT NULL"),
     Step("table", TABLE, check=f"SELECT to_regclass('{SCHEMA}.t') IS NOT NULL"),
-    Step("note", "SELECT 1"),  # no check: it can never disagree
+    Step("note", NOOP),  # no check: it can never disagree
 ]
 APP = Changeset("app", STEPS)
 FUNCTION = f"CREATE FUNCTION {SCHEMA}.f(a integer) RETURNS integer LANGUAGE sql AS 'SELECT 1'"
@@ -644,11 +781,29 @@ def test_drift_finds_a_changed_index(conn: Any) -> None:
     assert _changes(conn) == [("changed", "index", f"{SCHEMA}.t_idx")]
 
 
+def test_drift_finds_a_changed_trigger_a_new_policy_a_new_flag_and_a_new_enum_label(conn: Any) -> None:
+    _baselined(conn, TABLE, TRIGGER_FUNCTION, TRIGGER, ENUM)
+    assert _changes(conn) == []
+    _run(
+        conn,
+        f"ALTER TABLE {SCHEMA}.t DISABLE TRIGGER t_ins",
+        POLICY,
+        f"ALTER TABLE {SCHEMA}.t ENABLE ROW LEVEL SECURITY",
+        f"ALTER TYPE {SCHEMA}.mood ADD VALUE 'fine'",
+    )
+    assert _changes(conn) == [
+        ("changed", "trigger", f"{SCHEMA}.t.t_ins"),
+        ("added", "row_security", f"{SCHEMA}.t"),
+        ("added", "policy", f"{SCHEMA}.t.p_all"),
+        ("changed", "enum", f"{SCHEMA}.mood"),
+    ]
+
+
 def test_drift_compares_with_the_latest_fingerprint_only(conn: Any) -> None:
     _applied(conn)
     _run(conn, f"ALTER TABLE {SCHEMA}.t ADD COLUMN extra text")
     assert drift(conn).differences
-    apply(conn, Changeset("app", [*STEPS, Step("later", f"CREATE TABLE {SCHEMA}.later ()")]))
+    apply(conn, Changeset("app", [*STEPS, Step("later", f"CREATE TABLE {SCHEMA}.later ()")]), on_drift="warn")
     result = drift(conn)  # the new run's fingerprint holds the column
     assert not result.differences and result.fingerprint_version == history(conn, limit=1)[0].version
 
@@ -708,7 +863,7 @@ def test_drift_does_not_call_an_unknown_step_a_disagreement(conn: Any) -> None:
 def test_drift_runs_the_checks_with_the_sessions_search_path(conn: Any) -> None:
     pinned = Step(
         "pinned",
-        "SELECT 1",
+        NOOP,
         check=f"SELECT current_setting('search_path') <> 'pg_catalog' AND to_regclass('{SCHEMA}.t') IS NOT NULL",
     )
     changeset = Changeset("app", [*STEPS, pinned])
